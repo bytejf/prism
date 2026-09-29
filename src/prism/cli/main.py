@@ -6,9 +6,11 @@ V1 只提供 `--version`，后续模块逐步加入 `diff` / `filter` / `hunk-ma
 
 import logging
 from importlib.metadata import version
+from pathlib import Path
 
 import typer
 
+from prism.core.diff.loader import load_diffs
 from prism.observability.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -58,3 +60,25 @@ def main(
         logger.debug("未指定子命令：打印帮助")
         typer.echo(ctx.get_help())
         raise typer.Exit
+
+
+@app.command()
+def diff(
+    base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
+    head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+) -> None:
+    """加载并解析 diff，打印结构摘要（不调用 LLM）。
+
+    以 merge-base(base, head) 为基准，只统计 PR 实际引入的改动。
+    """
+    logger.info("加载 diff: base=%s head=%s", base, head)
+    try:
+        diffs = load_diffs(Path.cwd(), base, head)
+    except ValueError as exc:
+        logger.error("diff 加载失败: %s", exc)
+        typer.echo(f"错误：{exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Loaded {len(diffs)} files, {sum(len(d.hunks) for d in diffs)} hunks")
+    for item in diffs:
+        typer.echo(f"  {item.path}: {len(item.hunks)} hunks (+{item.insertions}/-{item.deletions})")

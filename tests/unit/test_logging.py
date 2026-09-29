@@ -2,6 +2,8 @@
 
 import logging
 
+import pytest
+
 from prism.observability.logging import LOG_FORMAT, resolve_level, setup_logging
 
 
@@ -19,7 +21,7 @@ def test_resolve_level_invalid_falls_back_to_info() -> None:
     assert resolve_level(None) == logging.INFO
 
 
-def test_setup_logging_applies_env_level(monkeypatch) -> None:
+def test_setup_logging_applies_env_level(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试 setup_logging 从环境变量读取级别并生效。"""
     monkeypatch.setenv("PRISM_LOG_LEVEL", "DEBUG")
     root = logging.getLogger()
