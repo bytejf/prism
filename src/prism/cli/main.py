@@ -228,12 +228,13 @@ def _llm_or_exit() -> LLMClient:
         raise typer.Exit(code=1) from exc
 
 
-def _run_groups(groups: list[Group], project_root: Path) -> list[MainLoopResult]:
+def _run_groups(groups: list[Group], project_root: Path, head_rev: str) -> list[MainLoopResult]:
     """串行跑完所有审查单元（V1 不做并发）。
 
     Args:
         groups: 审查单元列表
         project_root: 项目根目录
+        head_rev: 被审查的版本，传给工具读源码用
 
     Returns:
         各组的循环产出
@@ -245,7 +246,7 @@ def _run_groups(groups: list[Group], project_root: Path) -> list[MainLoopResult]
             f"Processing Group {index}: {item.package_path} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
-        result = run_main_loop(item, llm, str(project_root))
+        result = run_main_loop(item, llm, str(project_root), head_rev)
         results.append(result)
         typer.echo(
             f"  {result.group_id} completed: {_plural(len(result.comments), 'comment')} "
@@ -281,7 +282,7 @@ def review(
     if not groups:
         typer.echo("没有可审查的 hunk。")
 
-    results = _run_groups(groups, root) if groups else []
+    results = _run_groups(groups, root, head) if groups else []
     comments = sort_comments(to_comments(results, groups))
 
     stats = ReviewStats(

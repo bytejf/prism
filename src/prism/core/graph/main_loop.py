@@ -278,17 +278,18 @@ def route_after_check(state: MainState) -> str:
     return "end" if state.get("exit_reason") else "call_llm"
 
 
-def initial_state(group: Group, project_root: str) -> MainState:
+def initial_state(group: Group, project_root: str, head_rev: str = "") -> MainState:
     """构造 Main 循环的初始状态。
 
     Args:
         group: 审查单元
         project_root: 项目根目录
+        head_rev: 被审查的版本，工具据此读取源码而不是读工作区
 
     Returns:
         初始 MainState
     """
-    ctx = ToolContext(project_root=project_root)
+    ctx = ToolContext(project_root=project_root, head_rev=head_rev)
     ctx.init_hunks([item.hunk_id for item in group.hunks])
 
     user_content = "\n\n".join(
@@ -347,13 +348,16 @@ def build_graph(llm: ChatInvoker) -> Any:
     return graph.compile()
 
 
-def run_main_loop(group: Group, llm: ChatInvoker, project_root: str) -> MainLoopResult:
+def run_main_loop(
+    group: Group, llm: ChatInvoker, project_root: str, head_rev: str = ""
+) -> MainLoopResult:
     """跑一个审查单元的 Main 循环。
 
     Args:
         group: 审查单元
         llm: LLM 客户端
         project_root: 项目根目录
+        head_rev: 被审查的版本，工具据此读取源码而不是读工作区
 
     Returns:
         循环产出（退出原因、评论、未审 hunk 等）
@@ -361,7 +365,7 @@ def run_main_loop(group: Group, llm: ChatInvoker, project_root: str) -> MainLoop
     Raises:
         ValueError: 图在未设置 exit_reason 的情况下结束
     """
-    state = initial_state(group, project_root)
+    state = initial_state(group, project_root, head_rev)
     max_rounds = state["max_rounds"]
     logger.info(
         "开始审查 %s（%s，%d 个文件，%d 个 hunk，上限 %d 轮）",

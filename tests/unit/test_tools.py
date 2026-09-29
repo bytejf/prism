@@ -108,6 +108,100 @@ def test_file_read_without_project_root() -> None:
     assert "project_root" in result
 
 
+# ---------- 必须读「被审查版本」而不是工作区 ----------
+
+MAIN_GO = "\n".join(
+    [
+        "package main",
+        "",
+        "func Find(id string) string {",
+        '\treturn db.Query("WHERE id = ?", id)',
+        "}",
+        "",
+    ]
+)
+FEATURE_GO = "\n".join(
+    [
+        "package main",
+        "",
+        "func Find(id string) string {",
+        '\treturn db.Query("WHERE id = \'" + id + "\'")',
+        "}",
+        "",
+    ]
+)
+
+
+@pytest.fixture
+def divergence_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
+    """构造「工作区停在 main、被审查版本是 feature」的仓库。
+
+    main 与 feature 的 db.go 内容不同，用来检测工具到底读了哪一版。
+
+    Returns:
+        仓库路径（工作区在 main 上）
+    """
+    repo = tmp_path / "divergence"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "test")
+
+    (repo / "db.go").write_text(MAIN_GO, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "base")
+
+    git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "db.go").write_text(FEATURE_GO, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feature")
+
+    # 关键：工作区切回 main，模拟「审别人的 PR、自己 checkout 在 main」
+    git(repo, "checkout", "-q", "main")
+    return repo
+
+
+def test_file_read_reads_reviewed_revision_not_worktree(divergence_repo: Path) -> None:
+    """测试 file_read 读被审查版本，而不是工作区。
+
+    回归用例：审查目标是 feature，但工作区停在 main。
+    若读工作区，会拿到改之前的参数化查询，导致系统性漏报。
+    """
+    ctx = ToolContext(project_root=str(divergence_repo), head_rev="feature")
+    tool = make_file_read_tool(ctx)
+
+    result = tool.invoke({"path": "db.go", "start_line": 3, "end_line": 4})
+    assert "WHERE id = '\" + id + \"'" in result, "读到了工作区（main）的内容而不是被审查版本"
+    assert "WHERE id = ?" not in result
+
+
+def test_file_read_falls_back_to_worktree_without_head_rev(divergence_repo: Path) -> None:
+    """测试未指定 head_rev 时退化为读工作区。"""
+    ctx = ToolContext(project_root=str(divergence_repo))
+    tool = make_file_read_tool(ctx)
+
+    result = tool.invoke({"path": "db.go", "start_line": 3, "end_line": 4})
+    assert "WHERE id = ?" in result
+
+
+def test_file_read_unknown_head_rev_falls_back(divergence_repo: Path) -> None:
+    """测试 head_rev 无法解析时退化为读工作区，不抛异常。"""
+    ctx = ToolContext(project_root=str(divergence_repo), head_rev="no-such-branch")
+    tool = make_file_read_tool(ctx)
+
+    result = tool.invoke({"path": "db.go", "start_line": 3, "end_line": 4})
+    assert "WHERE id = ?" in result
+
+
+def test_file_read_rejects_traversal_even_with_head_rev(divergence_repo: Path) -> None:
+    """测试指定 head_rev 时路径校验依然生效。"""
+    ctx = ToolContext(project_root=str(divergence_repo), head_rev="feature")
+    tool = make_file_read_tool(ctx)
+
+    for bad in ("../outside.go", "/etc/hosts", "a/../../b.go"):
+        assert "错误" in tool.invoke({"path": bad, "start_line": 1, "end_line": 1})
+
+
 # ---------- code_search ----------
 
 
@@ -185,6 +279,28 @@ def test_code_search_without_project_root() -> None:
     """测试未设置 project_root 时返回错误文本。"""
     tool = make_code_search_tool(CONTEXT_WITHOUT_ROOT)
     assert "project_root" in tool.invoke({"pattern": "func"})
+
+
+def test_code_search_searches_reviewed_revision_not_worktree(divergence_repo: Path) -> None:
+    """测试 code_search 搜被审查版本，而不是工作区。
+
+    回归用例：审查目标是 feature，但工作区停在 main。
+    若搜工作区，会搜到改之前的代码，与 file_read 一起造成系统性漏报。
+    """
+    ctx = ToolContext(project_root=str(divergence_repo), head_rev="feature")
+    tool = make_code_search_tool(ctx)
+
+    result = tool.invoke({"pattern": r"WHERE id = '"})
+    assert "db.go" in result, "没搜到 feature 里的字符串拼接查询"
+
+    # 工作区（main）里的参数化查询不应出现在结果里
+    assert "WHERE id = ?" not in tool.invoke({"pattern": r"WHERE id = \?"})
+
+
+def test_code_search_falls_back_to_worktree_without_head_rev(divergence_repo: Path) -> None:
+    """测试未指定 head_rev 时搜工作区。"""
+    tool = make_code_search_tool(ToolContext(project_root=str(divergence_repo)))
+    assert "db.go" in tool.invoke({"pattern": r"WHERE id = \?"})
 
 
 # ---------- report_hunks ----------

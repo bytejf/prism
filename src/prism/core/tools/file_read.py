@@ -5,7 +5,7 @@
 """
 
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from langchain_core.tools import BaseTool, tool
 
@@ -45,17 +45,23 @@ def make_file_read_tool(ctx: ToolContext) -> BaseTool:
         logger.debug(
             "file_read 调用：path=%s start_line=%d end_line=%d", path, start_line, end_line
         )
+        if not ctx.project_root:
+            logger.warning("file_read 缺少 project_root")
+            return "错误：ToolContext.project_root 未设置"
+
+        # 路径校验放在读取之前：git 读取路径不经过文件系统的 resolve()，
+        # 若先读再校验，``../`` 会绕过检查
         try:
-            target = _resolve_inside_project(ctx.project_root, path)
+            _validate_relative_path(path)
         except ValueError as exc:
             logger.warning("file_read 路径校验失败：%s", exc)
             return f"错误：{exc}"
 
-        if not target.is_file():
-            logger.warning("file_read 文件不存在：%s", path)
+        text = _read_reviewed(ctx, path)
+        if text is None:
             return f"错误：文件不存在：{path}"
 
-        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = text.splitlines()
         total = len(lines)
         if start_line > total:
             logger.warning("file_read 起始行超界：%d > %d", start_line, total)
@@ -76,6 +82,59 @@ def make_file_read_tool(ctx: ToolContext) -> BaseTool:
         return body
 
     return file_read
+
+
+def _read_reviewed(ctx: ToolContext, path: str) -> str | None:
+    """读取被审查版本的文件内容，取不到时退化为读工作区。
+
+    必须先读被审查版本：审查目标是 head 分支，而工作区可能停在别的分支，
+    直接读工作区会拿到改之前的代码，导致系统性漏报。
+
+    Args:
+        ctx: 工具执行上下文
+        path: 文件相对路径
+
+    Returns:
+        文件文本；两边都取不到时返回 None
+    """
+    text = ctx.read_source(path)
+    if text is not None:
+        return text
+
+    try:
+        target = _resolve_inside_project(ctx.project_root, path)
+    except ValueError as exc:
+        logger.warning("file_read 路径校验失败：%s", exc)
+        return None
+
+    if not target.is_file():
+        logger.warning("file_read 文件不存在：%s", path)
+        return None
+    return target.read_text(encoding="utf-8", errors="replace")
+
+
+def _validate_relative_path(path: str) -> None:
+    """校验 path 是项目内的相对路径。
+
+    纯字符串判断，与文件系统无关，因此对 git 读取路径同样有效。
+
+    Args:
+        path: 待校验的路径
+
+    Raises:
+        ValueError: 空路径、绝对路径，或含 ``..`` 段
+    """
+    if not path.strip():
+        msg = "path 不能为空"
+        raise ValueError(msg)
+
+    candidate = PurePosixPath(path)
+    if candidate.is_absolute():
+        msg = f"必须是相对路径：{path}"
+        raise ValueError(msg)
+    if ".." in candidate.parts:
+        msg = f"路径不得包含 ..：{path}"
+        raise ValueError(msg)
 
 
 def _resolve_inside_project(project_root: str, path: str) -> Path:

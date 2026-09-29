@@ -48,6 +48,9 @@ def make_code_search_tool(ctx: ToolContext) -> BaseTool:
 
         Returns:
             匹配行列表（含文件路径、行号、内容）；无匹配或出错时返回说明文本
+
+        Notes:
+            ToolContext.head_rev 已设置时搜索该版本，否则搜索工作区。
         """
         limit = max(1, min(max_results, MAX_RESULTS))
         logger.debug(
@@ -73,9 +76,12 @@ def make_code_search_tool(ctx: ToolContext) -> BaseTool:
             "--extended-regexp",
             "-I",
             pattern,
-            "--",
-            file_pattern,
         ]
+        # 指定 rev 时搜的是该版本的树，而不是工作区 —— 工作区可能停在别的分支，
+        # 直接搜工作区会拿到改之前的代码
+        if ctx.head_rev:
+            command.append(ctx.head_rev)
+        command.extend(["--", file_pattern])
         try:
             completed = subprocess.run(
                 command,
