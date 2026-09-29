@@ -7,7 +7,6 @@ from pathlib import Path
 import pygit2
 import pytest
 
-from prism.core.ast.mapper import changed_lines
 from prism.core.diff.loader import load_diffs, resolve_commit
 from prism.core.diff.parser import parse_diff_text
 
@@ -276,75 +275,48 @@ def test_hunk_header_lines_match_body_walk(blank_line_repo: Path) -> None:
     assert checked >= 2, "样例应产生至少两个 hunk"
 
 
-def test_blank_lines_survive_in_hunk_body(blank_line_repo: Path) -> None:
-    """测试空源码行的上下文行（git 输出为单个空格）在正文里保留。
+def test_load_diffs_uses_zero_context(blank_line_repo: Path) -> None:
+    """测试 load_diffs 产出的是 -U0（零上下文）diff。
 
-    回归用例：按 line.strip() 判断有效性会把它丢掉，导致 hunk.content
-    里所有空源码行消失、上述不变量失配。
+    `changed_lines` 直接读头字段，成立的前提就是 hunk 里只有改动行：
+    正文行数必须等于 new_lines + old_lines，且每行只能是 + 或 -（外加
+    `\\ No newline` 标记）。这条断言守住这个前提。
     """
     diffs = load_diffs(blank_line_repo, "main", "feature")
-    bodies = [hunk.content for diff in diffs for hunk in diff.hunks]
+    hunks = [hunk for diff in diffs for hunk in diff.hunks]
+    assert hunks
 
-    assert any("\n \n" in body for body in bodies), "正文里应有单空格上下文行"
-    for body in bodies:
-        for line in body.splitlines()[1:]:
-            if not line.startswith("\\"):
-                assert line[:1] in (" ", "+", "-"), f"非法正文行：{line!r}"
+    for hunk in hunks:
+        body = [ln for ln in hunk.content.splitlines()[1:] if not ln.startswith("\\")]
+        assert len(body) == hunk.new_lines + hunk.old_lines, f"{hunk.content} 不是 -U0"
+        for line in body:
+            assert line[:1] in ("+", "-"), f"-U0 下不应出现上下文行：{line!r}"
 
 
-def test_changed_lines_match_git_u0_headers(blank_line_repo: Path) -> None:
-    """把推导出的改动行与 `git diff -U0` 的头字段对齐。
+def test_load_diffs_matches_git_cli_u0_headers(blank_line_repo: Path) -> None:
+    """测试 pygit2 取到的 -U0 diff 与 git 命令行的 `git diff -U0` 逐行一致。
 
-    `-U0` 下每个 hunk 只含改动行，头 ``@@ -a,b +c,d @@`` 直接给出改动行的
-    起始与行数 —— 这是「行号精确」的权威来源。
-
-    两种上下文下 hunk 的**划分**不同（-U3 会把相近改动合并），但**改动行的
-    集合**必须完全一致。这条不变量证明了：我们从 hunk 正文推导的改动行与 git
-    自己的口径逐行吻合，因此运行时不需要再跑一遍 `-U0`。
+    pygit2 走的是 libgit2，与 git 命令行是两个实现。这条断言确保
+    `repo.diff(..., context_lines=0)` 产出的头字段（起始行 / 行数）与
+    git 自己一致 —— 归属判定直接依赖这些数字。
     """
-    u0_patch = subprocess_run_u0(blank_line_repo)
-    assert u0_patch, "git diff -U0 应产生输出"
-
-    u3: dict[str, tuple[set[int], set[int]]] = {}
-    for diff in load_diffs(blank_line_repo, "main", "feature"):
-        added: set[int] = set()
-        removed: set[int] = set()
-        for hunk in diff.hunks:
-            hunk_added, hunk_removed = changed_lines(hunk)
-            added.update(hunk_added)
-            removed.update(hunk_removed)
-        u3[diff.path] = (added, removed)
-
-    u0: dict[str, tuple[set[int], set[int]]] = {}
-    for diff in parse_diff_text(u0_patch):
-        added = set()
-        removed = set()
-        for hunk in diff.hunks:
-            hunk_added, hunk_removed = changed_lines(hunk)
-            added.update(hunk_added)
-            removed.update(hunk_removed)
-        u0[diff.path] = (added, removed)
-
-    assert u3, "样例应产生 diff"
-    for path, (added, removed) in u3.items():
-        assert u0[path] == (added, removed), f"{path} 的改动行与 -U0 不一致"
-    assert any(added for added, _ in u3.values()), "样例应至少有新增行"
-
-
-def subprocess_run_u0(repo: Path) -> str:
-    """跑一次 `git diff -U0 main feature`。
-
-    Args:
-        repo: 仓库路径
-
-    Returns:
-        diff 文本
-    """
-    completed = subprocess.run(
+    cli_patch = subprocess.run(
         ["git", "-c", "core.quotepath=false", "diff", "-U0", "main", "feature"],
-        cwd=repo,
+        cwd=blank_line_repo,
         capture_output=True,
         text=True,
         check=True,
-    )
-    return completed.stdout
+    ).stdout
+    assert cli_patch, "git diff -U0 应产生输出"
+
+    def headers(patch: str) -> dict[str, list[tuple[int, int, int, int]]]:
+        return {
+            diff.path: [(h.old_start, h.old_lines, h.new_start, h.new_lines) for h in diff.hunks]
+            for diff in parse_diff_text(patch)
+        }
+
+    ours = {
+        diff.path: [(h.old_start, h.old_lines, h.new_start, h.new_lines) for h in diff.hunks]
+        for diff in load_diffs(blank_line_repo, "main", "feature")
+    }
+    assert ours == headers(cli_patch)

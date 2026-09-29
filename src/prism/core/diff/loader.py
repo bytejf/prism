@@ -14,6 +14,16 @@ from prism.models.diff import Diff
 
 logger = logging.getLogger(__name__)
 
+# diff 的上下文行数。0 表示只输出改动行，等价于 `git diff -U0`。
+#
+# 这样 hunk 头里的 new_start/new_lines 就是「新增行的起始与数量」、
+# old_start/old_lines 就是「删除行的起始与数量」，归属判定直接读头即可，
+# 不必再遍历正文把上下文行和改动行分开推。
+#
+# 审查单元是 Group（同包文件的所有 hunk 在一个会话里审），不是单个 hunk，
+# 所以 hunk 变细不影响调用 LLM 的次数，只是让报告粒度更准。
+CONTEXT_LINES = 0
+
 
 def resolve_commit(repo: pygit2.Repository, rev: str) -> pygit2.Commit:
     """把分支名 / 标签 / SHA 解析为 Commit 对象。
@@ -115,7 +125,7 @@ def load_diffs(repo_path: str | Path, base: str, head: str) -> list[Diff]:
     """
     repo, diff_base, head_commit = resolve_range(repo_path, base, head)
 
-    diff = repo.diff(diff_base, head_commit)
+    diff = repo.diff(diff_base, head_commit, context_lines=CONTEXT_LINES)
     # 显式开启重命名检测：libgit2 默认走 diff.renames 配置项且不实现 git 的
     # 隐式默认值（true），不开启会把 `R old.go -> new.go` 拆成「删 + 增」两个文件
     diff.find_similar(pygit2.enums.DiffFind.FIND_RENAMES)

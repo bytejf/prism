@@ -3,10 +3,10 @@
 用 tree-sitter 提取源码里的符号行号范围，与 hunk 的**改动行**求交，
 把每个 hunk 归属到包含其改动行的符号上。
 
-为什么用改动行而不是整个 hunk 范围：diff 默认带 3 行上下文，hunk 范围
-常常越过函数边界。按整段范围求交会把改动其实不在里面的相邻函数也挂上
-（实测真实 PR 里 30% 的 hunk 会拿到多个符号，其中约 2/3 是上下文造成的
-膨胀）。改用改动行后，只有真正包含改动行的符号才会命中。
+diff 用 `-U0` 生成（见 `loader.CONTEXT_LINES`），hunk 里只有改动行，
+所以行号直接来自头字段。归属判定用改动行而不是 hunk 范围，是因为
+按整段范围求交会把改动其实不在里面的相邻符号也挂上；用改动行后
+只有真正包含改动的符号才会命中。
 """
 
 import logging
@@ -49,9 +49,6 @@ KIND_LABELS: dict[str, str] = {
     KIND_INTERFACE: "接口",
     KIND_TYPE: "类型",
 }
-
-# `\ No newline at end of file` 标记行的行首字符
-_MARKER_PREFIX = "\\"
 
 
 def map_hunks_to_symbols(
@@ -104,36 +101,21 @@ def map_hunks_to_symbols(
 
 
 def changed_lines(hunk: Hunk) -> tuple[list[int], list[int]]:
-    """取出 hunk 的改动行号（不含上下文行）。
+    """取出 hunk 的改动行号。
 
-    行号口径与 git 一致：
-    - 上下文行（空格开头）：两侧行号都前进
-    - 新增行（``+``）：记入新文件侧，只有新文件侧前进
-    - 删除行（``-``）：记入旧文件侧，只有旧文件侧前进
-    - ``\\ No newline at end of file`` 标记行不占文件行号
+    diff 由 `loader.CONTEXT_LINES = 0`（等价 `git diff -U0`）生成，hunk 里
+    只有改动行、没有上下文行，因此头字段本身就是改动行的位置与数量：
+    新文件侧是 ``[new_start, new_start + new_lines - 1]``，旧文件侧同理，
+    该侧行数为 0 时表示这一侧没有改动行。
 
     Args:
         hunk: 待解析的 hunk
 
     Returns:
-        (新增行号列表, 删除行号列表)，均为 1-based，按出现顺序
+        (新增行号列表, 删除行号列表)，均为 1-based
     """
-    new_no, old_no = hunk.new_start, hunk.old_start
-    added: list[int] = []
-    removed: list[int] = []
-
-    for line in hunk.content.splitlines()[1:]:
-        if line.startswith("+"):
-            added.append(new_no)
-            new_no += 1
-        elif line.startswith("-"):
-            removed.append(old_no)
-            old_no += 1
-        elif line.startswith(_MARKER_PREFIX):
-            continue
-        else:
-            new_no += 1
-            old_no += 1
+    added = list(range(hunk.new_start, hunk.new_start + hunk.new_lines)) if hunk.new_lines else []
+    removed = list(range(hunk.old_start, hunk.old_start + hunk.old_lines)) if hunk.old_lines else []
     return added, removed
 
 

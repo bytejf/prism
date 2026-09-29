@@ -67,45 +67,24 @@ def test_display_range_falls_back_to_old_side_for_pure_deletion() -> None:
     assert display_range(make_hunk(10, 3, 9, 0)) == (10, 12)
 
 
-def test_changed_lines_separates_added_and_removed() -> None:
-    """测试改动行号推导：上下文两侧前进，+ 只进新侧，- 只进旧侧。"""
-    content = "\n".join(
-        [
-            "@@ -10,5 +12,6 @@",
-            " ctx1",
-            "-old1",
-            "+new1",
-            "+new2",
-            " ctx2",
-            "-old2",
-        ]
-    )
-    added, removed = changed_lines(make_hunk(10, 5, 12, 6, content))
-    # 新文件侧：12=ctx1, 13=new1, 14=new2, 15=ctx2
+def test_changed_lines_reads_header_for_modification() -> None:
+    """测试改动行直接来自头字段（-U0 下头字段就是改动行）。"""
+    content = "\n".join(["@@ -11,1 +13,2 @@", "-old1", "+new1", "+new2"])
+    added, removed = changed_lines(make_hunk(11, 1, 13, 2, content))
     assert added == [13, 14]
-    # 旧文件侧：10=ctx1, 11=old1, 12=ctx2, 13=old2
-    assert removed == [11, 13]
+    assert removed == [11]
 
 
-def test_changed_lines_ignores_no_newline_marker() -> None:
-    """测试 `\\ No newline at end of file` 标记行不占行号。"""
-    content = "\n".join(
-        [
-            "@@ -1,2 +1,2 @@",
-            " keep",
-            "-old",
-            "\\ No newline at end of file",
-            "+new",
-            "\\ No newline at end of file",
-        ]
-    )
-    added, removed = changed_lines(make_hunk(1, 2, 1, 2, content))
-    assert added == [2]
-    assert removed == [2]
+def test_changed_lines_pure_addition_has_no_removed() -> None:
+    """测试纯新增 hunk（旧文件侧行数为 0）。"""
+    content = "\n".join(["@@ -14,0 +16,1 @@", "+ErrInvalid"])
+    added, removed = changed_lines(make_hunk(14, 0, 16, 1, content))
+    assert added == [16]
+    assert removed == []
 
 
 def test_changed_lines_pure_deletion_has_no_added() -> None:
-    """测试纯删除 hunk 没有新增行。"""
+    """测试纯删除 hunk（新文件侧行数为 0）。"""
     content = "\n".join(["@@ -10,3 +9,0 @@", "-a", "-b", "-c"])
     added, removed = changed_lines(make_hunk(10, 3, 9, 0, content))
     assert added == []
@@ -197,11 +176,13 @@ def go_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
     return repo
 
 
-def test_map_hunks_ignores_context_spill(go_repo: Path, git: Callable[..., None]) -> None:
-    """测试归属只看改动行，不被上下文行带到相邻函数。
+def test_map_hunks_attributes_to_the_changed_function(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """测试归属到真正包含改动的函数。
 
-    diff 带 3 行上下文，hunk 范围会溢出到后面的 Helper，但改动只落在 Run 内，
-    因此只应归属 Run —— 这正是「按 hunk 范围求交」会误挂 Helper 的场景。
+    改动是 Run 里新增的一行，hunk（-U0）只含这一行，因此只归属 Run，
+    不会牵连后面的 Helper。
     """
     diffs = filter_files(load_diffs(go_repo, "main", "feature")).reviewable
     mapped = map_hunks_to_symbols(go_repo, "main", "feature", diffs)
@@ -212,10 +193,10 @@ def test_map_hunks_ignores_context_spill(go_repo: Path, git: Callable[..., None]
     assert item.file_path == "svc.go"
     assert [s.name for s in item.symbols] == ["Run"]
 
-    # 反向确认：Helper 确实落在 hunk 的块范围内（所以旧规则会误挂）
-    helper_line = MODIFIED_GO.splitlines().index("func Helper() {") + 1
-    hunk_end = item.hunk.new_start + item.hunk.new_lines - 1
-    assert item.hunk.new_start <= helper_line <= hunk_end
+    added, _ = changed_lines(item.hunk)
+    assert len(added) == 1
+    lines = MODIFIED_GO.splitlines()
+    assert lines[added[0] - 1].strip() == 'fmt.Println("extra")'
 
 
 def test_map_hunks_between_functions_has_no_symbol(go_repo: Path, git: Callable[..., None]) -> None:
@@ -242,8 +223,6 @@ def test_map_hunks_between_functions_has_no_symbol(go_repo: Path, git: Callable[
     added, _ = changed_lines(item.hunk)
     lines = MODIFIED_GAP_GO.splitlines()
     assert [lines[ln - 1] for ln in added] == ["// Helper 只做打印。"]
-    # 块范围却横跨两个函数 —— 这正是「按 hunk 范围求交」会误挂的原因
-    assert item.hunk.new_start < added[0] < item.hunk.new_start + item.hunk.new_lines - 1
 
 
 def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[..., None]) -> None:
