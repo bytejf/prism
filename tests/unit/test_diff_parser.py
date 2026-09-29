@@ -292,3 +292,34 @@ def test_parse_empty_text() -> None:
     """测试空文本返回空列表。"""
     assert parse_diff_text("") == []
     assert parse_diff_text("\n\n") == []
+
+
+def test_hunk_keeps_blank_context_lines() -> None:
+    """测试空源码行的上下文行被保留。
+
+    回归用例：git 对空源码行的上下文行输出「单个空格」，而按 line.strip()
+    判断有效性会把它丢掉 —— 结果是 hunk.content 里所有空源码行消失、
+    行号错位，送进 LLM 的 diff 文本也与实际不符。
+    """
+    text = "\n".join(
+        [
+            "diff --git a/a.go b/a.go",
+            "--- a/a.go",
+            "+++ b/a.go",
+            "@@ -1,4 +1,5 @@",
+            " package main",
+            " ",
+            "+// 新增注释",
+            " func Run() {}",
+            " ",
+        ]
+    )
+    hunks = parse_diff_text(text)[0].hunks
+    assert len(hunks) == 1
+
+    hunk = hunks[0]
+    body = hunk.content.splitlines()[1:]
+    assert body == [" package main", " ", "+// 新增注释", " func Run() {}", " "]
+    # 头声明的行数与正文一致（1 上下文 + 1 空行 + 1 上下文 + 1 新增 + 1 上下文）
+    assert hunk.new_lines == len(body)
+    assert hunk.old_lines == len(body) - 1

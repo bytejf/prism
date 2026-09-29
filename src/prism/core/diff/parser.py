@@ -63,18 +63,19 @@ def _split_blocks(lines: list[str]) -> list[list[str]]:
         文件块列表，每块是若干行
     """
     blocks: list[list[str]] = []
-    headerless = False  # 当前块是否为手写 diff（无 diff --git 头）
 
     for line in lines:
         if line.startswith("diff --git "):
             blocks.append([line])
-            headerless = False
-        elif headerless or (blocks and line.strip()):
+        elif blocks:
+            # 块已开始，后续行一律归属它 —— 包括空行，以及
+            # 空源码行的上下文行（git 会输出成单个空格 " "）。
+            # 不能用 line.strip() 判断有效性：那会把 " " 丢掉，
+            # 导致 hunk.content 里所有空源码行凭空消失、行号错位。
             blocks[-1].append(line)
         elif line.strip():
             # 手写 diff：没有 diff --git 头，从第一个非空行开始整块收下
             blocks.append([line])
-            headerless = True
     return blocks
 
 
