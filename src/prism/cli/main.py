@@ -6,13 +6,15 @@ V1 只提供 `--version`，后续模块逐步加入 `diff` / `filter` / `hunk-ma
 
 import logging
 from importlib.metadata import version
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import typer
 
 from prism.core.ast.mapper import format_location, format_symbols, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
+from prism.core.grouping.packages import group_by_package
+from prism.models.ast import HunkWithSymbol
 from prism.models.diff import Diff
 from prism.observability.logging import setup_logging
 
@@ -83,6 +85,38 @@ def _load_or_exit(base: str, head: str) -> list[Diff]:
         raise typer.Exit(code=1) from exc
 
 
+def _plural(count: int, word: str) -> str:
+    """渲染带单复数的计数文本。
+
+    Args:
+        count: 数量
+        word: 单数名词，如 "file"
+
+    Returns:
+        ``1 file`` 或 ``3 files``
+    """
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def _map_or_exit(base: str, head: str) -> list[HunkWithSymbol]:
+    """跑完审查前流程（diff → 过滤 → hunk 映射），失败时终止进程。
+
+    Args:
+        base: base 分支 / 版本
+        head: head 分支 / 版本
+
+    Returns:
+        带归属符号的 hunk 列表
+    """
+    reviewable = filter_files(_load_or_exit(base, head)).reviewable
+    try:
+        return map_hunks_to_symbols(Path.cwd(), base, head, reviewable)
+    except ValueError as exc:
+        logger.error("hunk 映射失败: %s", exc)
+        typer.echo(f"错误：{exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @app.command()
 def diff(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
@@ -110,12 +144,12 @@ def filter(
     diffs = _load_or_exit(base, head)
     result = filter_files(diffs)
 
-    typer.echo(f"Reviewable: {len(result.reviewable)} files")
+    typer.echo(f"Reviewable: {_plural(len(result.reviewable), 'file')}")
     for item in result.reviewable:
         typer.echo(f"  {item.path}")
 
     typer.echo("")
-    typer.echo(f"Skipped: {len(result.skipped)} files")
+    typer.echo(f"Skipped: {_plural(len(result.skipped), 'file')}")
     for skipped in result.skipped:
         typer.echo(f"  {skipped.path} ({skipped.reason})")
 
@@ -130,18 +164,42 @@ def hunk_map(
     只处理通过文件过滤的 .go 文件。
     """
     logger.info("映射 hunk: base=%s head=%s", base, head)
-    reviewable = filter_files(_load_or_exit(base, head)).reviewable
-
-    try:
-        mapped = map_hunks_to_symbols(Path.cwd(), base, head, reviewable)
-    except ValueError as exc:
-        logger.error("hunk 映射失败: %s", exc)
-        typer.echo(f"错误：{exc}", err=True)
-        raise typer.Exit(code=1) from exc
+    mapped = _map_or_exit(base, head)
 
     if not mapped:
         typer.echo("没有可映射的 hunk")
         return
 
     blocks = [f"{format_location(item)}\n  归属：{format_symbols(item.symbols)}" for item in mapped]
+    typer.echo("\n\n".join(blocks))
+
+
+@app.command()
+def group(
+    base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
+    head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+) -> None:
+    """按包路径分组，打印审查单元（不调用 LLM）。
+
+    这是审查前流程的最后一个环节：输出即为送入 LLM 的「审查单元」。
+    """
+    logger.info("分组: base=%s head=%s", base, head)
+    groups = group_by_package(_map_or_exit(base, head))
+
+    if not groups:
+        typer.echo("没有可审查的 hunk")
+        return
+
+    blocks = []
+    for index, item in enumerate(groups, start=1):
+        header = (
+            f"Group {index}: {item.package_path} "
+            f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
+        )
+        lines = [header]
+        for path in item.files:
+            hunk_ids = ", ".join(h.hunk_id for h in item.hunks if h.file_path == path)
+            lines.append(f"  - {PurePosixPath(path).name} ({hunk_ids})")
+        blocks.append("\n".join(lines))
+
     typer.echo("\n\n".join(blocks))
