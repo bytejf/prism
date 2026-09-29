@@ -1,7 +1,67 @@
 """Prism CLI 入口。
 
-子命令：`diff` / `filter` / `hunk-map` / `group` 只跑审查前流程，
-`review` 串起完整链路（审查前 → 审查中 → 审查后）。
+本模块是全部可执行命令的唯一入口（`[project.scripts] prism = "prism.cli.main:app"`）。
+下面是命令总览；每条命令的详细参数见各自的 `--help`，实现见本文件内的同名函数。
+
+## 全局
+
+    prism --version                 显示版本号并退出
+    prism --help / prism            打印帮助（不带子命令时）
+
+    所有命令都在「当前工作目录」这个 git 仓库里运行，以 merge-base(base, head)
+    为基准比较，所以只统计 PR 实际引入的改动 —— base 分支上的新提交不会混进来。
+
+## 审查前流程（确定性，不调用 LLM、零 token 成本）
+
+纯读取命令，用于在花钱调 LLM 之前确认「改了什么、审哪些、怎么分组」。
+四个命令依次是流水线的下一个环节，可以逐个跑、逐个核对。
+
+    prism diff      [--base main] [--head HEAD]
+        加载并解析 diff，打印文件数 / hunk 数 / 增删行数。
+        对应 core/diff/：pygit2 算 merge-base + 状态机解析 unified diff。
+
+    prism filter    [--base main] [--head HEAD]
+        按规则过滤文件，打印可审查 / 跳过清单（含跳过原因）。
+        三级过滤：硬性排除（二进制 / 符号链接）→ 扩展名白名单（.go）
+        → 内置降噪（*_test.go、*.pb.go）。对应 core/filter/。
+
+    prism hunk-map  [--base main] [--head HEAD]
+        把每个 hunk 归属到它重叠的函数 / 方法，打印 hunk 位置与归属符号。
+        只处理通过过滤的 .go 文件。对应 core/ast/：
+        tree-sitter 提取 function_declaration / method_declaration 的行号范围后求交。
+
+    prism group     [--base main] [--head HEAD]
+        按包路径（目录）分组，打印审查单元。
+        这是审查前流程的最后一个环节，输出即为送进 LLM 的「审查单元」。
+        对应 core/grouping/。
+
+## 完整审查（调用 LLM，产生 token 成本）
+
+    prism review    [--base main] [--head HEAD]
+        串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。
+
+        审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
+        想看完整轨迹设 `PRISM_LOG_LEVEL=DEBUG`，想只看结果设 `PRISM_LOG_LEVEL=WARNING`。
+
+        需要环境变量 `DEEPSEEK_API_KEY`，缺失时以退出码 1 明确报错。
+
+        退出码：0 正常（含 0 条评论）；1 参数 / 环境 / git 错误。
+
+## 典型用法
+
+    # 先干跑一遍看清范围（不花钱），确认后再真审
+    prism group  --base main --head origin/some-branch
+    prism review --base main --head origin/some-branch
+
+    # 排查「为什么某个文件没被审」
+    prism filter --base main --head origin/some-branch
+
+    # 排查「某个 hunk 归属不准」
+    prism hunk-map --base main --head origin/some-branch
+
+注意：`review` 的 `--head` 是**被审查的版本**，工具读源码时读的就是它，
+不是当前工作区。所以工作区停在别的分支也能正确审查
+（见 core/tools/context.py 的 head_rev）。
 """
 
 import logging

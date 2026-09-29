@@ -1,0 +1,94 @@
+# Prism
+
+一个**确定性优先**的 Go 代码审查 Agent。
+
+传统 linter 只能发现模式化问题，纯 LLM 审查又贵、幻觉多、不可复现。
+Prism 用「确定性优先 + LLM 补充」的混合架构：能用规则判定的绝不调 LLM。
+
+## 安装
+
+```bash
+uv sync
+```
+
+## 快速开始
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+
+# 先干跑一遍看清范围（不花钱、不调用 LLM）
+prism group --base main --head origin/some-branch
+
+# 确认后再真审
+prism review --base main --head origin/some-branch
+```
+
+`review` 的输出：
+
+```
+=== Prism Code Review ===
+审查范围：merge-base(main, feature)..feature
+文件数：3 | 评论数：5
+
+─── db.go ───
+[安全-SQL注入 · high]
+将参数化查询改为字符串拼接，id 直接拼入 SQL，存在严重 SQL 注入漏洞。……
+
+=== 统计 ===
+high: 4 | medium: 1 | low: 0
+```
+
+## 命令
+
+全部命令都在**当前工作目录**这个 git 仓库里运行，以 `merge-base(base, head)`
+为基准比较，只统计 PR 实际引入的改动。
+
+### 审查前流程（确定性，不调用 LLM）
+
+四个命令依次是流水线的下一个环节，可以逐个跑、逐个核对：
+
+| 命令 | 功能 |
+|------|------|
+| `prism diff` | 加载并解析 diff，打印文件数 / hunk 数 / 增删行数 |
+| `prism filter` | 按规则过滤文件，打印可审查 / 跳过清单（含跳过原因） |
+| `prism hunk-map` | 把每个 hunk 归属到它重叠的函数 / 方法 |
+| `prism group` | 按包路径分组，输出即为送进 LLM 的「审查单元」 |
+
+### 完整审查（调用 LLM）
+
+| 命令 | 功能 |
+|------|------|
+| `prism review` | diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染 |
+
+带 `--base` / `--head` 选项（默认 `main` / `HEAD`）。完整命令清单与参数见
+`prism --help`。
+
+## 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `DEEPSEEK_API_KEY` | **必填**（仅 `review` 需要）。缺失时 `review` 以退出码 1 明确报错 |
+| `PRISM_LOG_LEVEL` | 日志级别，默认 `INFO`。只作用于 `prism` 命名空间，不影响第三方库。想看完整轨迹设 `DEBUG`，想只看结果设 `WARNING` |
+
+## 设计要点
+
+- **工具读「被审查版本」而不是工作区** —— `--head` 指哪就读哪，
+  工作区停在别的分支也能正确审查
+- **hunk → 函数映射走 AST** —— tree-sitter 提取函数行号范围后求交，
+  不靠 LLM 猜测
+- **进度由代码统计** —— LLM 只报告原始结论，完成状态、剩余清单都由代码维护
+- **输出顺序可复现** —— 按 severity + 文件路径排序，同一输入两次运行结果一致
+
+## 开发
+
+```bash
+uv run pytest tests/unit/     # 单元测试（不调用 LLM）
+uv run pytest tests/e2e/      # 端到端 smoke test（真实调用 LLM）
+uv run pytest tests/          # 全部
+uv run ruff check . && uv run ruff format --check .
+uv run mypy src/ tests/
+```
+
+测试用的 Go 项目在 `tests/fixtures/go-sample/`（`base/` 无 bug、`buggy/` 埋了 5 个），
+由测试用 `tmp_path` 程序化构造成临时 git 仓库。
+`tests/fixtures/go-sample/BUGS.md` 记录了埋入的 bug 清单。
