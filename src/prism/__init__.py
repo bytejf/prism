@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from prism!")
+"""Prism — 确定性优先的 Go 代码审查 Agent。"""

@@ -1,7 +1,7 @@
 [project]
 name = "prism"
 version = "0.1.0"
-description = "Add your description here"
+description = "A deterministic-first code review agent for Go"
 readme = "README.md"
 authors = [
     { name = "huhu", email = "2420183374@qq.com" }
@@ -9,12 +9,47 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "langchain>=1.4.2",
+    "langchain-openai>=1.6.6",
+    "langfuse>=4.15.6",
     "langgraph>=1.2.12",
+    "pygit2>=1.20.1",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-go>=0.25.0",
+    "typer>=0.27.2",
 ]
 
 [project.scripts]
-prism = "prism:main"
+prism = "prism.cli.main:app"
 
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # 中文全角标点，代码规范要求中文注释
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
