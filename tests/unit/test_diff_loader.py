@@ -1,6 +1,6 @@
 """diff 加载的单元测试（用临时 git 仓库）。"""
 
-import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pygit2
@@ -9,23 +9,8 @@ import pytest
 from prism.core.diff.loader import load_diffs, resolve_commit
 
 
-def _git(repo: Path, *args: str) -> None:
-    """在指定仓库内执行 git 命令。
-
-    Args:
-        repo: 仓库路径
-        args: git 子命令及参数
-    """
-    subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
 @pytest.fixture
-def sample_repo(tmp_path: Path) -> Path:
+def sample_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
     """构造含 main / feature 两个分支的临时仓库。
 
     main:    a.go（a() 无输出）
@@ -36,19 +21,19 @@ def sample_repo(tmp_path: Path) -> Path:
     """
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "test@example.com")
-    _git(repo, "config", "user.name", "test")
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "test")
 
     (repo / "a.go").write_text("package main\n\nfunc a() {}\n", encoding="utf-8")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "init")
 
-    _git(repo, "checkout", "-q", "-b", "feature")
+    git(repo, "checkout", "-q", "-b", "feature")
     (repo / "a.go").write_text("package main\n\nfunc a() { println(1) }\n", encoding="utf-8")
     (repo / "b.go").write_text("package main\n\nfunc b() {}\n", encoding="utf-8")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "feature")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "feature")
     return repo
 
 
@@ -67,12 +52,12 @@ def test_load_diffs_returns_changed_files(sample_repo: Path) -> None:
     assert modified.deletions == 1
 
 
-def test_load_diffs_uses_merge_base(sample_repo: Path) -> None:
+def test_load_diffs_uses_merge_base(sample_repo: Path, git: Callable[..., None]) -> None:
     """测试以 merge-base 为基准：base 分支上的新提交不进入 diff。"""
-    _git(sample_repo, "checkout", "-q", "main")
+    git(sample_repo, "checkout", "-q", "main")
     (sample_repo / "c.go").write_text("package main\n\nfunc c() {}\n", encoding="utf-8")
-    _git(sample_repo, "add", ".")
-    _git(sample_repo, "commit", "-q", "-m", "main only")
+    git(sample_repo, "add", ".")
+    git(sample_repo, "commit", "-q", "-m", "main only")
 
     diffs = load_diffs(sample_repo, "main", "feature")
     assert {d.path for d in diffs} == {"a.go", "b.go"}
@@ -97,7 +82,7 @@ def test_load_diffs_rejects_non_repo(tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def edge_repo(tmp_path: Path) -> Path:
+def edge_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
     """构造含二进制文件 / 删除文件 / 重命名文件的临时仓库。
 
     main:    a.go、del.go、old.go、logo.png
@@ -108,28 +93,28 @@ def edge_repo(tmp_path: Path) -> Path:
     """
     repo = tmp_path / "edge"
     repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "test@example.com")
-    _git(repo, "config", "user.name", "test")
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "test")
 
     (repo / "a.go").write_text("package main\n", encoding="utf-8")
     (repo / "del.go").write_text("old content\n", encoding="utf-8")
     # 5 行文件，重命名后只改 1 行：相似度 58%，git 会判为 R058 重命名
     (repo / "old.go").write_text("package main\n\nfunc old() {\n\treturn\n}\n", encoding="utf-8")
     (repo / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "init")
 
-    _git(repo, "checkout", "-q", "-b", "feature")
+    git(repo, "checkout", "-q", "-b", "feature")
     (repo / "a.go").write_text("package main\n\nfunc a() {}\n", encoding="utf-8")
     (repo / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\xff" * 16)
-    _git(repo, "rm", "-q", "del.go")
-    _git(repo, "mv", "old.go", "renamed.go")
+    git(repo, "rm", "-q", "del.go")
+    git(repo, "mv", "old.go", "renamed.go")
     (repo / "renamed.go").write_text(
         "package main\n\nfunc renamed() {\n\treturn\n}\n", encoding="utf-8"
     )
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "feature")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feature")
     return repo
 
 

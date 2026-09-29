@@ -10,6 +10,7 @@ from pathlib import Path
 
 import typer
 
+from prism.core.ast.mapper import format_location, format_symbols, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.models.diff import Diff
@@ -117,3 +118,30 @@ def filter(
     typer.echo(f"Skipped: {len(result.skipped)} files")
     for skipped in result.skipped:
         typer.echo(f"  {skipped.path} ({skipped.reason})")
+
+
+@app.command()
+def hunk_map(
+    base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
+    head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+) -> None:
+    """把每个 hunk 归属到函数 / 方法，打印映射结果（不调用 LLM）。
+
+    只处理通过文件过滤的 .go 文件。
+    """
+    logger.info("映射 hunk: base=%s head=%s", base, head)
+    reviewable = filter_files(_load_or_exit(base, head)).reviewable
+
+    try:
+        mapped = map_hunks_to_symbols(Path.cwd(), base, head, reviewable)
+    except ValueError as exc:
+        logger.error("hunk 映射失败: %s", exc)
+        typer.echo(f"错误：{exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if not mapped:
+        typer.echo("没有可映射的 hunk")
+        return
+
+    blocks = [f"{format_location(item)}\n  归属：{format_symbols(item.symbols)}" for item in mapped]
+    typer.echo("\n\n".join(blocks))
