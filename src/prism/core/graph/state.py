@@ -61,17 +61,32 @@ class MainLoopResult:
         group_id: 审查单元编号
         exit_reason: 退出原因
         round_count: 实际跑了多少轮
-        comments: 收集到的原始评论
+        hunk_comments: hunk 编号 → 该 hunk 收集到的评论（按编号排序）
         pending_hunk_ids: 退出时仍未审查完毕的 hunk 编号
-        round_trace: 逐轮摘要，用于打印运行日志
     """
 
     group_id: str
     exit_reason: str
     round_count: int
-    comments: list[CommentInput] = field(default_factory=list)
+    hunk_comments: dict[str, list[CommentInput]] = field(default_factory=dict)
     pending_hunk_ids: list[str] = field(default_factory=list)
-    round_trace: list[str] = field(default_factory=list)
+
+    @property
+    def comments(self) -> list[CommentInput]:
+        """所有评论，按 hunk 编号顺序展开。
+
+        按 hunk 编号键控而不是拍平成一个列表，是因为 CommentInput
+        本身不带 hunk_id —— 只有携带它的容器才知道评论属于哪个 hunk
+        （输出阶段需要靠它补文件路径）。
+
+        Returns:
+            评论列表
+        """
+        return [
+            comment
+            for hunk_id in sorted(self.hunk_comments)
+            for comment in self.hunk_comments[hunk_id]
+        ]
 
 
 def max_rounds_for(hunk_count: int) -> int:

@@ -383,19 +383,24 @@ def run_main_loop(group: Group, llm: ChatInvoker, project_root: str) -> MainLoop
         raise ValueError(msg)
 
     ctx = final["tool_context"]
-    comments = list(ctx.all_comments)
+    # 按 hunk 编号键控返回：CommentInput 不带 hunk_id，
+    # 输出阶段要靠这个键补文件路径
+    hunk_comments = {
+        hunk_id: list(status.comments) for hunk_id, status in sorted(ctx.hunk_status.items())
+    }
+    total_comments = sum(len(items) for items in hunk_comments.values())
     logger.info(
         "结束审查 %s：exit_reason=%s，轮次 %d，评论 %d 条，未审 %d 个",
         group.group_id,
         exit_reason,
         final["round_count"],
-        len(comments),
+        total_comments,
         len(ctx.pending_ids()),
     )
     return MainLoopResult(
         group_id=group.group_id,
         exit_reason=exit_reason,
         round_count=final["round_count"],
-        comments=comments,
+        hunk_comments=hunk_comments,
         pending_hunk_ids=ctx.pending_ids(),
     )
