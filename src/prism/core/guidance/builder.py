@@ -126,3 +126,54 @@ def _render_finish() -> str:
             "如果有 hunk 未标记 complete，end_done 会被拒绝，并提示剩余 hunk。",
         )
     )
+
+
+def build_diff_text(group: Group) -> str:
+    """把本组 hunk 渲染成 diff 文本。
+
+    hunk.content 含 @@ 头与内容行但不含文件路径，这里按文件分组补上。
+
+    Args:
+        group: 审查单元
+
+    Returns:
+        diff 文本，按文件分组
+    """
+    parts: list[str] = []
+    for path in group.files:
+        hunks = [item for item in group.hunks if item.file_path == path]
+        if not hunks:
+            continue
+        parts.append(f"--- {path} ---")
+        parts.extend(item.hunk.content for item in hunks)
+    return "\n".join(parts)
+
+
+def build_system_prompt() -> str:
+    """组装主任务 system prompt。
+
+    只放角色定义与硬约束；审查维度、报告节奏、结束方式写在
+    build_guidance() 的输出里，避免同一条要求在两处重复。
+    这里只做一处指路，不再抄一遍具体条目。
+
+    Returns:
+        system prompt 文本
+    """
+    return "\n".join(
+        (
+            "你是一名资深 Go 代码审查员。你正在审查一个变更集（PR）中的若干 hunk。",
+            "",
+            "## 工作方式",
+            "",
+            "- 先用 file_read 读取 hunk 周边上下文，必要时用 code_search 查调用方与定义",
+            "- 审查完成后用 report_hunks 报告该 hunk 的结论（有问题就给出评论，没问题也要 "
+            "complete=true）",
+            "- 所有 hunk 报告完毕后调用 end_done 结束",
+            "",
+            "## 硬约束",
+            "",
+            "- 只审查给定的 hunk，不要审查未列出的代码",
+            "- 每条评论必须给出 severity、category、content、existing_code",
+            "- 报告节奏与审查维度的具体要求见随后的 user 消息",
+        )
+    )
