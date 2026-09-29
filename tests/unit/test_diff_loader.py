@@ -157,3 +157,133 @@ def test_load_diffs_rename_with_content_change(edge_repo: Path) -> None:
     assert len(renamed.hunks) == 1
     assert renamed.insertions == 1
     assert renamed.deletions == 1
+
+
+BLANK_LINE_BASE = """package main
+
+func Alpha() {
+	println("a")
+}
+
+// Delta 只用来把 Alpha 与 Beta 隔开，
+// 让两处改动相距足够远、落进不同的 hunk。
+func Delta() {
+	println("d")
+}
+
+func Beta() {
+	println("b")
+	println("b2")
+}
+
+func Gamma() {
+	println("c")
+}
+"""
+
+BLANK_LINE_HEAD = """package main
+
+func Alpha() {
+	println("a")
+	println("a2")
+}
+
+// Delta 只用来把 Alpha 与 Beta 隔开，
+// 让两处改动相距足够远、落进不同的 hunk。
+func Delta() {
+	println("d")
+}
+
+func Beta() {
+	println("b")
+}
+
+func Gamma() {
+	println("c")
+}
+"""
+
+
+@pytest.fixture
+def blank_line_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
+    """构造含空行上下文与纯删除 hunk 的临时仓库。
+
+    feature 相对 main：Alpha 加一行、Beta 删一行、函数之间都有空行。
+
+    Returns:
+        仓库路径
+    """
+    repo = tmp_path / "blank"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "test")
+
+    (repo / "a.go").write_text(BLANK_LINE_BASE, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "base")
+
+    git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "a.go").write_text(BLANK_LINE_HEAD, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feature")
+    return repo
+
+
+def test_hunk_header_lines_match_body_walk(blank_line_repo: Path) -> None:
+    """测试 hunk 头声明的行数与正文遍历结果一致。
+
+    这条不变量是「hunk 块范围」和「改动行号」可信的前提：
+    从 new_start / old_start 各走一遍正文（上下文两侧都前进、+ 只进新文件侧、
+    - 只进旧文件侧），走出的行数必须等于头声明的 new_lines / old_lines，
+    末行也必须落在 start + lines - 1（闭区间）。
+    """
+    diffs = load_diffs(blank_line_repo, "main", "feature")
+    checked = 0
+
+    for diff in diffs:
+        for hunk in diff.hunks:
+            checked += 1
+            # `\ No newline at end of file` 是标记行，不占文件行号
+            body = [ln for ln in hunk.content.splitlines()[1:] if not ln.startswith("\\")]
+
+            new_no, old_no = hunk.new_start, hunk.old_start
+            walked_new: list[int] = []
+            walked_old: list[int] = []
+            for line in body:
+                if line.startswith("+"):
+                    walked_new.append(new_no)
+                    new_no += 1
+                elif line.startswith("-"):
+                    walked_old.append(old_no)
+                    old_no += 1
+                else:
+                    walked_new.append(new_no)
+                    walked_old.append(old_no)
+                    new_no += 1
+                    old_no += 1
+
+            assert len(walked_new) == hunk.new_lines, f"{diff.path} 新文件侧行数不符"
+            assert len(walked_old) == hunk.old_lines, f"{diff.path} 旧文件侧行数不符"
+            if walked_new:
+                assert walked_new[-1] == hunk.new_start + hunk.new_lines - 1
+            if walked_old:
+                assert walked_old[-1] == hunk.old_start + hunk.old_lines - 1
+
+    assert checked >= 2, "样例应产生至少两个 hunk"
+
+
+def test_blank_lines_survive_in_hunk_body(blank_line_repo: Path) -> None:
+    """测试空源码行的上下文行（git 输出为单个空格）在正文里保留。
+
+    回归用例：按 line.strip() 判断有效性会把它丢掉，导致 hunk.content
+    里所有空源码行消失、上述不变量失配。
+    """
+    diffs = load_diffs(blank_line_repo, "main", "feature")
+    bodies = [hunk.content for diff in diffs for hunk in diff.hunks]
+
+    assert any("\n \n" in body for body in bodies), "正文里应有单空格上下文行"
+    for body in bodies:
+        for line in body.splitlines()[1:]:
+            if not line.startswith("\\"):
+                assert line[:1] in (" ", "+", "-"), f"非法正文行：{line!r}"
