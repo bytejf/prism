@@ -1,12 +1,15 @@
 """diff 加载的单元测试（用临时 git 仓库）。"""
 
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 import pygit2
 import pytest
 
+from prism.core.ast.mapper import changed_lines
 from prism.core.diff.loader import load_diffs, resolve_commit
+from prism.core.diff.parser import parse_diff_text
 
 
 @pytest.fixture
@@ -287,3 +290,61 @@ def test_blank_lines_survive_in_hunk_body(blank_line_repo: Path) -> None:
         for line in body.splitlines()[1:]:
             if not line.startswith("\\"):
                 assert line[:1] in (" ", "+", "-"), f"非法正文行：{line!r}"
+
+
+def test_changed_lines_match_git_u0_headers(blank_line_repo: Path) -> None:
+    """把推导出的改动行与 `git diff -U0` 的头字段对齐。
+
+    `-U0` 下每个 hunk 只含改动行，头 ``@@ -a,b +c,d @@`` 直接给出改动行的
+    起始与行数 —— 这是「行号精确」的权威来源。
+
+    两种上下文下 hunk 的**划分**不同（-U3 会把相近改动合并），但**改动行的
+    集合**必须完全一致。这条不变量证明了：我们从 hunk 正文推导的改动行与 git
+    自己的口径逐行吻合，因此运行时不需要再跑一遍 `-U0`。
+    """
+    u0_patch = subprocess_run_u0(blank_line_repo)
+    assert u0_patch, "git diff -U0 应产生输出"
+
+    u3: dict[str, tuple[set[int], set[int]]] = {}
+    for diff in load_diffs(blank_line_repo, "main", "feature"):
+        added: set[int] = set()
+        removed: set[int] = set()
+        for hunk in diff.hunks:
+            hunk_added, hunk_removed = changed_lines(hunk)
+            added.update(hunk_added)
+            removed.update(hunk_removed)
+        u3[diff.path] = (added, removed)
+
+    u0: dict[str, tuple[set[int], set[int]]] = {}
+    for diff in parse_diff_text(u0_patch):
+        added = set()
+        removed = set()
+        for hunk in diff.hunks:
+            hunk_added, hunk_removed = changed_lines(hunk)
+            added.update(hunk_added)
+            removed.update(hunk_removed)
+        u0[diff.path] = (added, removed)
+
+    assert u3, "样例应产生 diff"
+    for path, (added, removed) in u3.items():
+        assert u0[path] == (added, removed), f"{path} 的改动行与 -U0 不一致"
+    assert any(added for added, _ in u3.values()), "样例应至少有新增行"
+
+
+def subprocess_run_u0(repo: Path) -> str:
+    """跑一次 `git diff -U0 main feature`。
+
+    Args:
+        repo: 仓库路径
+
+    Returns:
+        diff 文本
+    """
+    completed = subprocess.run(
+        ["git", "-c", "core.quotepath=false", "diff", "-U0", "main", "feature"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout

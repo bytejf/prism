@@ -7,9 +7,10 @@ import pytest
 
 from prism.core.ast.mapper import (
     TOP_LEVEL_LABEL,
+    changed_lines,
+    display_range,
     format_location,
     format_symbols,
-    hunk_line_range,
     map_hunks_to_symbols,
 )
 from prism.core.diff.loader import load_diffs
@@ -18,7 +19,9 @@ from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Diff, Hunk
 
 
-def make_hunk(old_start: int, old_lines: int, new_start: int, new_lines: int) -> Hunk:
+def make_hunk(
+    old_start: int, old_lines: int, new_start: int, new_lines: int, content: str = ""
+) -> Hunk:
     """构造测试用 Hunk。
 
     Args:
@@ -26,6 +29,7 @@ def make_hunk(old_start: int, old_lines: int, new_start: int, new_lines: int) ->
         old_lines: 旧文件行数
         new_start: 新文件起始行
         new_lines: 新文件行数
+        content: 原始 hunk 文本（含 @@ 行）
 
     Returns:
         Hunk 对象
@@ -35,7 +39,7 @@ def make_hunk(old_start: int, old_lines: int, new_start: int, new_lines: int) ->
         old_lines=old_lines,
         new_start=new_start,
         new_lines=new_lines,
-        content="",
+        content=content,
     )
 
 
@@ -53,21 +57,59 @@ def make_item(hunk: Hunk, symbols: list[Symbol], hunk_id: str = "H-01") -> HunkW
     return HunkWithSymbol(hunk=hunk, file_path="a.go", symbols=symbols, hunk_id=hunk_id)
 
 
-def test_hunk_line_range_new_side() -> None:
-    """测试取新文件侧行号范围。"""
-    assert hunk_line_range(make_hunk(10, 4, 12, 6), use_old_side=False) == (12, 17)
+def test_display_range_prefers_new_side() -> None:
+    """测试展示区间优先取新文件侧。"""
+    assert display_range(make_hunk(10, 4, 12, 6)) == (12, 17)
 
 
-def test_hunk_line_range_old_side() -> None:
-    """测试取旧文件侧行号范围。"""
-    assert hunk_line_range(make_hunk(10, 4, 12, 6), use_old_side=True) == (10, 13)
+def test_display_range_falls_back_to_old_side_for_pure_deletion() -> None:
+    """测试纯删除 hunk 展示旧文件侧区间（新文件侧为空）。"""
+    assert display_range(make_hunk(10, 3, 9, 0)) == (10, 12)
 
 
-def test_hunk_line_range_pure_deletion() -> None:
-    """测试纯删除 hunk：new_lines 为 0 时按锚点推算新文件侧范围。"""
-    # @@ -10,3 +9,0 @@ → 被删的 3 行在新文件中本应位于 10..12
-    assert hunk_line_range(make_hunk(10, 3, 9, 0), use_old_side=False) == (10, 12)
-    assert hunk_line_range(make_hunk(10, 3, 9, 0), use_old_side=True) == (10, 12)
+def test_changed_lines_separates_added_and_removed() -> None:
+    """测试改动行号推导：上下文两侧前进，+ 只进新侧，- 只进旧侧。"""
+    content = "\n".join(
+        [
+            "@@ -10,5 +12,6 @@",
+            " ctx1",
+            "-old1",
+            "+new1",
+            "+new2",
+            " ctx2",
+            "-old2",
+        ]
+    )
+    added, removed = changed_lines(make_hunk(10, 5, 12, 6, content))
+    # 新文件侧：12=ctx1, 13=new1, 14=new2, 15=ctx2
+    assert added == [13, 14]
+    # 旧文件侧：10=ctx1, 11=old1, 12=ctx2, 13=old2
+    assert removed == [11, 13]
+
+
+def test_changed_lines_ignores_no_newline_marker() -> None:
+    """测试 `\\ No newline at end of file` 标记行不占行号。"""
+    content = "\n".join(
+        [
+            "@@ -1,2 +1,2 @@",
+            " keep",
+            "-old",
+            "\\ No newline at end of file",
+            "+new",
+            "\\ No newline at end of file",
+        ]
+    )
+    added, removed = changed_lines(make_hunk(1, 2, 1, 2, content))
+    assert added == [2]
+    assert removed == [2]
+
+
+def test_changed_lines_pure_deletion_has_no_added() -> None:
+    """测试纯删除 hunk 没有新增行。"""
+    content = "\n".join(["@@ -10,3 +9,0 @@", "-a", "-b", "-c"])
+    added, removed = changed_lines(make_hunk(10, 3, 9, 0, content))
+    assert added == []
+    assert removed == [10, 11, 12]
 
 
 def test_format_location_multi_line_and_single_line() -> None:
@@ -119,7 +161,10 @@ func Helper() {
 }
 """
 
-# 只有包级常量，没有任何函数声明：改动无法归属到函数
+# 只加一行注释在 Run 与 Helper 之间：改动不属于任何函数
+MODIFIED_GAP_GO = BASELINE_GO.replace("func Helper() {", "// Helper 只做打印。\nfunc Helper() {")
+
+# 只有包级常量，没有任何函数声明
 CONSTS_GO = """package main
 
 const (
@@ -152,13 +197,11 @@ def go_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
     return repo
 
 
-def test_map_hunks_attributes_to_all_overlapping_functions(
-    go_repo: Path, git: Callable[..., None]
-) -> None:
-    """测试 hunk 归属到全部重叠函数。
+def test_map_hunks_ignores_context_spill(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试归属只看改动行，不被上下文行带到相邻函数。
 
-    diff 带 3 行上下文，改动虽然落在 Run 内，但 hunk 范围会溢出到 Helper，
-    按文档「hunk 跨多个函数 → 归属到所有重叠函数」应两者都归属。
+    diff 带 3 行上下文，hunk 范围会溢出到后面的 Helper，但改动只落在 Run 内，
+    因此只应归属 Run —— 这正是「按 hunk 范围求交」会误挂 Helper 的场景。
     """
     diffs = filter_files(load_diffs(go_repo, "main", "feature")).reviewable
     mapped = map_hunks_to_symbols(go_repo, "main", "feature", diffs)
@@ -167,12 +210,40 @@ def test_map_hunks_attributes_to_all_overlapping_functions(
     item = mapped[0]
     assert item.hunk_id == "H-01"
     assert item.file_path == "svc.go"
-    assert [s.name for s in item.symbols] == ["Run", "Helper"]
+    assert [s.name for s in item.symbols] == ["Run"]
 
-    # 真正新增的那一行确实落在 Run 内部
-    added_line = MODIFIED_GO.splitlines().index('\tfmt.Println("extra")') + 1
-    run = next(s for s in item.symbols if s.name == "Run")
-    assert run.start_line <= added_line <= run.end_line
+    # 反向确认：Helper 确实落在 hunk 的块范围内（所以旧规则会误挂）
+    helper_line = MODIFIED_GO.splitlines().index("func Helper() {") + 1
+    hunk_end = item.hunk.new_start + item.hunk.new_lines - 1
+    assert item.hunk.new_start <= helper_line <= hunk_end
+
+
+def test_map_hunks_between_functions_has_no_symbol(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试改动落在两个函数之间时归属为空。
+
+    只加一行注释在 Run 的 `}` 与 func Helper 之间 —— 该行不属于任何函数，
+    按改动行判定应得到空列表，而不是被挂到前后相邻的函数上。
+    从 main 起分支以保证 hunk 里只有这一处改动。
+    """
+    git(go_repo, "checkout", "-q", "-b", "gap", "main")
+    (go_repo / "svc.go").write_text(MODIFIED_GAP_GO, encoding="utf-8")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "gap")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "gap")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "gap", diffs)
+
+    assert len(mapped) == 1
+    item = mapped[0]
+    assert item.symbols == []
+    assert format_symbols(item.symbols) == TOP_LEVEL_LABEL
+
+    # 反向确认改动确实落在两个函数之间：新增的那一行既不属于 Run 也不属于 Helper
+    added, _ = changed_lines(item.hunk)
+    lines = MODIFIED_GAP_GO.splitlines()
+    assert [lines[ln - 1] for ln in added] == ["// Helper 只做打印。"]
+    # 块范围却横跨两个函数 —— 这正是「按 hunk 范围求交」会误挂的原因
+    assert item.hunk.new_start < added[0] < item.hunk.new_start + item.hunk.new_lines - 1
 
 
 def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[..., None]) -> None:
@@ -192,8 +263,10 @@ def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[...,
     assert "Run" in [s.name for s in mapped[1].symbols]
 
 
-def test_map_hunks_top_level_change_has_no_symbol(go_repo: Path, git: Callable[..., None]) -> None:
-    """测试包级常量的改动无法归属到函数，标记为顶层。"""
+def test_map_hunks_top_level_change_attributes_to_const_block(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """测试包级常量的改动归属到 const 块（而不是笼统的 <顶层>）。"""
     git(go_repo, "checkout", "-q", "-b", "consts", "main")
     (go_repo / "consts.go").write_text(CONSTS_GO, encoding="utf-8")
     git(go_repo, "add", "-A")
@@ -208,12 +281,12 @@ def test_map_hunks_top_level_change_has_no_symbol(go_repo: Path, git: Callable[.
     mapped = map_hunks_to_symbols(go_repo, "main", "HEAD", diffs)
     consts = next(item for item in mapped if item.file_path == "consts.go")
 
-    assert consts.symbols == []
-    assert format_symbols(consts.symbols) == TOP_LEVEL_LABEL
+    assert [s.name for s in consts.symbols] == ["const"]
+    assert format_symbols(consts.symbols) == "const（const 块）"
 
 
 def test_map_hunks_deleted_file_uses_old_source(go_repo: Path, git: Callable[..., None]) -> None:
-    """测试删除文件时用旧版本源码，仍能归属到函数。"""
+    """测试删除文件时用旧版本源码，仍能归属到符号。"""
     git(go_repo, "checkout", "-q", "-b", "del", "feature")
     git(go_repo, "rm", "-q", "svc.go")
     git(go_repo, "commit", "-q", "-m", "del")
@@ -223,7 +296,8 @@ def test_map_hunks_deleted_file_uses_old_source(go_repo: Path, git: Callable[...
 
     assert mapped
     assert all(item.symbols for item in mapped)
-    assert {s.name for item in mapped for s in item.symbols} == {"Run", "Helper"}
+    names = {s.name for item in mapped for s in item.symbols}
+    assert {"Run", "Helper"} <= names
 
 
 def test_map_hunks_empty_diffs(go_repo: Path) -> None:

@@ -1,6 +1,16 @@
 """Go 符号提取的单元测试。"""
 
-from prism.core.ast.extractor import KIND_FUNCTION, KIND_METHOD, extract_symbols
+from prism.core.ast.extractor import (
+    KIND_CONST,
+    KIND_FUNCTION,
+    KIND_IMPORT,
+    KIND_INTERFACE,
+    KIND_METHOD,
+    KIND_STRUCT,
+    KIND_TYPE,
+    KIND_VAR,
+    extract_symbols,
+)
 
 GO_SOURCE = """package main
 
@@ -66,8 +76,8 @@ func C() {}
 
 
 def test_no_symbols() -> None:
-    """测试没有函数声明的源码返回空列表。"""
-    assert extract_symbols("package main\n\nvar x = 1\n") == []
+    """测试没有任何声明的源码返回空列表。"""
+    assert extract_symbols("package main\n") == []
     assert extract_symbols("") == []
 
 
@@ -83,19 +93,92 @@ def test_extract_from_large_source_with_multibyte_comments() -> None:
     节点文本读取会读到已释放内存，文件到达一定规模后段错误（小文件侥幸不崩）。
     本用例构造一个几十 KB、含中文注释的 Go 文件来触发该路径。
     """
-    methods = []
+    chunks = []
     for index in range(60):
-        methods.append(
+        chunks.append(
             f"// 方法 {index} 的中文说明，含多字节字符：①②③④⑤\n"
             f"func (r *Runner) Method{index}(ctx context.Context, a string, b []int) bool {{\n"
             f"\t// 中文注释" + "说明" * 200 + "\n"
             "\treturn true\n"
             "}\n"
         )
-    source = 'package main\n\nimport "context"\n\n' + "\n".join(methods)
+    source = 'package main\n\nimport "context"\n\n' + "\n".join(chunks)
     assert len(source.encode("utf-8")) > 50_000
 
     symbols = extract_symbols(source)
-    assert len(symbols) == 60
-    assert symbols[0].name == "(*Runner).Method0"
-    assert symbols[-1].name == "(*Runner).Method59"
+    method_symbols = [s for s in symbols if s.kind == KIND_METHOD]
+    # 60 个方法 + 1 个 import 声明
+    assert len(method_symbols) == 60
+    assert len(symbols) == 61
+    assert method_symbols[0].name == "(*Runner).Method0"
+    assert method_symbols[-1].name == "(*Runner).Method59"
+
+
+# ---------- 顶层声明：import / const / var / type ----------
+
+
+def test_extract_import_block() -> None:
+    """测试提取 import 块。"""
+    source = 'package main\n\nimport (\n\t"errors"\n\t"fmt"\n)\n'
+    symbols = extract_symbols(source)
+    assert [(s.name, s.kind) for s in symbols] == [("import", KIND_IMPORT)]
+    assert (symbols[0].start_line, symbols[0].end_line) == (3, 6)
+
+
+def test_extract_const_and_var_blocks() -> None:
+    """测试提取 const / var 块。"""
+    source = """package main
+
+const (
+	A = 1
+)
+
+var (
+	B = 2
+)
+"""
+    assert [(s.name, s.kind) for s in extract_symbols(source)] == [
+        ("const", KIND_CONST),
+        ("var", KIND_VAR),
+    ]
+
+
+def test_extract_struct_and_interface() -> None:
+    """测试提取结构体与接口，且不把字段 / 方法签名当作符号。"""
+    source = """package main
+
+type Config struct {
+	Name string
+}
+
+type Reader interface {
+	Read(id string) error
+}
+"""
+    symbols = extract_symbols(source)
+    assert [(s.name, s.kind) for s in symbols] == [
+        ("Config", KIND_STRUCT),
+        ("Reader", KIND_INTERFACE),
+    ]
+    assert (symbols[0].start_line, symbols[0].end_line) == (3, 5)
+
+
+def test_extract_type_group_produces_one_symbol_per_spec() -> None:
+    """测试分组类型声明（type ( ... )）产生多个符号。"""
+    source = """package main
+
+type (
+	ID   int
+	Name string
+)
+"""
+    assert [(s.name, s.kind) for s in extract_symbols(source)] == [
+        ("ID", KIND_TYPE),
+        ("Name", KIND_TYPE),
+    ]
+
+
+def test_extract_type_alias_is_kind_type() -> None:
+    """测试类型别名归为 KIND_TYPE。"""
+    source = "package main\n\ntype Alias = int\n"
+    assert [(s.name, s.kind) for s in extract_symbols(source)] == [("Alias", KIND_TYPE)]
