@@ -1,10 +1,11 @@
 """Prism CLI 入口。
 
-V1 只提供 `--version`，后续模块逐步加入 `diff` / `filter` / `hunk-map` /
-`group` / `review` 等子命令。
+子命令：`diff` / `filter` / `hunk-map` / `group` 只跑审查前流程，
+`review` 串起完整链路（审查前 → 审查中 → 审查后）。
 """
 
 import logging
+import time
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 
@@ -13,9 +14,17 @@ import typer
 from prism.core.ast.mapper import format_location, format_symbols, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
+from prism.core.graph.main_loop import run_main_loop
+from prism.core.graph.state import MainLoopResult
 from prism.core.grouping.packages import group_by_package
+from prism.core.llm.client import LLMClient
+from prism.core.output.renderer import TerminalRenderer
+from prism.core.output.sort import sort_comments, to_comments
 from prism.models.ast import HunkWithSymbol
+from prism.models.comment import ReviewStats
 from prism.models.diff import Diff
+from prism.models.grouping import Group
+from prism.models.llm import LLMConfig
 from prism.observability.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -203,3 +212,86 @@ def group(
         blocks.append("\n".join(lines))
 
     typer.echo("\n\n".join(blocks))
+
+
+def _llm_or_exit() -> LLMClient:
+    """构造 LLM 客户端，失败时打印错误并终止进程。
+
+    Returns:
+        LLMClient 实例
+    """
+    try:
+        return LLMClient(LLMConfig.from_env())
+    except ValueError as exc:
+        logger.error("LLM 初始化失败: %s", exc)
+        typer.echo(f"错误：{exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _run_groups(groups: list[Group], project_root: Path) -> list[MainLoopResult]:
+    """串行跑完所有审查单元（V1 不做并发）。
+
+    Args:
+        groups: 审查单元列表
+        project_root: 项目根目录
+
+    Returns:
+        各组的循环产出
+    """
+    llm = _llm_or_exit()
+    results: list[MainLoopResult] = []
+    for index, item in enumerate(groups, start=1):
+        typer.echo(
+            f"Processing Group {index}: {item.package_path} "
+            f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
+        )
+        result = run_main_loop(item, llm, str(project_root))
+        results.append(result)
+        typer.echo(
+            f"  {result.group_id} completed: {_plural(len(result.comments), 'comment')} "
+            f"(exit_reason={result.exit_reason}, 轮次={result.round_count})"
+        )
+    return results
+
+
+@app.command()
+def review(
+    base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
+    head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+) -> None:
+    """完整审查：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。"""
+    started = time.monotonic()
+    root = Path.cwd()
+    logger.info("开始审查: base=%s head=%s root=%s", base, head, root)
+
+    typer.echo("Loading diffs...")
+    diffs = _load_or_exit(base, head)
+
+    typer.echo(f"Filtering files... ({_plural(len(diffs), 'file')} in diff)")
+    reviewable = filter_files(diffs).reviewable
+
+    typer.echo(f"Grouping by package... ({_plural(len(reviewable), 'reviewable file')})")
+    try:
+        groups = group_by_package(map_hunks_to_symbols(root, base, head, reviewable))
+    except ValueError as exc:
+        logger.error("hunk 映射失败: %s", exc)
+        typer.echo(f"错误：{exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if not groups:
+        typer.echo("没有可审查的 hunk。")
+
+    results = _run_groups(groups, root) if groups else []
+    comments = sort_comments(to_comments(results, groups))
+
+    stats = ReviewStats(
+        base_branch=base,
+        head_sha=head,
+        files_count=len(reviewable),
+        hunks_count=sum(len(item.hunks) for item in groups),
+        comments_count=len(comments),
+        duration_seconds=time.monotonic() - started,
+    )
+    typer.echo("")
+    typer.echo(TerminalRenderer().render(comments, stats))
+    typer.echo(f"\nReview completed: {_plural(len(comments), 'comment')}")
