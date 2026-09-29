@@ -22,6 +22,9 @@ _DIFF_GIT_RE = re.compile(r"^diff --git (\S+) (\S+)")
 # 无法从 diff 文本中还原出路径时的占位符
 UNKNOWN_PATH = "<unknown>"
 
+# git 中符号链接的文件模式（普通文件为 100644 / 100755）
+SYMLINK_MODE = "120000"
+
 # 未变更侧路径的占位符
 DEV_NULL = "/dev/null"
 
@@ -92,6 +95,7 @@ def _parse_block(lines: list[str]) -> Diff | None:
     is_new = False
     is_deleted = False
     is_binary = False
+    is_symlink = False
     hunks: list[Hunk] = []
     insertions = 0
     deletions = 0
@@ -123,8 +127,13 @@ def _parse_block(lines: list[str]) -> Diff | None:
             header, header_line = matched, line
         elif line.startswith("new file mode"):
             is_new = True
+            is_symlink = _has_symlink_mode(line)
         elif line.startswith("deleted file mode"):
             is_deleted = True
+            is_symlink = _has_symlink_mode(line)
+        elif line.startswith(("index ", "new mode ")):
+            # `old mode` 不参与判断：只关心变更「之后」是不是符号链接
+            is_symlink = is_symlink or _has_symlink_mode(line)
         elif line.startswith(("Binary files ", "GIT binary patch")):
             is_binary = True
         elif line.startswith("--- "):
@@ -156,6 +165,7 @@ def _parse_block(lines: list[str]) -> Diff | None:
             is_new=False,
             is_deleted=False,
             is_binary=False,
+            is_symlink=False,
         )
 
     return Diff(
@@ -167,7 +177,23 @@ def _parse_block(lines: list[str]) -> Diff | None:
         is_new=is_new,
         is_deleted=is_deleted,
         is_binary=is_binary,
+        is_symlink=is_symlink,
     )
+
+
+def _has_symlink_mode(line: str) -> bool:
+    """判断文件模式行是否声明了符号链接模式（120000）。
+
+    适用于 `new file mode 120000`、`index a..b 120000`、`new mode 120000`。
+
+    Args:
+        line: diff 中的模式相关行
+
+    Returns:
+        是否为符号链接模式
+    """
+    parts = line.split()
+    return bool(parts) and parts[-1] == SYMLINK_MODE
 
 
 def _is_hunk_body_line(line: str) -> bool:

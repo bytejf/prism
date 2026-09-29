@@ -208,6 +208,74 @@ def test_parse_pure_rename_without_content_change() -> None:
     assert not diff.is_deleted
 
 
+def test_parse_symlink_creation() -> None:
+    """测试新增符号链接：模式 120000 标记 is_symlink。"""
+    text = "\n".join(
+        [
+            "diff --git a/link.go b/link.go",
+            "new file mode 120000",
+            "index 0000000..abc1234",
+            "--- /dev/null",
+            "+++ b/link.go",
+            "@@ -0,0 +1 @@",
+            "+target/path",
+        ]
+    )
+    diffs = parse_diff_text(text)
+    assert diffs[0].is_symlink
+    assert diffs[0].is_new
+
+
+def test_parse_symlink_target_change() -> None:
+    """测试符号链接指向变更：index 行尾部模式为 120000。"""
+    text = "\n".join(
+        [
+            "diff --git a/link.go b/link.go",
+            "index abc1234..def5678 120000",
+            "--- a/link.go",
+            "+++ b/link.go",
+            "@@ -1 +1 @@",
+            "-old-target",
+            "+new-target",
+        ]
+    )
+    diffs = parse_diff_text(text)
+    assert diffs[0].is_symlink
+    assert not diffs[0].is_new
+    assert not diffs[0].is_deleted
+
+
+def test_parse_mode_change_to_symlink() -> None:
+    """测试普通文件改成符号链接。"""
+    text = "\n".join(
+        [
+            "diff --git a/f b/f",
+            "old mode 100644",
+            "new mode 120000",
+        ]
+    )
+    diffs = parse_diff_text(text)
+    assert diffs[0].is_symlink
+
+
+def test_parse_mode_change_from_symlink_is_not_symlink() -> None:
+    """测试符号链接改成普通文件：只看变更之后的状态，不算符号链接。"""
+    text = "\n".join(
+        [
+            "diff --git a/f b/f",
+            "old mode 120000",
+            "new mode 100644",
+        ]
+    )
+    diffs = parse_diff_text(text)
+    assert not diffs[0].is_symlink
+
+
+def test_parse_regular_file_is_not_symlink() -> None:
+    """测试普通文件不会被标记为符号链接。"""
+    assert not parse_diff_text(TWO_HUNK_DIFF)[0].is_symlink
+
+
 def test_parse_unparsable_text_falls_back_to_raw() -> None:
     """测试无法解析的文本降级为原始文本，不抛异常。"""
     raw = "\n".join(["这不是 diff", "随便什么内容"])

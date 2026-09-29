@@ -35,6 +35,7 @@ class Diff:
         is_new: 是否新增文件
         is_deleted: 是否删除文件
         is_binary: 是否二进制文件
+        is_symlink: 变更后是否为符号链接
     """
 
     old_path: str
@@ -45,6 +46,7 @@ class Diff:
     is_new: bool
     is_deleted: bool
     is_binary: bool
+    is_symlink: bool = False
 
     @property
     def path(self) -> str:
