@@ -1,4 +1,8 @@
-"""Go 符号提取的单元测试。"""
+"""Go 符号提取的单元测试。
+
+每个用例的源码都以 `package main` 开头，所以期望里都带一个 package 符号 ——
+包声明也是可归属的符号（改包名、改包的文档注释都要能落到它上面）。
+"""
 
 from prism.core.ast.extractor import (
     KIND_CONST,
@@ -6,6 +10,7 @@ from prism.core.ast.extractor import (
     KIND_IMPORT,
     KIND_INTERFACE,
     KIND_METHOD,
+    KIND_PACKAGE,
     KIND_STRUCT,
     KIND_TYPE,
     KIND_VAR,
@@ -26,25 +31,62 @@ func (s Service) Value() {}
 """
 
 
+def names(source: str) -> list[str]:
+    """取源码里所有符号的名字。
+
+    Args:
+        source: Go 源码
+
+    Returns:
+        符号名列表，按源码顺序
+    """
+    return [s.name for s in extract_symbols(source)]
+
+
+def kinds(source: str) -> list[str]:
+    """取源码里所有符号的类型。
+
+    Args:
+        source: Go 源码
+
+    Returns:
+        符号类型列表，按源码顺序
+    """
+    return [s.kind for s in extract_symbols(source)]
+
+
+def test_extract_package_clause() -> None:
+    """测试提取包声明。"""
+    symbols = extract_symbols("package main\n\nfunc A() {}\n")
+    assert [(s.name, s.kind, s.start_line, s.end_line) for s in symbols] == [
+        ("package", KIND_PACKAGE, 1, 1),
+        ("A", KIND_FUNCTION, 3, 3),
+    ]
+
+
 def test_extract_function_and_methods() -> None:
     """测试提取普通函数、指针接收者方法与值接收者方法。"""
-    symbols = extract_symbols(GO_SOURCE)
-    assert [s.name for s in symbols] == ["Foo", "(*Service).Run", "(Service).Value"]
-    assert [s.kind for s in symbols] == [KIND_FUNCTION, KIND_METHOD, KIND_METHOD]
+    assert names(GO_SOURCE) == ["package", "Foo", "(*Service).Run", "(Service).Value"]
+    assert kinds(GO_SOURCE) == [
+        KIND_PACKAGE,
+        KIND_FUNCTION,
+        KIND_METHOD,
+        KIND_METHOD,
+    ]
 
 
 def test_extract_line_ranges() -> None:
     """测试行号范围（1-based，含首尾）。"""
     symbols = extract_symbols(GO_SOURCE)
-    assert (symbols[0].start_line, symbols[0].end_line) == (3, 5)
-    assert (symbols[1].start_line, symbols[1].end_line) == (7, 9)
-    assert (symbols[2].start_line, symbols[2].end_line) == (11, 11)
+    assert (symbols[0].start_line, symbols[0].end_line) == (1, 1)  # package
+    assert (symbols[1].start_line, symbols[1].end_line) == (3, 5)  # Foo
+    assert (symbols[2].start_line, symbols[2].end_line) == (7, 9)  # (*Service).Run
+    assert (symbols[3].start_line, symbols[3].end_line) == (11, 11)  # (Service).Value
 
 
 def test_extract_unnamed_receiver() -> None:
     """测试省略接收者变量名的方法。"""
-    symbols = extract_symbols("package main\n\nfunc (*Ptr) Unnamed() {}\n")
-    assert [s.name for s in symbols] == ["(*Ptr).Unnamed"]
+    assert names("package main\n\nfunc (*Ptr) Unnamed() {}\n") == ["package", "(*Ptr).Unnamed"]
 
 
 def test_function_literal_is_not_a_symbol() -> None:
@@ -58,8 +100,7 @@ func Outer() {
 \tinner()
 }
 """
-    symbols = extract_symbols(source)
-    assert [s.name for s in symbols] == ["Outer"]
+    assert names(source) == ["package", "Outer"]
 
 
 def test_multiple_symbols_are_sorted_by_source_order() -> None:
@@ -72,12 +113,12 @@ func B() {}
 
 func C() {}
 """
-    assert [s.name for s in extract_symbols(source)] == ["A", "B", "C"]
+    assert names(source) == ["package", "A", "B", "C"]
 
 
 def test_no_symbols() -> None:
-    """测试没有任何声明的源码返回空列表。"""
-    assert extract_symbols("package main\n") == []
+    """测试没有任何声明的源码只返回包声明。"""
+    assert names("package main\n") == ["package"]
     assert extract_symbols("") == []
 
 
@@ -107,22 +148,25 @@ def test_extract_from_large_source_with_multibyte_comments() -> None:
 
     symbols = extract_symbols(source)
     method_symbols = [s for s in symbols if s.kind == KIND_METHOD]
-    # 60 个方法 + 1 个 import 声明
     assert len(method_symbols) == 60
-    assert len(symbols) == 61
+    # 60 个方法 + package + import
+    assert len(symbols) == 62
     assert method_symbols[0].name == "(*Runner).Method0"
     assert method_symbols[-1].name == "(*Runner).Method59"
 
 
-# ---------- 顶层声明：import / const / var / type ----------
+# ---------- 顶层声明：package / import / const / var / type ----------
 
 
 def test_extract_import_block() -> None:
     """测试提取 import 块。"""
     source = 'package main\n\nimport (\n\t"errors"\n\t"fmt"\n)\n'
     symbols = extract_symbols(source)
-    assert [(s.name, s.kind) for s in symbols] == [("import", KIND_IMPORT)]
-    assert (symbols[0].start_line, symbols[0].end_line) == (3, 6)
+    assert [(s.name, s.kind) for s in symbols] == [
+        ("package", KIND_PACKAGE),
+        ("import", KIND_IMPORT),
+    ]
+    assert (symbols[1].start_line, symbols[1].end_line) == (3, 6)
 
 
 def test_extract_const_and_var_blocks() -> None:
@@ -138,6 +182,7 @@ var (
 )
 """
     assert [(s.name, s.kind) for s in extract_symbols(source)] == [
+        ("package", KIND_PACKAGE),
         ("const", KIND_CONST),
         ("var", KIND_VAR),
     ]
@@ -157,10 +202,11 @@ type Reader interface {
 """
     symbols = extract_symbols(source)
     assert [(s.name, s.kind) for s in symbols] == [
+        ("package", KIND_PACKAGE),
         ("Config", KIND_STRUCT),
         ("Reader", KIND_INTERFACE),
     ]
-    assert (symbols[0].start_line, symbols[0].end_line) == (3, 5)
+    assert (symbols[1].start_line, symbols[1].end_line) == (3, 5)
 
 
 def test_extract_type_group_produces_one_symbol_per_spec() -> None:
@@ -173,6 +219,7 @@ type (
 )
 """
     assert [(s.name, s.kind) for s in extract_symbols(source)] == [
+        ("package", KIND_PACKAGE),
         ("ID", KIND_TYPE),
         ("Name", KIND_TYPE),
     ]
@@ -180,5 +227,7 @@ type (
 
 def test_extract_type_alias_is_kind_type() -> None:
     """测试类型别名归为 KIND_TYPE。"""
-    source = "package main\n\ntype Alias = int\n"
-    assert [(s.name, s.kind) for s in extract_symbols(source)] == [("Alias", KIND_TYPE)]
+    assert [(s.name, s.kind) for s in extract_symbols("package main\n\ntype Alias = int\n")] == [
+        ("package", KIND_PACKAGE),
+        ("Alias", KIND_TYPE),
+    ]

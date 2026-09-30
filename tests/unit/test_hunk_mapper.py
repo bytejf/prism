@@ -140,8 +140,13 @@ func Helper() {
 }
 """
 
-# 只加一行注释在 Run 与 Helper 之间：改动不属于任何函数
-MODIFIED_GAP_GO = BASELINE_GO.replace("func Helper() {", "// Helper 只做打印。\nfunc Helper() {")
+# 注释直接贴在 func Helper 上方 —— 按 Go 约定它是 Helper 的文档注释
+MODIFIED_DOC_GO = BASELINE_GO.replace("func Helper() {", "// Helper 只做打印。\nfunc Helper() {")
+
+# 注释与 func Helper 之间隔了空行 —— 不是文档注释，无从归属
+MODIFIED_ORPHAN_GO = BASELINE_GO.replace(
+    "func Helper() {", "// 与 Helper 无关的独立说明。\n\nfunc Helper() {"
+)
 
 # 只有包级常量，没有任何函数声明
 CONSTS_GO = """package main
@@ -199,30 +204,55 @@ def test_map_hunks_attributes_to_the_changed_function(
     assert lines[added[0] - 1].strip() == 'fmt.Println("extra")'
 
 
-def test_map_hunks_between_functions_has_no_symbol(go_repo: Path, git: Callable[..., None]) -> None:
-    """测试改动落在两个函数之间时归属为空。
+def test_map_hunks_doc_comment_falls_to_following_declaration(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """测试函数的文档注释归属到那个函数。
 
-    只加一行注释在 Run 的 `}` 与 func Helper 之间 —— 该行不属于任何函数，
-    按改动行判定应得到空列表，而不是被挂到前后相邻的函数上。
-    从 main 起分支以保证 hunk 里只有这一处改动。
+    注释在语法树里是独立节点，不挂在它描述的声明下面，纯语法视角下不归属
+    任何符号。补偿策略：改动行是注释时向下「落」到注释块下方第一个非注释行。
+    这里新增的注释紧贴 func Helper 上方，是它的文档注释 → 归属 Helper。
     """
-    git(go_repo, "checkout", "-q", "-b", "gap", "main")
-    (go_repo / "svc.go").write_text(MODIFIED_GAP_GO, encoding="utf-8")
+    git(go_repo, "checkout", "-q", "-b", "doc", "main")
+    (go_repo / "svc.go").write_text(MODIFIED_DOC_GO, encoding="utf-8")
     git(go_repo, "add", "-A")
-    git(go_repo, "commit", "-q", "-m", "gap")
+    git(go_repo, "commit", "-q", "-m", "doc")
 
-    diffs = filter_files(load_diffs(go_repo, "main", "gap")).reviewable
-    mapped = map_hunks_to_symbols(go_repo, "main", "gap", diffs)
+    diffs = filter_files(load_diffs(go_repo, "main", "doc")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "doc", diffs)
+
+    assert len(mapped) == 1
+    item = mapped[0]
+    assert [s.name for s in item.symbols] == ["Helper"]
+
+    added, _ = changed_lines(item.hunk)
+    lines = MODIFIED_DOC_GO.splitlines()
+    assert [lines[ln - 1] for ln in added] == ["// Helper 只做打印。"]
+
+
+def test_map_hunks_orphan_comment_has_no_symbol(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试与声明隔了空行的独立注释归属为空。
+
+    注释块与下一个声明之间有空行 → 按 Go 约定不是文档注释，落不到任何声明上，
+    应保持「<顶层>」而不是被挂到前后相邻的函数上。
+    """
+    git(go_repo, "checkout", "-q", "-b", "orphan", "main")
+    (go_repo / "svc.go").write_text(MODIFIED_ORPHAN_GO, encoding="utf-8")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "orphan")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "orphan")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "orphan", diffs)
 
     assert len(mapped) == 1
     item = mapped[0]
     assert item.symbols == []
     assert format_symbols(item.symbols) == TOP_LEVEL_LABEL
 
-    # 反向确认改动确实落在两个函数之间：新增的那一行既不属于 Run 也不属于 Helper
+    # 新增的是「注释 + 空行」两行，空行把注释与 func Helper 隔开
     added, _ = changed_lines(item.hunk)
-    lines = MODIFIED_GAP_GO.splitlines()
-    assert [lines[ln - 1] for ln in added] == ["// Helper 只做打印。"]
+    lines = MODIFIED_ORPHAN_GO.splitlines()
+    assert [lines[ln - 1] for ln in added] == ["// 与 Helper 无关的独立说明。", ""]
 
 
 def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[..., None]) -> None:
@@ -238,30 +268,37 @@ def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[...,
 
     assert [item.hunk_id for item in mapped] == ["H-01", "H-02"]
     assert [item.file_path for item in mapped] == ["a.go", "svc.go"]
-    assert [s.name for s in mapped[0].symbols] == ["A"]
+    # a.go 是新增文件，整个文件都是「新增行」，因此 package 与 A 都命中
+    assert [s.name for s in mapped[0].symbols] == ["package", "A"]
     assert "Run" in [s.name for s in mapped[1].symbols]
 
 
 def test_map_hunks_top_level_change_attributes_to_const_block(
     go_repo: Path, git: Callable[..., None]
 ) -> None:
-    """测试包级常量的改动归属到 const 块（而不是笼统的 <顶层>）。"""
+    """测试包级常量的改动归属到 const 块（而不是笼统的 <顶层>）。
+
+    用两个分支比较（consts → bump），保证 hunk 里只有常量值这一处改动 ——
+    否则新增文件的 hunk 会覆盖整个文件，把所有符号都命中。
+    """
     git(go_repo, "checkout", "-q", "-b", "consts", "main")
     (go_repo / "consts.go").write_text(CONSTS_GO, encoding="utf-8")
     git(go_repo, "add", "-A")
     git(go_repo, "commit", "-q", "-m", "add consts")
+
+    git(go_repo, "checkout", "-q", "-b", "bump")
     (go_repo / "consts.go").write_text(
         CONSTS_GO.replace("MaxRetry = 3", "MaxRetry = 5"), encoding="utf-8"
     )
     git(go_repo, "add", "-A")
     git(go_repo, "commit", "-q", "-m", "bump const")
 
-    diffs = filter_files(load_diffs(go_repo, "main", "HEAD")).reviewable
-    mapped = map_hunks_to_symbols(go_repo, "main", "HEAD", diffs)
-    consts = next(item for item in mapped if item.file_path == "consts.go")
+    diffs = filter_files(load_diffs(go_repo, "consts", "bump")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "consts", "bump", diffs)
 
-    assert [s.name for s in consts.symbols] == ["const"]
-    assert format_symbols(consts.symbols) == "const（const 块）"
+    assert len(mapped) == 1
+    assert [s.name for s in mapped[0].symbols] == ["const"]
+    assert format_symbols(mapped[0].symbols) == "const（const 块）"
 
 
 def test_map_hunks_deleted_file_uses_old_source(go_repo: Path, git: Callable[..., None]) -> None:

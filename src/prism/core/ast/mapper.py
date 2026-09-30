@@ -10,6 +10,7 @@ diff 用 `-U0` 生成（见 `loader.CONTEXT_LINES`），hunk 里只有改动行�
 """
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import pygit2
@@ -20,6 +21,7 @@ from prism.core.ast.extractor import (
     KIND_IMPORT,
     KIND_INTERFACE,
     KIND_METHOD,
+    KIND_PACKAGE,
     KIND_STRUCT,
     KIND_TYPE,
     KIND_VAR,
@@ -40,6 +42,7 @@ TOP_LEVEL_LABEL = "<顶层>"
 
 # 符号类型的中文展示
 KIND_LABELS: dict[str, str] = {
+    KIND_PACKAGE: "包声明",
     KIND_FUNCTION: "函数",
     KIND_METHOD: "方法",
     KIND_IMPORT: "import 块",
@@ -49,6 +52,22 @@ KIND_LABELS: dict[str, str] = {
     KIND_INTERFACE: "接口",
     KIND_TYPE: "类型",
 }
+
+# 注释行的行首字符（去除缩进后）
+_COMMENT_PREFIXES = ("//", "/*", "*")
+
+
+@dataclass
+class _FileFacts:
+    """某个文件在某一侧的源码事实。
+
+    Attributes:
+        lines: 源码按行切分的结果（0-based 下标，行号 = 下标 + 1）
+        symbols: 该文件的符号表
+    """
+
+    lines: list[str]
+    symbols: list[Symbol]
 
 
 def map_hunks_to_symbols(
@@ -78,8 +97,8 @@ def map_hunks_to_symbols(
     """
     repo, diff_base, head_commit = resolve_range(repo_path, base, head)
 
-    # 同一文件同一侧只解析一次：(路径, 是否旧版本) → 符号列表
-    cache: dict[tuple[str, bool], list[Symbol]] = {}
+    # 同一文件同一侧只读一次：(路径, 是否旧版本) → 源码事实
+    cache: dict[tuple[str, bool], _FileFacts] = {}
     results: list[HunkWithSymbol] = []
     counter = 0
 
@@ -166,7 +185,7 @@ def format_symbols(symbols: list[Symbol]) -> str:
 
 
 def _attribute(
-    cache: dict[tuple[str, bool], list[Symbol]],
+    cache: dict[tuple[str, bool], _FileFacts],
     repo: pygit2.Repository,
     base_commit: pygit2.Commit,
     head_commit: pygit2.Commit,
@@ -176,9 +195,10 @@ def _attribute(
     """把单个 hunk 归属到符号。
 
     有新增行 → 新文件侧；纯删除 → 旧文件侧；两侧都没有改动行 → 空。
+    改动行是注释时先「落」到注释块下方的第一个非注释行（见 _landing_line）。
 
     Args:
-        cache: 文件符号表缓存
+        cache: 文件事实缓存
         repo: pygit2 仓库
         base_commit: merge-base 侧的 commit
         head_commit: head 侧的 commit
@@ -190,22 +210,60 @@ def _attribute(
     """
     added, removed = changed_lines(hunk)
     if added:
-        symbols = _file_symbols(cache, repo, head_commit, path, side=False)
-        return _containing(symbols, added)
+        facts = _file_facts(cache, repo, head_commit, path, side=False)
+        return _containing(facts.symbols, [_landing_line(facts.lines, ln) for ln in added])
     if removed:
-        symbols = _file_symbols(cache, repo, base_commit, path, side=True)
-        return _containing(symbols, removed)
+        facts = _file_facts(cache, repo, base_commit, path, side=True)
+        return _containing(facts.symbols, [_landing_line(facts.lines, ln) for ln in removed])
     return []
 
 
-def _file_symbols(
-    cache: dict[tuple[str, bool], list[Symbol]],
+def _landing_line(lines: list[str], line_no: int) -> int:
+    """把注释行「落」到它下方第一个非注释行。
+
+    注释在语法树里是独立节点，不挂在它描述的声明下面 —— 「改了一行函数文档
+    注释」在纯语法视角下不归属任何符号。Go 的约定是「紧贴声明上方、不隔空行的
+    连续注释块 = 该声明的文档注释」，所以向下找到注释块结束后的第一个非注释行，
+    就能落到那条声明上。
+
+    非注释行原样返回；注释块一直到文件末尾则也原样返回（无从归属）。
+
+    Args:
+        lines: 源码按行切分的结果，行号 = 下标 + 1
+        line_no: 待归位的行号（1-based）
+
+    Returns:
+        归位后的行号（1-based）
+    """
+    if line_no < 1 or line_no > len(lines) or not _is_comment_line(lines[line_no - 1]):
+        return line_no
+
+    index = line_no  # 下一个待检查行的 0-based 下标
+    while index < len(lines) and _is_comment_line(lines[index]):
+        index += 1
+    return index + 1 if index < len(lines) else line_no
+
+
+def _is_comment_line(line: str) -> bool:
+    """判断一行是否是注释行。
+
+    Args:
+        line: 源码的一行
+
+    Returns:
+        去缩进后以 ``//`` / ``/*`` / ``*`` 开头则视为注释
+    """
+    return line.strip().startswith(_COMMENT_PREFIXES)
+
+
+def _file_facts(
+    cache: dict[tuple[str, bool], _FileFacts],
     repo: pygit2.Repository,
     commit: pygit2.Commit,
     path: str,
     side: bool,
-) -> list[Symbol]:
-    """取某个文件在指定侧的符号表，带缓存。
+) -> _FileFacts:
+    """取某个文件在指定侧的源码事实（行文本 + 符号表），带缓存。
 
     Args:
         cache: 缓存字典
@@ -215,16 +273,16 @@ def _file_symbols(
         side: True 表示旧版本侧
 
     Returns:
-        该文件的符号列表；文件不存在时为空列表
+        该文件的 _FileFacts；文件不存在时为空事实
     """
     key = (path, side)
     if key not in cache:
         source = read_blob(repo, commit, path)
         if source is None:
             logger.debug("文件 %s 在该版本中不存在，符号表为空", path)
-            cache[key] = []
+            cache[key] = _FileFacts(lines=[], symbols=[])
         else:
-            cache[key] = extract_symbols(source)
+            cache[key] = _FileFacts(lines=source.splitlines(), symbols=extract_symbols(source))
     return cache[key]
 
 
@@ -233,7 +291,7 @@ def _containing(symbols: list[Symbol], lines: list[int]) -> list[Symbol]:
 
     Args:
         symbols: 候选符号
-        lines: 改动行号列表
+        lines: 改动行号列表（已归位）
 
     Returns:
         命中的符号列表，保持入参顺序

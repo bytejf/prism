@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # 提取的 AST 节点类型
 FUNCTION_NODE = "function_declaration"
 METHOD_NODE = "method_declaration"
+PACKAGE_NODE = "package_clause"
 IMPORT_NODE = "import_declaration"
 CONST_NODE = "const_declaration"
 VAR_NODE = "var_declaration"
@@ -27,6 +28,7 @@ VAR_NODE = "var_declaration"
 TYPE_NODES = frozenset({"type_spec", "type_alias"})
 
 # 符号类型，与 models.ast.Symbol.kind 取值一致
+KIND_PACKAGE = "package"
 KIND_FUNCTION = "function"
 KIND_METHOD = "method"
 KIND_IMPORT = "import"
@@ -38,6 +40,7 @@ KIND_TYPE = "type"
 
 # 顶层声明块节点 → 符号类型
 BLOCK_KINDS: dict[str, str] = {
+    PACKAGE_NODE: KIND_PACKAGE,
     IMPORT_NODE: KIND_IMPORT,
     CONST_NODE: KIND_CONST,
     VAR_NODE: KIND_VAR,
@@ -55,8 +58,12 @@ _parser = Parser(Language(tree_sitter_go.language()))
 def extract_symbols(source: str) -> list[Symbol]:
     """从 Go 源码中提取可归属的符号。
 
-    提取函数 / 方法与顶层声明（import / const / var 块、type 声明）。
+    提取函数 / 方法与顶层声明（package / import / const / var 块、type 声明）。
     不进入函数体，因此闭包（func literal）不会被误当作符号。
+
+    顶层节点里唯一不提取的是 ``comment`` —— 注释在语法树里是独立节点，
+    不挂在它「描述」的声明下面，提成符号也只能得到「comment（注释）」这种
+    无用归属。它的补偿在 mapper 里做（见 `mapper._landing_line`）。
 
     Args:
         source: Go 源码文本
@@ -111,10 +118,10 @@ def _to_symbol(node: Node, kind: str) -> Symbol:
 
 
 def _block_symbol(node: Node, kind: str) -> Symbol:
-    """把顶层声明块（import / const / var）转成 Symbol。
+    """把顶层声明块（package / import / const / var）转成 Symbol。
 
     Args:
-        node: import_declaration / const_declaration / var_declaration 节点
+        node: package_clause / import_declaration / const_declaration / var_declaration 节点
         kind: 符号类型
 
     Returns:
