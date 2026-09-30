@@ -26,9 +26,9 @@
         → 内置降噪（*_test.go、*.pb.go）。对应 core/filter/。
 
     prism hunk-map  [--base main] [--head HEAD]
-        把每个 hunk 归属到它重叠的函数 / 方法，打印 hunk 位置与归属符号。
-        只处理通过过滤的 .go 文件。对应 core/ast/：
-        tree-sitter 提取 function_declaration / method_declaration 的行号范围后求交。
+        把每个 hunk 归属到包含其改动行的符号，打印 hunk 位置与归属符号。
+        只处理通过过滤的 .go 文件。对应 core/ast/：tree-sitter 提取符号
+        （函数 / 方法 / 包声明 / import / const / var / type），按改动行求交。
 
     prism group     [--base main] [--head HEAD]
         按包路径（目录）分组，打印审查单元。
@@ -37,7 +37,7 @@
 
 ## 完整审查（调用 LLM，产生 token 成本）
 
-    prism review    [--base main] [--head HEAD]
+    prism review    [--base main] [--head HEAD] [--model M] [--base-url URL]
         串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。
 
         审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
@@ -228,7 +228,7 @@ def hunk_map(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
 ) -> None:
-    """把每个 hunk 归属到函数 / 方法，打印映射结果（不调用 LLM）。
+    """把每个 hunk 归属到符号，打印映射结果（不调用 LLM）。
 
     只处理通过文件过滤的 .go 文件。
     """
@@ -274,32 +274,49 @@ def group(
     typer.echo("\n\n".join(blocks))
 
 
-def _llm_or_exit() -> LLMClient:
+def _llm_or_exit(model: str | None = None, base_url: str | None = None) -> LLMClient:
     """构造 LLM 客户端，失败时打印错误并终止进程。
+
+    Args:
+        model: 覆盖默认模型名（可选）
+        base_url: 覆盖默认 base URL（可选），用于切到其他 OpenAI 兼容端点
 
     Returns:
         LLMClient 实例
     """
     try:
-        return LLMClient(LLMConfig.from_env())
+        config = LLMConfig.from_env()
+        if model:
+            config.model = model
+        if base_url:
+            config.base_url = base_url
+        return LLMClient(config)
     except ValueError as exc:
         logger.error("LLM 初始化失败: %s", exc)
         typer.echo(f"错误：{exc}", err=True)
         raise typer.Exit(code=1) from exc
 
 
-def _run_groups(groups: list[Group], project_root: Path, head_rev: str) -> list[MainLoopResult]:
+def _run_groups(
+    groups: list[Group],
+    project_root: Path,
+    head_rev: str,
+    model: str | None = None,
+    base_url: str | None = None,
+) -> list[MainLoopResult]:
     """串行跑完所有审查单元（V1 不做并发）。
 
     Args:
         groups: 审查单元列表
         project_root: 项目根目录
         head_rev: 被审查的版本，传给工具读源码用
+        model: 覆盖默认模型名（可选）
+        base_url: 覆盖默认 base URL（可选）
 
     Returns:
         各组的循环产出
     """
-    llm = _llm_or_exit()
+    llm = _llm_or_exit(model, base_url)
     results: list[MainLoopResult] = []
     for index, item in enumerate(groups, start=1):
         typer.echo(
@@ -319,6 +336,8 @@ def _run_groups(groups: list[Group], project_root: Path, head_rev: str) -> list[
 def review(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+    model: str = typer.Option("", "--model", help="覆盖默认模型名，如 deepseek-chat"),
+    base_url: str = typer.Option("", "--base-url", help="覆盖默认 base URL，切到其他兼容端点"),
 ) -> None:
     """完整审查：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。"""
     started = time.monotonic()
@@ -342,14 +361,13 @@ def review(
     if not groups:
         typer.echo("没有可审查的 hunk。")
 
-    results = _run_groups(groups, root, head) if groups else []
+    results = _run_groups(groups, root, head, model or None, base_url or None) if groups else []
     comments = sort_comments(to_comments(results, groups))
 
     stats = ReviewStats(
         base_branch=base,
         head_sha=head,
         files_count=len(reviewable),
-        hunks_count=sum(len(item.hunks) for item in groups),
         comments_count=len(comments),
         duration_seconds=time.monotonic() - started,
     )

@@ -8,9 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "langchain>=1.4.2",
     "langchain-openai>=1.6.6",
-    "langfuse>=4.15.6",
     "langgraph>=1.2.12",
     "pygit2>=1.20.1",
     "tree-sitter>=0.25,<0.26",
@@ -29,7 +27,6 @@ build-backend = "uv_build"
 dev = [
     "mypy>=2.3.1",
     "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
     "ruff>=0.16.9",
 ]
 

@@ -41,14 +41,12 @@ class ReviewStats:
         base_branch: base 分支名
         head_sha: head SHA
         files_count: 文件数
-        hunks_count: hunk 数
         comments_count: 评论数
-        duration_seconds: 耗时
+        duration_seconds: 耗时（秒）
     """
 
     base_branch: str
     head_sha: str
     files_count: int
-    hunks_count: int
     comments_count: int
     duration_seconds: float

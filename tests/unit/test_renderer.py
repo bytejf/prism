@@ -57,7 +57,6 @@ def make_stats(
         base_branch=base_branch,
         head_sha=head_sha,
         files_count=files_count,
-        hunks_count=2,
         comments_count=comments_count,
         duration_seconds=1.5,
     )
@@ -89,6 +88,7 @@ def test_render_header() -> None:
     assert "main" in output
     assert "文件数：3" in output
     assert "评论数：5" in output
+    assert "耗时：1.5s" in output
 
 
 def test_render_header_shows_range() -> None:

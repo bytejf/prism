@@ -4,7 +4,7 @@
 运行时对象（HunkStatus / ToolContext）放在 core/tools/context.py。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -26,18 +26,3 @@ class CommentInput:
     existing_code: str
     suggestion_code: str | None = None
     rule_ref: str | None = None
-
-
-@dataclass
-class HunkReport:
-    """单个 hunk 的报告。
-
-    Attributes:
-        hunk_id: hunk 编号（如 "H-01"）
-        complete: 是否审查完毕
-        comments: 评论列表（可为空）
-    """
-
-    hunk_id: str
-    complete: bool
-    comments: list[CommentInput] = field(default_factory=list)

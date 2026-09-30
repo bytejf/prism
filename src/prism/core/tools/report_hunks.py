@@ -9,7 +9,7 @@ from typing import Any
 
 from langchain_core.tools import BaseTool, tool
 
-from prism.core.tools.context import STATUS_DONE, ToolContext
+from prism.core.tools.context import STATUS_DONE, STATUS_IN_PROGRESS, ToolContext
 from prism.models.tool import CommentInput
 
 logger = logging.getLogger(__name__)
@@ -65,8 +65,8 @@ def make_report_hunks_tool(ctx: ToolContext) -> BaseTool:
             status.comments.extend(comments)
             ctx.all_comments.extend(comments)
             new_comment_count += len(comments)
-            if raw.get("complete"):
-                status.status = STATUS_DONE
+            # complete=False 表示「报了部分结论但还没审完」，置为审查中
+            status.status = STATUS_DONE if raw.get("complete") else STATUS_IN_PROGRESS
             recorded.append(hunk_id)
 
         done = ctx.done_count()

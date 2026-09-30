@@ -55,7 +55,7 @@ class TerminalRenderer:
         return text
 
     def _render_header(self, stats: ReviewStats) -> str:
-        """渲染头部：审查范围 + 文件数 + 评论数。
+        """渲染头部：审查范围 + 文件数 + 评论数 + 耗时。
 
         Args:
             stats: 审查统计信息
@@ -67,7 +67,8 @@ class TerminalRenderer:
             (
                 HEADER_TITLE,
                 f"审查范围：merge-base({stats.base_branch}, {stats.head_sha})..{stats.head_sha}",
-                f"文件数：{stats.files_count} | 评论数：{stats.comments_count}",
+                f"文件数：{stats.files_count} | 评论数：{stats.comments_count}"
+                f" | 耗时：{stats.duration_seconds:.1f}s",
             )
         )
 

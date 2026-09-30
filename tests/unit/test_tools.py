@@ -8,6 +8,7 @@ import pytest
 from prism.core.tools.code_search import MAX_RESULTS, make_code_search_tool
 from prism.core.tools.context import (
     STATUS_DONE,
+    STATUS_IN_PROGRESS,
     STATUS_PENDING,
     HunkStatus,
     ToolContext,
@@ -367,13 +368,20 @@ def test_report_hunks_ignores_unknown_hunk_id() -> None:
     assert ctx.all_comments == []
 
 
-def test_report_hunks_keeps_incomplete_hunk_pending() -> None:
-    """测试 complete=False 时状态不置为 done。"""
+def test_report_hunks_marks_incomplete_hunk_in_progress() -> None:
+    """测试 complete=False 时置为「审查中」而不是 done。
+
+    这给了 STATUS_IN_PROGRESS 一条真实的产生路径，<agent_status> 的
+    「🔄 审查中」分组才有意义（否则永远是 0）。
+    """
     ctx = make_ctx_with_hunks("H-01")
     tool = make_report_hunks_tool(ctx)
 
     tool.invoke({"reports": [{"hunk_id": "H-01", "complete": False, "comments": []}]})
-    assert ctx.hunk_status["H-01"].status == STATUS_PENDING
+    assert ctx.hunk_status["H-01"].status == STATUS_IN_PROGRESS
+    # 未完成 → 仍算未审，不进 pending_ids 之外的任何完成统计
+    assert ctx.pending_ids() == ["H-01"]
+    assert ctx.done_count() == 0
 
 
 def test_report_hunks_preserves_unknown_severity() -> None:
