@@ -26,7 +26,9 @@ LLM 用**脚本化的假实现**（不打真实 API）：可复现、秒级完�
     uv run pytest tests/test_debug_prism_tests.py -s
 """
 
+import logging
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -145,8 +147,30 @@ def dump_state(state: MainState) -> None:
         print(str(message.content)[:1500])
 
 
+def enable_console_logging(level: int = logging.INFO) -> None:
+    """让 prism 的日志与 print 实时打到控制台，不被 pytest 吞掉。
+
+    pytest 会在 root logger 上挂自己的捕获 handler —— 此时
+    `logging.basicConfig()` 会变成空操作（它只在 root 没有任何 handler 时才生效），
+    所以必须 `force=True` 换掉它。加完之后不必再加 `--log-cli-level`。
+
+    只影响 prism 命名空间与 root 的输出，不改任何业务逻辑。
+
+    Args:
+        level: 日志级别，默认 INFO
+    """
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s | %(name)s | %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+    logging.getLogger("prism").setLevel(level)
+
+
 def test_debug_full_pipeline() -> None:
     """在 prism-tests 上跑一次完整链路，供断点单步查看。"""
+    enable_console_logging()
     print(f"\n被审查仓库: {PRISM_TESTS}（{BASE_BRANCH} → {HEAD_BRANCH}）")
 
     # ── 阶段 1：加载 + 解析 diff ──────────────────────────────────────
