@@ -5,6 +5,7 @@ V1 不注入调用图、静态分析发现与规则；这四段全部是静态�
 """
 
 import logging
+from itertools import groupby
 
 from prism.core.ast.mapper import format_location, format_symbol
 from prism.models.grouping import Group
@@ -147,10 +148,9 @@ def build_diff_text(group: Group) -> str:
         diff 文本，按文件分组
     """
     parts: list[str] = []
-    for path in group.files:
-        hunks = [item for item in group.hunks if item.file_path == path]
-        if not hunks:
-            continue
+    # group.hunks 已按 (文件路径, 行号) 排序，同一文件的 hunk 是连续的，
+    # 一次 groupby 就够 —— 不必按文件反复过滤整个列表
+    for path, hunks in groupby(group.hunks, key=lambda item: item.file_path):
         parts.append(f"--- {path} ---")
         for item in hunks:
             parts.append(f"@@ {format_location(item)} @@")

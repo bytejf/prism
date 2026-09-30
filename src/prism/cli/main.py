@@ -67,6 +67,7 @@
 import logging
 import time
 from importlib.metadata import version
+from itertools import groupby
 from pathlib import Path, PurePosixPath
 
 import typer
@@ -266,8 +267,9 @@ def group(
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
         lines = [header]
-        for path in item.files:
-            hunk_ids = ", ".join(h.hunk_id for h in item.hunks if h.file_path == path)
+        # hunks 已按文件路径排序，同文件的连续 → groupby 一次即可
+        for path, hunks in groupby(item.hunks, key=lambda h: h.file_path):
+            hunk_ids = ", ".join(h.hunk_id for h in hunks)
             lines.append(f"  - {PurePosixPath(path).name} ({hunk_ids})")
         blocks.append("\n".join(lines))
 
