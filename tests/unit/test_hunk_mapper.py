@@ -29,7 +29,7 @@ def make_hunk(
         old_lines: 旧文件行数
         new_start: 新文件起始行
         new_lines: 新文件行数
-        content: 原始 hunk 文本（含 @@ 行）
+        content: hunk 正文（不含 @@ 行）；changed_lines 不读它，只读前四个数字
 
     Returns:
         Hunk 对象
@@ -68,25 +68,25 @@ def test_display_range_falls_back_to_old_side_for_pure_deletion() -> None:
 
 
 def test_changed_lines_reads_header_for_modification() -> None:
-    """测试改动行直接来自头字段（-U0 下头字段就是改动行）。"""
-    content = "\n".join(["@@ -11,1 +13,2 @@", "-old1", "+new1", "+new2"])
-    added, removed = changed_lines(make_hunk(11, 1, 13, 2, content))
+    """测试改动行直接来自头字段（-U0 下头字段就是改动行）。
+
+    只给四个数字，不传 content —— changed_lines 不读正文。
+    """
+    added, removed = changed_lines(make_hunk(11, 1, 13, 2))
     assert added == [13, 14]
     assert removed == [11]
 
 
 def test_changed_lines_pure_addition_has_no_removed() -> None:
     """测试纯新增 hunk（旧文件侧行数为 0）。"""
-    content = "\n".join(["@@ -14,0 +16,1 @@", "+ErrInvalid"])
-    added, removed = changed_lines(make_hunk(14, 0, 16, 1, content))
+    added, removed = changed_lines(make_hunk(14, 0, 16, 1))
     assert added == [16]
     assert removed == []
 
 
 def test_changed_lines_pure_deletion_has_no_added() -> None:
     """测试纯删除 hunk（新文件侧行数为 0）。"""
-    content = "\n".join(["@@ -10,3 +9,0 @@", "-a", "-b", "-c"])
-    added, removed = changed_lines(make_hunk(10, 3, 9, 0, content))
+    added, removed = changed_lines(make_hunk(10, 3, 9, 0))
     assert added == []
     assert removed == [10, 11, 12]
 

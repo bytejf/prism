@@ -246,8 +246,9 @@ def test_hunk_header_lines_match_body_walk(blank_line_repo: Path) -> None:
     for diff in diffs:
         for hunk in diff.hunks:
             checked += 1
-            # `\ No newline at end of file` 是标记行，不占文件行号
-            body = [ln for ln in hunk.content.splitlines()[1:] if not ln.startswith("\\")]
+            # content 只含正文（不含 @@ 行）；`\ No newline at end of file`
+            # 是标记行，不占文件行号
+            body = [ln for ln in hunk.content.splitlines() if not ln.startswith("\\")]
 
             new_no, old_no = hunk.new_start, hunk.old_start
             walked_new: list[int] = []
@@ -287,7 +288,7 @@ def test_load_diffs_uses_zero_context(blank_line_repo: Path) -> None:
     assert hunks
 
     for hunk in hunks:
-        body = [ln for ln in hunk.content.splitlines()[1:] if not ln.startswith("\\")]
+        body = [ln for ln in hunk.content.splitlines() if not ln.startswith("\\")]
         assert len(body) == hunk.new_lines + hunk.old_lines, f"{hunk.content} 不是 -U0"
         for line in body:
             assert line[:1] in ("+", "-"), f"-U0 下不应出现上下文行：{line!r}"

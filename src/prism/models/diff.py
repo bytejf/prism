@@ -12,7 +12,7 @@ class Hunk:
         old_lines: 旧文件行数
         new_start: 新文件起始行号
         new_lines: 新文件行数
-        content: 原始 hunk 文本（含 @@ 行）
+        content: hunk 正文（不含 @@ 行）
     """
 
     old_start: int

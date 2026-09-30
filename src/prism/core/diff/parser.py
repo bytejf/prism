@@ -103,18 +103,17 @@ def _parse_block(lines: list[str]) -> Diff | None:
 
     # 当前正在累积的 hunk：头部匹配、头部原文、内容行
     header: re.Match[str] | None = None
-    header_line = ""
     body: list[str] = []
 
     def flush() -> None:
         """把累积中的 hunk 落盘，并统计增删行数。"""
-        nonlocal header, header_line, body, insertions, deletions
+        nonlocal header, body, insertions, deletions
         if header is None:
             return
-        hunks.append(_make_hunk(header_line, header, body))
+        hunks.append(_make_hunk(header, body))
         insertions += sum(1 for line in body if line.startswith("+"))
         deletions += sum(1 for line in body if line.startswith("-"))
-        header, header_line, body = None, "", []
+        header, body = None, []
 
     for line in lines:
         # 在 hunk 内部：`--- ` / `+++ ` 也可能是增删行的内容，必须先判内容行
@@ -125,7 +124,7 @@ def _parse_block(lines: list[str]) -> Diff | None:
         flush()
 
         if (matched := _HUNK_HEADER_RE.match(line)) is not None:
-            header, header_line = matched, line
+            header = matched
         elif line.startswith("new file mode"):
             is_new = True
             is_symlink = _has_symlink_mode(line)
@@ -212,11 +211,15 @@ def _is_hunk_body_line(line: str) -> bool:
     return line[:1] in (" ", "+", "-", "\\", "")
 
 
-def _make_hunk(header_line: str, matched: re.Match[str], body: list[str]) -> Hunk:
+def _make_hunk(matched: re.Match[str], body: list[str]) -> Hunk:
     """由 hunk 头与内容行构造 Hunk。
 
+    content 只存正文，不含 `@@` 头：行号与行数已经在字段里了，而头尾那段
+    「所属函数」是 git 从旧文件就近取的（最近的前一个声明），实测 18~35% 的
+    hunk 会指错 —— 带进送审文本只会误导模型。位置信息由 guidance 层用
+    我们自己的准确归属重新渲染。
+
     Args:
-        header_line: hunk 头原文，如 `@@ -1,3 +1,5 @@ func foo() {`
         matched: hunk 头的正则匹配结果
         body: hunk 内容行
 
@@ -228,7 +231,7 @@ def _make_hunk(header_line: str, matched: re.Match[str], body: list[str]) -> Hun
         old_lines=int(matched.group(2)) if matched.group(2) is not None else 1,
         new_start=int(matched.group(3)),
         new_lines=int(matched.group(4)) if matched.group(4) is not None else 1,
-        content="\n".join([header_line, *body]),
+        content="\n".join(body),
     )
 
 

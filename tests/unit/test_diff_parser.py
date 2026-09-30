@@ -40,14 +40,15 @@ def test_parse_two_hunks() -> None:
 
 
 def test_parse_hunk_line_ranges_and_content() -> None:
-    """测试 hunk 的行号范围与原始内容（含 @@ 行）。"""
+    """测试 hunk 的行号范围与正文内容（不含 @@ 行）。"""
     hunks = parse_diff_text(TWO_HUNK_DIFF)[0].hunks
 
     assert (hunks[0].old_start, hunks[0].old_lines) == (10, 4)
     assert (hunks[0].new_start, hunks[0].new_lines) == (10, 5)
-    assert hunks[0].content.startswith("@@ -10,4 +10,5 @@ func (a *Agent) Run() {")
+    # content 只含正文，不含 @@ 行（行号在字段里，见 Hunk.content）
+    assert hunks[0].content.startswith(" line1")
     assert "-line2" in hunks[0].content
-    # hunk 内容在下一个 @@ 行处截断，不含下一个 hunk
+    # 正文在下一个 hunk 处截断，不含下一个 hunk
     assert hunks[0].content.endswith(" line4")
 
     assert (hunks[1].old_start, hunks[1].old_lines) == (30, 2)
@@ -318,7 +319,7 @@ def test_hunk_keeps_blank_context_lines() -> None:
     assert len(hunks) == 1
 
     hunk = hunks[0]
-    body = hunk.content.splitlines()[1:]
+    body = hunk.content.splitlines()
     assert body == [" package main", " ", "+// 新增注释", " func Run() {}", " "]
     # 头声明的行数与正文一致（1 上下文 + 1 空行 + 1 上下文 + 1 新增 + 1 上下文）
     assert hunk.new_lines == len(body)

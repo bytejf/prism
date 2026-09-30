@@ -131,7 +131,14 @@ def _render_finish() -> str:
 def build_diff_text(group: Group) -> str:
     """把本组 hunk 渲染成 diff 文本。
 
-    hunk.content 含 @@ 头与内容行但不含文件路径，这里按文件分组补上。
+    hunk.content 只有正文（见 Hunk.content），这里为每个 hunk 补两样东西：
+
+    - 文件分隔行 `--- path ---`，按文件分组
+    - hunk 标记 `@@ H-01 path:6 @@`，既做边界分隔，又把 hunk 编号和位置直接
+      摆在正文旁边，模型调 report_hunks 时不用回头翻指导文本
+
+    标记内容全部来自我们自己的字段（改动行算出来的），不用 git 那段
+    「最近的前一个声明」—— 实测它 18~35% 的 hunk 会指错（见 parser._make_hunk）。
 
     Args:
         group: 审查单元
@@ -145,7 +152,9 @@ def build_diff_text(group: Group) -> str:
         if not hunks:
             continue
         parts.append(f"--- {path} ---")
-        parts.extend(item.hunk.content for item in hunks)
+        for item in hunks:
+            parts.append(f"@@ {format_location(item)} @@")
+            parts.append(item.hunk.content)
     return "\n".join(parts)
 
 
