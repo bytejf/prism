@@ -293,12 +293,14 @@ def test_load_diffs_uses_zero_context(blank_line_repo: Path) -> None:
             assert line[:1] in ("+", "-"), f"-U0 下不应出现上下文行：{line!r}"
 
 
-def test_load_diffs_matches_git_cli_u0_headers(blank_line_repo: Path) -> None:
-    """测试 pygit2 取到的 -U0 diff 与 git 命令行的 `git diff -U0` 逐行一致。
+def test_load_diffs_matches_git_cli_u0(blank_line_repo: Path) -> None:
+    """测试 pygit2 取到的 -U0 diff 与 git 命令行的 `git diff -U0` 一致。
 
-    pygit2 走的是 libgit2，与 git 命令行是两个实现。这条断言确保
-    `repo.diff(..., context_lines=0)` 产出的头字段（起始行 / 行数）与
-    git 自己一致 —— 归属判定直接依赖这些数字。
+    pygit2 走的是 libgit2，与 git 命令行是两个实现。这条断言把
+    `repo.diff(..., context_lines=0)` 的产物与 `git diff -U0` 对比：
+
+    - 头字段（起始行 / 行数）—— 归属判定直接依赖这些数字
+    - hunk 正文 —— 它是送进 LLM 审查的内容
     """
     cli_patch = subprocess.run(
         ["git", "-c", "core.quotepath=false", "diff", "-U0", "main", "feature"],
@@ -309,14 +311,18 @@ def test_load_diffs_matches_git_cli_u0_headers(blank_line_repo: Path) -> None:
     ).stdout
     assert cli_patch, "git diff -U0 应产生输出"
 
-    def headers(patch: str) -> dict[str, list[tuple[int, int, int, int]]]:
+    def shape(patch: str) -> dict[str, list[tuple[int, int, int, int, str]]]:
         return {
-            diff.path: [(h.old_start, h.old_lines, h.new_start, h.new_lines) for h in diff.hunks]
+            diff.path: [
+                (h.old_start, h.old_lines, h.new_start, h.new_lines, h.content) for h in diff.hunks
+            ]
             for diff in parse_diff_text(patch)
         }
 
     ours = {
-        diff.path: [(h.old_start, h.old_lines, h.new_start, h.new_lines) for h in diff.hunks]
+        diff.path: [
+            (h.old_start, h.old_lines, h.new_start, h.new_lines, h.content) for h in diff.hunks
+        ]
         for diff in load_diffs(blank_line_repo, "main", "feature")
     }
-    assert ours == headers(cli_patch)
+    assert ours == shape(cli_patch)
