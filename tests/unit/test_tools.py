@@ -2,10 +2,13 @@
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
+from langchain_core.tools import BaseTool
+from langgraph.prebuilt import ToolRuntime
 
-from prism.core.tools.code_search import MAX_RESULTS, make_code_search_tool
+from prism.core.tools.code_search import MAX_RESULTS, code_search
 from prism.core.tools.context import (
     STATUS_DONE,
     STATUS_IN_PROGRESS,
@@ -13,11 +16,71 @@ from prism.core.tools.context import (
     HunkStatus,
     ToolContext,
 )
-from prism.core.tools.end_done import end_done_verdict, make_end_done_tool
-from prism.core.tools.file_read import MAX_LINES, make_file_read_tool
-from prism.core.tools.report_hunks import make_report_hunks_tool
+from prism.core.tools.end_done import end_done, end_done_verdict
+from prism.core.tools.file_read import MAX_LINES, file_read
+from prism.core.tools.report_hunks import report_hunks
 
 CONTEXT_WITHOUT_ROOT = ToolContext()
+
+
+def runtime_for(ctx: ToolContext) -> ToolRuntime[None, Any]:
+    """构造测试用的 ToolRuntime。
+
+    生产环境由 ToolNode 从图状态里注入；测试只关心 state 里的 tool_context，
+    其余字段填最小可用值。
+
+    Args:
+        ctx: 工具执行上下文
+
+    Returns:
+        只带 tool_context 的 ToolRuntime
+    """
+    return ToolRuntime(
+        state={"tool_context": ctx},
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id=None,
+        store=None,
+    )
+
+
+class ToolUnderTest:
+    """把 ctx 绑进 runtime 的工具包装。
+
+    工具改成从 ToolRuntime 取上下文后，测试不能再 `make_x_tool(ctx)`。
+    这里做 ToolNode 做的那件事（注入 runtime），让用例保持 `tool.invoke(args)` 的写法。
+    """
+
+    def __init__(self, tool: BaseTool, ctx: ToolContext) -> None:
+        """绑定工具与上下文。
+
+        Args:
+            tool: 被测工具
+            ctx: 工具执行上下文
+        """
+        self._tool = tool
+        self._ctx = ctx
+
+    def invoke(self, args: dict[str, Any]) -> str:
+        """调用工具（自动注入 runtime）。
+
+        Args:
+            args: 工具参数
+
+        Returns:
+            工具返回的文本
+        """
+        return str(self._tool.invoke({**args, "runtime": runtime_for(self._ctx)}))
+
+    @property
+    def name(self) -> str:
+        """工具名。
+
+        Returns:
+            工具名
+        """
+        return self._tool.name
 
 
 @pytest.fixture
@@ -50,7 +113,7 @@ def make_ctx_with_hunks(*hunk_ids: str) -> ToolContext:
 def test_file_read_returns_lines_with_numbers(ctx: ToolContext, tmp_path: Path) -> None:
     """测试读取文件指定行范围，输出带行号。"""
     (tmp_path / "test.go").write_text("line1\nline2\nline3\nline4\n", encoding="utf-8")
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
 
     result = tool.invoke({"path": "test.go", "start_line": 2, "end_line": 3})
     assert "line2" in result
@@ -62,7 +125,7 @@ def test_file_read_returns_lines_with_numbers(ctx: ToolContext, tmp_path: Path) 
 def test_file_read_truncates_at_limit(ctx: ToolContext, tmp_path: Path) -> None:
     """测试超过 500 行时截断并提示。"""
     (tmp_path / "big.go").write_text("x\n" * (MAX_LINES + 100), encoding="utf-8")
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
 
     result = tool.invoke({"path": "big.go", "start_line": 1, "end_line": MAX_LINES + 100})
     assert "截断" in result
@@ -73,7 +136,7 @@ def test_file_read_rejects_path_traversal(ctx: ToolContext, tmp_path: Path) -> N
     """测试拒绝越出项目根的路径，且不泄漏目标文件内容。"""
     outside = tmp_path.parent / "outside.go"
     outside.write_text("OUTSIDE_CONTENT\n", encoding="utf-8")
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
 
     result = tool.invoke({"path": "../outside.go", "start_line": 1, "end_line": 1})
     assert "错误" in result
@@ -82,14 +145,14 @@ def test_file_read_rejects_path_traversal(ctx: ToolContext, tmp_path: Path) -> N
 
 def test_file_read_rejects_absolute_path_outside_project(ctx: ToolContext) -> None:
     """测试拒绝项目外的绝对路径。"""
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
     result = tool.invoke({"path": "/etc/hosts", "start_line": 1, "end_line": 1})
     assert "错误" in result
 
 
 def test_file_read_missing_file(ctx: ToolContext) -> None:
     """测试文件不存在时返回错误文本而非抛异常。"""
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
     result = tool.invoke({"path": "nope.go", "start_line": 1, "end_line": 1})
     assert "不存在" in result
 
@@ -97,14 +160,14 @@ def test_file_read_missing_file(ctx: ToolContext) -> None:
 def test_file_read_start_line_beyond_eof(ctx: ToolContext, tmp_path: Path) -> None:
     """测试起始行超出总行数。"""
     (tmp_path / "small.go").write_text("a\nb\n", encoding="utf-8")
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
     result = tool.invoke({"path": "small.go", "start_line": 99, "end_line": 100})
     assert "错误" in result
 
 
 def test_file_read_without_project_root() -> None:
     """测试未设置 project_root 时返回错误文本。"""
-    tool = make_file_read_tool(CONTEXT_WITHOUT_ROOT)
+    tool = ToolUnderTest(file_read, CONTEXT_WITHOUT_ROOT)
     result = tool.invoke({"path": "a.go", "start_line": 1, "end_line": 1})
     assert "project_root" in result
 
@@ -169,7 +232,7 @@ def test_file_read_reads_reviewed_revision_not_worktree(divergence_repo: Path) -
     若读工作区，会拿到改之前的参数化查询，导致系统性漏报。
     """
     ctx = ToolContext(project_root=str(divergence_repo), head_rev="feature")
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
 
     result = tool.invoke({"path": "db.go", "start_line": 3, "end_line": 4})
     assert "WHERE id = '\" + id + \"'" in result, "读到了工作区（main）的内容而不是被审查版本"
@@ -179,7 +242,7 @@ def test_file_read_reads_reviewed_revision_not_worktree(divergence_repo: Path) -
 def test_file_read_falls_back_to_worktree_without_head_rev(divergence_repo: Path) -> None:
     """测试未指定 head_rev 时退化为读工作区。"""
     ctx = ToolContext(project_root=str(divergence_repo))
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
 
     result = tool.invoke({"path": "db.go", "start_line": 3, "end_line": 4})
     assert "WHERE id = ?" in result
@@ -188,7 +251,7 @@ def test_file_read_falls_back_to_worktree_without_head_rev(divergence_repo: Path
 def test_file_read_unknown_head_rev_falls_back(divergence_repo: Path) -> None:
     """测试 head_rev 无法解析时退化为读工作区，不抛异常。"""
     ctx = ToolContext(project_root=str(divergence_repo), head_rev="no-such-branch")
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
 
     result = tool.invoke({"path": "db.go", "start_line": 3, "end_line": 4})
     assert "WHERE id = ?" in result
@@ -197,7 +260,7 @@ def test_file_read_unknown_head_rev_falls_back(divergence_repo: Path) -> None:
 def test_file_read_rejects_traversal_even_with_head_rev(divergence_repo: Path) -> None:
     """测试指定 head_rev 时路径校验依然生效。"""
     ctx = ToolContext(project_root=str(divergence_repo), head_rev="feature")
-    tool = make_file_read_tool(ctx)
+    tool = ToolUnderTest(file_read, ctx)
 
     for bad in ("../outside.go", "/etc/hosts", "a/../../b.go"):
         assert "错误" in tool.invoke({"path": bad, "start_line": 1, "end_line": 1})
@@ -230,7 +293,7 @@ def go_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
 
 def test_code_search_finds_matches(go_repo: Path) -> None:
     """测试搜索命中并带文件路径与行号。"""
-    tool = make_code_search_tool(ToolContext(project_root=str(go_repo)))
+    tool = ToolUnderTest(code_search, ToolContext(project_root=str(go_repo)))
     result = tool.invoke({"pattern": "func Alpha"})
 
     assert "a.go:3" in result
@@ -239,14 +302,14 @@ def test_code_search_finds_matches(go_repo: Path) -> None:
 
 def test_code_search_respects_file_pattern(go_repo: Path) -> None:
     """测试 file_pattern 限定文件类型。"""
-    tool = make_code_search_tool(ToolContext(project_root=str(go_repo)))
+    tool = ToolUnderTest(code_search, ToolContext(project_root=str(go_repo)))
     assert "note.md" not in tool.invoke({"pattern": "func Alpha", "file_pattern": "*.go"})
     assert "note.md" in tool.invoke({"pattern": "func Alpha", "file_pattern": "*.md"})
 
 
 def test_code_search_no_match(go_repo: Path) -> None:
     """测试无匹配时返回说明文本。"""
-    tool = make_code_search_tool(ToolContext(project_root=str(go_repo)))
+    tool = ToolUnderTest(code_search, ToolContext(project_root=str(go_repo)))
     assert "未找到匹配" in tool.invoke({"pattern": "func Nonexistent"})
 
 
@@ -262,7 +325,7 @@ def test_code_search_keeps_non_ascii_paths_readable(
     git(go_repo, "add", "-A")
     git(go_repo, "commit", "-q", "-m", "add chinese file")
 
-    tool = make_code_search_tool(ToolContext(project_root=str(go_repo)))
+    tool = ToolUnderTest(code_search, ToolContext(project_root=str(go_repo)))
     result = tool.invoke({"pattern": "func Delta", "file_pattern": "*.md"})
 
     assert "中文说明.md" in result
@@ -271,14 +334,14 @@ def test_code_search_keeps_non_ascii_paths_readable(
 
 def test_code_search_caps_result_count(go_repo: Path) -> None:
     """测试结果数被压到上限并提示截断。"""
-    tool = make_code_search_tool(ToolContext(project_root=str(go_repo)))
+    tool = ToolUnderTest(code_search, ToolContext(project_root=str(go_repo)))
     result = tool.invoke({"pattern": "func", "max_results": MAX_RESULTS})
     assert "func" in result
 
 
 def test_code_search_without_project_root() -> None:
     """测试未设置 project_root 时返回错误文本。"""
-    tool = make_code_search_tool(CONTEXT_WITHOUT_ROOT)
+    tool = ToolUnderTest(code_search, CONTEXT_WITHOUT_ROOT)
     assert "project_root" in tool.invoke({"pattern": "func"})
 
 
@@ -289,7 +352,7 @@ def test_code_search_searches_reviewed_revision_not_worktree(divergence_repo: Pa
     若搜工作区，会搜到改之前的代码，与 file_read 一起造成系统性漏报。
     """
     ctx = ToolContext(project_root=str(divergence_repo), head_rev="feature")
-    tool = make_code_search_tool(ctx)
+    tool = ToolUnderTest(code_search, ctx)
 
     result = tool.invoke({"pattern": r"WHERE id = '"})
     assert "db.go" in result, "没搜到 feature 里的字符串拼接查询"
@@ -300,7 +363,7 @@ def test_code_search_searches_reviewed_revision_not_worktree(divergence_repo: Pa
 
 def test_code_search_falls_back_to_worktree_without_head_rev(divergence_repo: Path) -> None:
     """测试未指定 head_rev 时搜工作区。"""
-    tool = make_code_search_tool(ToolContext(project_root=str(divergence_repo)))
+    tool = ToolUnderTest(code_search, ToolContext(project_root=str(divergence_repo)))
     assert "db.go" in tool.invoke({"pattern": r"WHERE id = \?"})
 
 
@@ -310,7 +373,7 @@ def test_code_search_falls_back_to_worktree_without_head_rev(divergence_repo: Pa
 def test_report_hunks_records_comments_and_marks_done() -> None:
     """测试报告评论并把 hunk 标记为完成。"""
     ctx = make_ctx_with_hunks("H-01", "H-02")
-    tool = make_report_hunks_tool(ctx)
+    tool = ToolUnderTest(report_hunks, ctx)
 
     result = tool.invoke(
         {
@@ -343,7 +406,7 @@ def test_report_hunks_records_comments_and_marks_done() -> None:
 def test_report_hunks_returns_remaining_not_completed() -> None:
     """测试返回值给「剩余未审」而非「已完成」。"""
     ctx = make_ctx_with_hunks("H-01", "H-02", "H-03")
-    tool = make_report_hunks_tool(ctx)
+    tool = ToolUnderTest(report_hunks, ctx)
 
     result = tool.invoke({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
     assert "剩余未审：H-02, H-03" in result
@@ -353,7 +416,7 @@ def test_report_hunks_returns_remaining_not_completed() -> None:
 def test_report_hunks_all_done_reports_none_pending() -> None:
     """测试全部完成时剩余为「无」。"""
     ctx = make_ctx_with_hunks("H-01")
-    tool = make_report_hunks_tool(ctx)
+    tool = ToolUnderTest(report_hunks, ctx)
     result = tool.invoke({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
     assert "剩余未审：无" in result
 
@@ -361,7 +424,7 @@ def test_report_hunks_all_done_reports_none_pending() -> None:
 def test_report_hunks_ignores_unknown_hunk_id() -> None:
     """测试未知 hunk 编号被忽略且提示。"""
     ctx = make_ctx_with_hunks("H-01")
-    tool = make_report_hunks_tool(ctx)
+    tool = ToolUnderTest(report_hunks, ctx)
 
     result = tool.invoke({"reports": [{"hunk_id": "H-99", "complete": True, "comments": []}]})
     assert "未知 hunk 编号" in result
@@ -375,7 +438,7 @@ def test_report_hunks_marks_incomplete_hunk_in_progress() -> None:
     「🔄 审查中」分组才有意义（否则永远是 0）。
     """
     ctx = make_ctx_with_hunks("H-01")
-    tool = make_report_hunks_tool(ctx)
+    tool = ToolUnderTest(report_hunks, ctx)
 
     tool.invoke({"reports": [{"hunk_id": "H-01", "complete": False, "comments": []}]})
     assert ctx.hunk_status["H-01"].status == STATUS_IN_PROGRESS
@@ -387,7 +450,7 @@ def test_report_hunks_marks_incomplete_hunk_in_progress() -> None:
 def test_report_hunks_preserves_unknown_severity() -> None:
     """测试非法 severity 原样保留（交由排序阶段处理），不改写为 low。"""
     ctx = make_ctx_with_hunks("H-01")
-    tool = make_report_hunks_tool(ctx)
+    tool = ToolUnderTest(report_hunks, ctx)
 
     tool.invoke(
         {
@@ -419,7 +482,7 @@ def test_end_done_accepted_when_all_complete() -> None:
     """测试所有 hunk 完成时接受结束。"""
     ctx = ToolContext()
     ctx.hunk_status["H-01"] = HunkStatus(hunk_id="H-01", status=STATUS_DONE)
-    tool = make_end_done_tool(ctx)
+    tool = ToolUnderTest(end_done, ctx)
 
     result = tool.invoke({})
     assert "审查完成" in result
@@ -429,7 +492,7 @@ def test_end_done_accepted_when_all_complete() -> None:
 def test_end_done_rejected_on_first_call_with_pending() -> None:
     """测试有未完成 hunk 时第一次调用被拒绝。"""
     ctx = make_ctx_with_hunks("H-01", "H-02")
-    tool = make_end_done_tool(ctx)
+    tool = ToolUnderTest(end_done, ctx)
 
     result = tool.invoke({})
     assert "未审" in result
@@ -440,7 +503,7 @@ def test_end_done_rejected_on_first_call_with_pending() -> None:
 def test_end_done_accepted_on_second_call_with_gaps() -> None:
     """测试第二次调用被接受并给出结构化告警。"""
     ctx = make_ctx_with_hunks("H-01", "H-02")
-    tool = make_end_done_tool(ctx)
+    tool = ToolUnderTest(end_done, ctx)
 
     tool.invoke({})
     result = tool.invoke({})

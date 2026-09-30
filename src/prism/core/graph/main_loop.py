@@ -1,10 +1,13 @@
 """Main 循环（StateGraph 手写）。
 
 结构：
-    [START] → [call_llm] ── 有 tool_calls ─→ [execute_tools] ─→ [check_exit]
+    [START] → [call_llm] ── 有 tool_calls ─→ [execute_tools] ─→ [track_progress] ─→ [check_exit]
                         └─ 无 tool_calls ─→ [inject_reminder] ─→ [check_exit]
     [check_exit] ── 满足退出条件 ─→ [END]
                  └─ 否则 ────────→ [call_llm]
+
+[execute_tools] 用 LangGraph 的 ToolNode（并行执行、统一的工具错误处理）；
+它只管执行与回灌结果，「审查推进到哪了」是 [track_progress] 的事。
 
 与文档原图的一处差异：文档画的 `inject_reminder → call_llm` 直连，
 但那样纯文本轮次永远不经过 check_exit，§6.1 要求的
@@ -14,12 +17,13 @@
 """
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, cast
 
-from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 
 from prism.core.graph.state import (
     EXIT_END_DONE,
@@ -36,11 +40,11 @@ from prism.core.graph.status import build_agent_status
 from prism.core.guidance import templates as tpl
 from prism.core.guidance.builder import build_diff_text, build_guidance
 from prism.core.llm.client import message_text
-from prism.core.tools.code_search import make_code_search_tool
+from prism.core.tools.code_search import code_search
 from prism.core.tools.context import ToolContext
-from prism.core.tools.end_done import end_done_verdict, make_end_done_tool
-from prism.core.tools.file_read import make_file_read_tool
-from prism.core.tools.report_hunks import make_report_hunks_tool
+from prism.core.tools.end_done import end_done, end_done_verdict
+from prism.core.tools.file_read import file_read
+from prism.core.tools.report_hunks import report_hunks
 from prism.models.grouping import Group
 
 logger = logging.getLogger(__name__)
@@ -93,24 +97,19 @@ class ChatInvoker(Protocol):
         ...
 
 
-def build_tools(ctx: ToolContext) -> list[BaseTool]:
-    """按运行时上下文构造 4 个工具。
+def build_tools() -> list[BaseTool]:
+    """构造 4 个工具。
 
-    Args:
-        ctx: 工具执行上下文
+    工具通过 `ToolRuntime` 从图状态里取上下文（框架注入，模型看不到该参数），
+    因此不需要按运行时上下文构造 —— 图构建时定一次即可。
 
     Returns:
         工具列表
     """
-    return [
-        make_file_read_tool(ctx),
-        make_code_search_tool(ctx),
-        make_report_hunks_tool(ctx),
-        make_end_done_tool(ctx),
-    ]
+    return [file_read, code_search, report_hunks, end_done]
 
 
-def update_no_report_rounds(current: int, tool_calls: list[dict[str, Any]]) -> int:
+def update_no_report_rounds(current: int, tool_calls: Sequence[Mapping[str, Any]]) -> int:
     """按本轮工具调用更新 no_report_rounds。
 
     - 调用了 report_hunks → 0（有审查产出）
@@ -140,7 +139,6 @@ def call_llm(state: MainState, llm: ChatInvoker) -> dict[str, Any]:
     Returns:
         状态更新（消息 + 轮次）
     """
-    ctx = state["tool_context"]
     round_count = state["round_count"] + 1
     logger.info(
         "轮次开始：第 %d/%d 轮，消息 %d 条，连续无产出 %d 轮",
@@ -150,7 +148,7 @@ def call_llm(state: MainState, llm: ChatInvoker) -> dict[str, Any]:
         state["no_report_rounds"],
     )
 
-    response = llm.invoke(state["messages"], tools=build_tools(ctx))
+    response = llm.invoke(state["messages"], tools=build_tools())
     logger.debug(
         "LLM 返回：内容 %d 字符，tool_calls %d 个（%s）",
         len(message_text(response)),
@@ -160,48 +158,42 @@ def call_llm(state: MainState, llm: ChatInvoker) -> dict[str, Any]:
     return {"messages": [response], "round_count": round_count}
 
 
-def execute_tools(state: MainState) -> dict[str, Any]:
-    """串行执行本轮 tool_calls，把结果回灌进消息历史。
+def _last_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
+    """取最近一条带 tool_calls 的消息里的调用列表。
+
+    ToolNode 之后消息尾部是 ToolMessage，本轮调了哪些工具要往上找那条 AI 消息。
+
+    Args:
+        messages: 消息历史
+
+    Returns:
+        工具调用列表；找不到时为空列表
+    """
+    for message in reversed(messages):
+        calls = getattr(message, "tool_calls", None)
+        if calls:
+            return [dict(call) for call in calls]
+    return []
+
+
+def track_progress(state: MainState) -> dict[str, Any]:
+    """ToolNode 之后：更新无产出计数，report_hunks 之后追加进度快照。
+
+    ToolNode 只管执行工具与回灌结果；「审查推进到哪了」是 Main 循环自己的事。
 
     Args:
         state: 当前状态
 
     Returns:
-        状态更新（工具结果消息 + no_report_rounds，report_hunks 时追加进度快照）
+        状态更新（no_report_rounds；调过 report_hunks 时追加进度快照）
     """
     ctx = state["tool_context"]
-    last = state["messages"][-1]
-    tool_calls = list(getattr(last, "tool_calls", []) or [])
-    tool_map = {item.name: item for item in build_tools(ctx)}
-
-    results: list[BaseMessage] = []
-    for call in tool_calls:
-        name = str(call.get("name", ""))
-        args = call.get("args") or {}
-        logger.debug("执行工具：%s(%s)", name, args)
-
-        tool = tool_map.get(name)
-        if tool is None:
-            content = f"错误：未知工具 {name}"
-            logger.warning("未知工具调用：%s", name)
-        else:
-            try:
-                content = str(tool.invoke(args))
-            except Exception as exc:  # 工具内部已尽量返回文本，这里兜底
-                content = f"错误：工具 {name} 执行异常：{exc}"
-                logger.warning("工具 %s 执行异常：%s", name, exc)
-
-        logger.debug("工具返回：%s，%d 字符", name, len(content))
-        results.append(ToolMessage(content=content, tool_call_id=str(call.get("id", ""))))
-
+    tool_calls = _last_tool_calls(state["messages"])
     updates: dict[str, Any] = {
-        "messages": results,
         "no_report_rounds": update_no_report_rounds(state["no_report_rounds"], tool_calls),
     }
-
-    # report_hunks 之后追加进度快照，让 LLM 知道还剩什么
     if any(str(call.get("name", "")) == "report_hunks" for call in tool_calls):
-        updates["messages"] = [*results, HumanMessage(content=build_agent_status(ctx))]
+        updates["messages"] = [HumanMessage(content=build_agent_status(ctx))]
     return updates
 
 
@@ -333,7 +325,8 @@ def build_graph(llm: ChatInvoker) -> Any:
 
     graph = StateGraph(MainState)
     graph.add_node("call_llm", call_llm_node)
-    graph.add_node("execute_tools", execute_tools)
+    graph.add_node("execute_tools", ToolNode(build_tools(), handle_tool_errors=True))
+    graph.add_node("track_progress", track_progress)
     graph.add_node("inject_reminder", inject_reminder)
     graph.add_node("check_exit", check_exit)
 
@@ -343,7 +336,8 @@ def build_graph(llm: ChatInvoker) -> Any:
         route_after_llm,
         {"execute_tools": "execute_tools", "inject_reminder": "inject_reminder"},
     )
-    graph.add_edge("execute_tools", "check_exit")
+    graph.add_edge("execute_tools", "track_progress")
+    graph.add_edge("track_progress", "check_exit")
     graph.add_edge("inject_reminder", "check_exit")
     graph.add_conditional_edges(
         "check_exit", route_after_check, {"end": END, "call_llm": "call_llm"}
@@ -381,7 +375,7 @@ def run_main_loop(
 
     # 每个节点至少一跳，条件边再分叉，给足余量避免 LangGraph 的递归上限先触发
     final: MainState = build_graph(llm).invoke(
-        state, config={"recursion_limit": max_rounds * 4 + 20}
+        state, config={"recursion_limit": max_rounds * 5 + 20}
     )
 
     exit_reason = final.get("exit_reason")

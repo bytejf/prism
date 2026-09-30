@@ -242,7 +242,7 @@ def test_initial_state_builds_messages_and_round_budget(project_root: str) -> No
 
 def test_build_tools_exposes_four_tools() -> None:
     """测试 4 个工具都构造出来且名字正确。"""
-    names = sorted(tool.name for tool in build_tools(ToolContext(project_root=".")))
+    names = sorted(tool.name for tool in build_tools())
     assert names == ["code_search", "end_done", "file_read", "report_hunks"]
 
 
@@ -413,12 +413,17 @@ def test_main_loop_injects_reminder_on_plain_text(project_root: str) -> None:
 
 
 def test_main_loop_unknown_tool_returns_error_text(project_root: str) -> None:
-    """测试调用不存在的工具时回灌错误文本而非崩溃。"""
+    """测试调用不存在的工具时回灌错误文本而非崩溃。
+
+    错误文本由 LangGraph 的 ToolNode 生成（`Error: xxx is not a valid tool`），
+    这里只断言「有错误文本回灌给模型」，不锁具体措辞。
+    """
     llm = ScriptedLLM([ai_call("no_such_tool", {}), report_call(["H-01"]), done_call()])
     result = run_main_loop(make_group(["H-01"]), llm, project_root)
 
     assert result.exit_reason == EXIT_END_DONE
-    assert any("未知工具" in str(m.content) for m in llm.calls[1])
+    feedback = [str(m.content) for m in llm.calls[1] if m.type == "tool"]
+    assert any("no_such_tool" in text and "Error" in text for text in feedback), feedback
 
 
 def test_main_loop_empty_group(project_root: str) -> None:

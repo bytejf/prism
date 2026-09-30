@@ -7,9 +7,10 @@
 import logging
 import subprocess
 
-from langchain_core.tools import BaseTool, tool
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
 
-from prism.core.tools.context import ToolContext
+from prism.core.graph.state import MainState
 
 logger = logging.getLogger(__name__)
 
@@ -23,96 +24,84 @@ TIMEOUT_SECONDS = 30
 RC_NO_MATCH = 1
 
 
-def make_code_search_tool(ctx: ToolContext) -> BaseTool:
-    """构造 code_search 工具，绑定运行时上下文。
+@tool
+def code_search(
+    pattern: str,
+    runtime: ToolRuntime[None, MainState],
+    file_pattern: str = "*.go",
+    max_results: int = 50,
+) -> str:
+    """按内容搜索代码。
 
     Args:
-        ctx: 工具执行上下文
+        pattern: 搜索模式（支持正则）
+        file_pattern: 文件过滤，默认 "*.go"
+        max_results: 最大结果数，默认 50
 
     Returns:
-        绑定上下文的 code_search 工具
+        匹配行列表（含文件路径、行号、内容）；无匹配或出错时返回说明文本
+
+    Notes:
+        ToolContext.head_rev 已设置时搜索该版本，否则搜索工作区。
     """
+    ctx = runtime.state["tool_context"]
+    limit = max(1, min(max_results, MAX_RESULTS))
+    logger.debug(
+        "code_search 调用：pattern=%s file_pattern=%s max_results=%d",
+        pattern,
+        file_pattern,
+        limit,
+    )
 
-    @tool
-    def code_search(
-        pattern: str,
-        file_pattern: str = "*.go",
-        max_results: int = 50,
-    ) -> str:
-        """按内容搜索代码。
+    if not ctx.project_root:
+        logger.warning("code_search 缺少 project_root")
+        return "错误：ToolContext.project_root 未设置"
 
-        Args:
-            pattern: 搜索模式（支持正则）
-            file_pattern: 文件过滤，默认 "*.go"
-            max_results: 最大结果数，默认 50
-
-        Returns:
-            匹配行列表（含文件路径、行号、内容）；无匹配或出错时返回说明文本
-
-        Notes:
-            ToolContext.head_rev 已设置时搜索该版本，否则搜索工作区。
-        """
-        limit = max(1, min(max_results, MAX_RESULTS))
-        logger.debug(
-            "code_search 调用：pattern=%s file_pattern=%s max_results=%d",
-            pattern,
-            file_pattern,
-            limit,
+    # -c core.quotepath=false：含中文等非 ASCII 的路径按原样输出，
+    #   否则 git 会转义成 "a-\346\234\200.md"，LLM 拿到后无法回传给 file_read
+    # -n 带行号，-E 扩展正则，-I 跳过二进制文件
+    command = [
+        "git",
+        "-c",
+        "core.quotepath=false",
+        "grep",
+        "--line-number",
+        "--extended-regexp",
+        "-I",
+        pattern,
+    ]
+    # 指定 rev 时搜的是该版本的树，而不是工作区 —— 工作区可能停在别的分支，
+    # 直接搜工作区会拿到改之前的代码
+    if ctx.head_rev:
+        command.append(ctx.head_rev)
+    command.extend(["--", file_pattern])
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ctx.project_root,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_SECONDS,
+            check=False,
         )
+    except subprocess.TimeoutExpired:
+        logger.warning("code_search 超时：%s", pattern)
+        return f"错误：搜索超时（超过 {TIMEOUT_SECONDS} 秒）"
+    except OSError as exc:
+        logger.warning("code_search 无法执行 git：%s", exc)
+        return f"错误：无法执行 git grep：{exc}"
 
-        if not ctx.project_root:
-            logger.warning("code_search 缺少 project_root")
-            return "错误：ToolContext.project_root 未设置"
+    if completed.returncode not in (0, RC_NO_MATCH):
+        logger.warning("code_search 失败：rc=%d %s", completed.returncode, completed.stderr.strip())
+        return f"错误：git grep 失败：{completed.stderr.strip()}"
 
-        # -c core.quotepath=false：含中文等非 ASCII 的路径按原样输出，
-        #   否则 git 会转义成 "a-\346\234\200.md"，LLM 拿到后无法回传给 file_read
-        # -n 带行号，-E 扩展正则，-I 跳过二进制文件
-        command = [
-            "git",
-            "-c",
-            "core.quotepath=false",
-            "grep",
-            "--line-number",
-            "--extended-regexp",
-            "-I",
-            pattern,
-        ]
-        # 指定 rev 时搜的是该版本的树，而不是工作区 —— 工作区可能停在别的分支，
-        # 直接搜工作区会拿到改之前的代码
-        if ctx.head_rev:
-            command.append(ctx.head_rev)
-        command.extend(["--", file_pattern])
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=ctx.project_root,
-                capture_output=True,
-                text=True,
-                timeout=TIMEOUT_SECONDS,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning("code_search 超时：%s", pattern)
-            return f"错误：搜索超时（超过 {TIMEOUT_SECONDS} 秒）"
-        except OSError as exc:
-            logger.warning("code_search 无法执行 git：%s", exc)
-            return f"错误：无法执行 git grep：{exc}"
+    matched = completed.stdout.splitlines()
+    if not matched:
+        logger.debug("code_search 无匹配：%s", pattern)
+        return f"未找到匹配：{pattern}"
 
-        if completed.returncode not in (0, RC_NO_MATCH):
-            logger.warning(
-                "code_search 失败：rc=%d %s", completed.returncode, completed.stderr.strip()
-            )
-            return f"错误：git grep 失败：{completed.stderr.strip()}"
-
-        matched = completed.stdout.splitlines()
-        if not matched:
-            logger.debug("code_search 无匹配：%s", pattern)
-            return f"未找到匹配：{pattern}"
-
-        body = "\n".join(matched[:limit])
-        if len(matched) > limit:
-            logger.debug("code_search 截断：共 %d 条，返回 %d 条", len(matched), limit)
-            body += f"\n（已截断：共 {len(matched)} 条匹配，只显示前 {limit} 条）"
-        return body
-
-    return code_search
+    body = "\n".join(matched[:limit])
+    if len(matched) > limit:
+        logger.debug("code_search 截断：共 %d 条，返回 %d 条", len(matched), limit)
+        body += f"\n（已截断：共 {len(matched)} 条匹配，只显示前 {limit} 条）"
+    return body

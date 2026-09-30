@@ -7,8 +7,10 @@
 import logging
 from pathlib import Path, PurePosixPath
 
-from langchain_core.tools import BaseTool, tool
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
 
+from prism.core.graph.state import MainState
 from prism.core.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -20,68 +22,58 @@ MAX_LINES = 500
 TRUNCATED_HINT = "（已截断：单次最多读取 {max_lines} 行）"
 
 
-def make_file_read_tool(ctx: ToolContext) -> BaseTool:
-    """构造 file_read 工具，绑定运行时上下文。
+@tool
+def file_read(
+    path: str,
+    start_line: int,
+    end_line: int,
+    runtime: ToolRuntime[None, MainState],
+) -> str:
+    """读取文件指定行范围的内容。
 
     Args:
-        ctx: 工具执行上下文
+        path: 文件相对路径
+        start_line: 起始行号（1-based）
+        end_line: 结束行号（1-based，最多 500 行）
 
     Returns:
-        绑定上下文的 file_read 工具
+        文件内容（每行前缀行号），超出 500 行时截断并提示
     """
+    ctx = runtime.state["tool_context"]
+    logger.debug("file_read 调用：path=%s start_line=%d end_line=%d", path, start_line, end_line)
+    if not ctx.project_root:
+        logger.warning("file_read 缺少 project_root")
+        return "错误：ToolContext.project_root 未设置"
 
-    @tool
-    def file_read(path: str, start_line: int, end_line: int) -> str:
-        """读取文件指定行范围的内容。
+    # 路径校验放在读取之前：git 读取路径不经过文件系统的 resolve()，
+    # 若先读再校验，``../`` 会绕过检查
+    try:
+        _validate_relative_path(path)
+    except ValueError as exc:
+        logger.warning("file_read 路径校验失败：%s", exc)
+        return f"错误：{exc}"
 
-        Args:
-            path: 文件相对路径
-            start_line: 起始行号（1-based）
-            end_line: 结束行号（1-based，最多 500 行）
+    text = _read_reviewed(ctx, path)
+    if text is None:
+        return f"错误：文件不存在：{path}"
 
-        Returns:
-            文件内容（每行前缀行号），超出 500 行时截断并提示
-        """
-        logger.debug(
-            "file_read 调用：path=%s start_line=%d end_line=%d", path, start_line, end_line
-        )
-        if not ctx.project_root:
-            logger.warning("file_read 缺少 project_root")
-            return "错误：ToolContext.project_root 未设置"
+    lines = text.splitlines()
+    total = len(lines)
+    if start_line > total:
+        logger.warning("file_read 起始行超界：%d > %d", start_line, total)
+        return f"错误：起始行 {start_line} 超出文件总行数 {total}"
 
-        # 路径校验放在读取之前：git 读取路径不经过文件系统的 resolve()，
-        # 若先读再校验，``../`` 会绕过检查
-        try:
-            _validate_relative_path(path)
-        except ValueError as exc:
-            logger.warning("file_read 路径校验失败：%s", exc)
-            return f"错误：{exc}"
+    start = max(start_line, 1)
+    end = min(max(end_line, start), total)
+    truncated = end - start + 1 > MAX_LINES
+    if truncated:
+        end = start + MAX_LINES - 1
 
-        text = _read_reviewed(ctx, path)
-        if text is None:
-            return f"错误：文件不存在：{path}"
-
-        lines = text.splitlines()
-        total = len(lines)
-        if start_line > total:
-            logger.warning("file_read 起始行超界：%d > %d", start_line, total)
-            return f"错误：起始行 {start_line} 超出文件总行数 {total}"
-
-        start = max(start_line, 1)
-        end = min(max(end_line, start), total)
-        truncated = end - start + 1 > MAX_LINES
-        if truncated:
-            end = start + MAX_LINES - 1
-
-        body = "\n".join(f"{number:>6}: {lines[number - 1]}" for number in range(start, end + 1))
-        logger.debug(
-            "file_read 完成：%d 行（总 %d 行，截断=%s）", end - start + 1, total, truncated
-        )
-        if truncated:
-            return f"{body}\n{TRUNCATED_HINT.format(max_lines=MAX_LINES)}"
-        return body
-
-    return file_read
+    body = "\n".join(f"{number:>6}: {lines[number - 1]}" for number in range(start, end + 1))
+    logger.debug("file_read 完成：%d 行（总 %d 行，截断=%s）", end - start + 1, total, truncated)
+    if truncated:
+        return f"{body}\n{TRUNCATED_HINT.format(max_lines=MAX_LINES)}"
+    return body
 
 
 def _read_reviewed(ctx: ToolContext, path: str) -> str | None:

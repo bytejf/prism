@@ -6,8 +6,10 @@ LLM 需要一个明确的结束信号。有未完成的 hunk 时第一次拒绝�
 
 import logging
 
-from langchain_core.tools import BaseTool, tool
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
 
+from prism.core.graph.state import MainState
 from prism.core.tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -34,41 +36,31 @@ def end_done_verdict(ctx: ToolContext) -> tuple[bool, list[str]]:
     return ctx.end_done_count > MAX_REJECTIONS, pending
 
 
-def make_end_done_tool(ctx: ToolContext) -> BaseTool:
-    """构造 end_done 工具，绑定运行时上下文。
+@tool
+def end_done(runtime: ToolRuntime[None, MainState]) -> str:
+    """结束审查。
+
+    只有所有 hunk 都标记为 complete 时才能结束。
+    如果有未完成的 hunk，返回拒绝消息，提示剩余 hunk。
 
     Args:
-        ctx: 工具执行上下文
+        runtime: 运行时（框架注入，模型看不到）
 
     Returns:
-        绑定上下文的 end_done 工具
+        "审查完成" 或 "⚠️ H-xx 未审，请先 report_hunks"
     """
+    ctx = runtime.state["tool_context"]
+    ctx.end_done_count += 1
+    accepted, pending = end_done_verdict(ctx)
 
-    @tool
-    def end_done() -> str:
-        """结束审查。
+    if accepted and not pending:
+        logger.info("end_done：全部 %d 个 hunk 审查完毕", len(ctx.hunk_status))
+        return "审查完成"
 
-        只有所有 hunk 都标记为 complete 时才能结束。
-        如果有未完成的 hunk，返回拒绝消息，提示剩余 hunk。
+    joined = ", ".join(pending)
+    if not accepted:
+        logger.warning("end_done 被拒绝：剩余 %s 未审", joined)
+        return f"⚠️ 剩余 {joined} 未审，请先 report_hunks"
 
-        Returns:
-            "审查完成" 或 "⚠️ H-xx 未审，请先 report_hunks"
-        """
-        ctx.end_done_count += 1
-        accepted, pending = end_done_verdict(ctx)
-
-        if accepted and not pending:
-            logger.info("end_done：全部 %d 个 hunk 审查完毕", len(ctx.hunk_status))
-            return "审查完成"
-
-        joined = ", ".join(pending)
-        if not accepted:
-            logger.warning("end_done 被拒绝：剩余 %s 未审", joined)
-            return f"⚠️ 剩余 {joined} 未审，请先 report_hunks"
-
-        logger.warning(
-            "end_done 第 %d 次调用，接受结束但仍有未审 hunk：%s", ctx.end_done_count, joined
-        )
-        return f"已接受结束请求。注意：{joined} 未被审查。"
-
-    return end_done
+    logger.warning("end_done 第 %d 次调用，接受结束但仍有未审 hunk：%s", ctx.end_done_count, joined)
+    return f"已接受结束请求。注意：{joined} 未被审查。"
