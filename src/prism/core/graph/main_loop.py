@@ -16,7 +16,7 @@
 import logging
 from typing import Any, Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 
@@ -32,7 +32,8 @@ from prism.core.graph.state import (
     max_rounds_for,
 )
 from prism.core.graph.status import build_agent_status
-from prism.core.guidance.builder import build_diff_text, build_guidance, build_system_prompt
+from prism.core.guidance import templates as tpl
+from prism.core.guidance.builder import build_diff_text, build_guidance
 from prism.core.llm.client import message_text
 from prism.core.tools.code_search import make_code_search_tool
 from prism.core.tools.context import ToolContext
@@ -292,19 +293,13 @@ def initial_state(group: Group, project_root: str, head_rev: str = "") -> MainSt
     ctx = ToolContext(project_root=project_root, head_rev=head_rev)
     ctx.init_hunks([item.hunk_id for item in group.hunks])
 
-    user_content = "\n\n".join(
-        (
-            build_guidance(group),
-            "### 本组 diff",
-            "",
-            build_diff_text(group),
-        )
-    )
     return MainState(
-        messages=[
-            SystemMessage(content=build_system_prompt()),
-            HumanMessage(content=user_content),
-        ],
+        # 提示词文本在 guidance/templates.py 里整块书写；
+        # 变量契约由 MAIN_PROMPT.input_variables 暴露，少传会直接报错
+        messages=tpl.MAIN_PROMPT.format_messages(
+            guidance=build_guidance(group),
+            diff_text=build_diff_text(group),
+        ),
         tool_context=ctx,
         round_count=0,
         max_rounds=max_rounds_for(len(group.hunks)),

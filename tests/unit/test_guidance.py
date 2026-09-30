@@ -2,7 +2,8 @@
 
 import pytest
 
-from prism.core.guidance.builder import REVIEW_DIMENSIONS, build_guidance
+from prism.core.guidance.builder import build_guidance
+from prism.core.guidance.templates import REVIEW_DIMENSIONS
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
