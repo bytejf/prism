@@ -12,6 +12,7 @@ from prism.core.ast.mapper import (
     format_location,
     format_symbols,
     map_hunks_to_symbols,
+    split_by_symbol,
 )
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
@@ -266,11 +267,13 @@ def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[...,
     diffs = filter_files(load_diffs(go_repo, "main", "more")).reviewable
     mapped = map_hunks_to_symbols(go_repo, "main", "more", diffs)
 
-    assert [item.hunk_id for item in mapped] == ["H-01", "H-02"]
-    assert [item.file_path for item in mapped] == ["a.go", "svc.go"]
-    # a.go 是新增文件，整个文件都是「新增行」，因此 package 与 A 都命中
-    assert [s.name for s in mapped[0].symbols] == ["package", "A"]
-    assert "Run" in [s.name for s in mapped[1].symbols]
+    # a.go 是新增文件，整个文件都是新增行；按实体边界拆成 2 个子 hunk
+    # （package + 空行、A），所以 3 个编号而不是 2 个
+    assert [item.hunk_id for item in mapped] == ["H-01", "H-02", "H-03"]
+    assert [item.file_path for item in mapped] == ["a.go", "a.go", "svc.go"]
+    assert [s.name for s in mapped[0].symbols] == ["package"]
+    assert [s.name for s in mapped[1].symbols] == ["A"]
+    assert [s.name for s in mapped[2].symbols] == ["Run"]
 
 
 def test_map_hunks_top_level_change_attributes_to_const_block(
@@ -337,3 +340,108 @@ def test_map_hunks_missing_file_has_no_symbol(go_repo: Path, git: Callable[..., 
     mapped = map_hunks_to_symbols(go_repo, "main", "feature", [*diffs, fake])
     ghost = next(item for item in mapped if item.file_path == "ghost.go")
     assert ghost.symbols == []
+
+
+# ---------- 按实体边界拆分 hunk ----------
+
+
+def test_split_returns_same_hunk_when_single_symbol() -> None:
+    """测试只属于一个符号时不拆分（原样返回同一个对象）。"""
+    symbols = [Symbol("A", "function", 3, 5)]
+    hunk = make_hunk(0, 0, 3, 3, "\n".join(["+\tx := 1", "+\t_ = x", "+}"]))
+    assert split_by_symbol(hunk, symbols, symbols) == [hunk]
+
+
+def test_split_new_file_by_entity_boundary() -> None:
+    """测试新增文件的 hunk 按实体边界拆开，空隙行归给相邻子 hunk。"""
+    symbols = [Symbol("package", "package", 1, 1), Symbol("A", "function", 3, 5)]
+    hunk = make_hunk(
+        0,
+        0,
+        1,
+        5,
+        "\n".join(["+package main", "+", "+func A() {", "+\tprintln(1)", "+}"]),
+    )
+
+    pieces = split_by_symbol(hunk, symbols, symbols)
+    assert len(pieces) == 2
+    # 子 hunk 1：package + 紧跟的空行（空行不属于任何符号，归给相邻子 hunk）
+    assert changed_lines(pieces[0]) == ([1, 2], [])
+    # 子 hunk 2：函数体
+    assert changed_lines(pieces[1]) == ([3, 4, 5], [])
+
+
+def test_split_preserves_lines_and_content() -> None:
+    """测试拆分不丢内容：行号并集还原、正文拼接还原。"""
+    symbols = [Symbol("package", "package", 1, 1), Symbol("A", "function", 3, 5)]
+    hunk = make_hunk(
+        0,
+        0,
+        1,
+        5,
+        "\n".join(["+package main", "+", "+func A() {", "+\tprintln(1)", "+}"]),
+    )
+
+    pieces = split_by_symbol(hunk, symbols, symbols)
+    added = [ln for piece in pieces for ln in changed_lines(piece)[0]]
+    removed = [ln for piece in pieces for ln in changed_lines(piece)[1]]
+    assert sorted(added) == changed_lines(hunk)[0]
+    assert sorted(removed) == changed_lines(hunk)[1]
+    assert "\n".join(piece.content for piece in pieces) == hunk.content
+
+
+def test_split_mixed_add_and_remove() -> None:
+    """测试增删混合的 hunk 也能按实体边界拆开。"""
+    # 旧文件：函数 A（1-2）；新文件：函数 A（1-2）+ 函数 B（4-5）
+    symbols = [Symbol("A", "function", 1, 2), Symbol("B", "function", 4, 5)]
+    hunk = make_hunk(
+        1,
+        2,
+        1,
+        4,
+        "\n".join(["-line1", "-line2", "+line1", "+line2", "+", "+func B() {}"]),
+    )
+
+    pieces = split_by_symbol(hunk, symbols, symbols)
+    assert len(pieces) == 2
+    # 子 1：A 的删改 + 其后那个空行（空行归给相邻子 hunk）
+    assert changed_lines(pieces[0]) == ([1, 2, 3], [1, 2])
+    # 子 2：新增的函数 B
+    assert changed_lines(pieces[1]) == ([4], [])
+
+
+def test_split_result_has_at_most_one_symbol(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试拆分后每个 hunk 至多归属一个符号（本次改造的目标）。"""
+    git(go_repo, "checkout", "-q", "-b", "multi", "main")
+    (go_repo / "many.go").write_text(
+        "\n".join(
+            [
+                "package main",
+                "",
+                'import "fmt"',
+                "",
+                "func A() {",
+                "\tfmt.Println(1)",
+                "}",
+                "",
+                "func B() {",
+                "\tfmt.Println(2)",
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "multi")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "multi")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "multi", diffs)
+
+    assert mapped
+    assert all(len(item.symbols) <= 1 for item in mapped)
+    # 新增文件被拆成多个子 hunk，整体仍覆盖全部行
+    names = [item.symbols[0].name for item in mapped if item.symbols]
+    assert "package" in names
+    assert "A" in names
+    assert "B" in names

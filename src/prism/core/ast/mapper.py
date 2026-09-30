@@ -61,10 +61,12 @@ def map_hunks_to_symbols(
 ) -> list[HunkWithSymbol]:
     """把每个 hunk 归属到包含其改动行的符号。
 
+    先按实体边界把 hunk 拆开（`split_by_symbol`），再逐个子 hunk 归属 ——
+    这样每个结果要么属于唯一一个符号，要么不属于任何符号（真·顶层改动），
+    不会出现「一个 hunk 挂着一串符号」这种含糊状态。
     有新增行时用新文件侧（新文件源码 + 新增行号），纯删除时用旧文件侧
-    （merge-base 源码 + 删除行号）—— 后者与文档「删除用旧文件的 AST」一致，
-    也让删除文件、纯删除 hunk 统一走同一条路径。
-    编号按文件路径排序后全局连续分配，保证同一输入产生同一编号。
+    （merge-base 源码 + 删除行号）—— 与文档「删除用旧文件的 AST」一致。
+    编号按文件路径排序、拆分后全局连续分配，保证同一输入产生同一编号。
 
     Args:
         repo_path: 仓库路径
@@ -80,26 +82,57 @@ def map_hunks_to_symbols(
     """
     repo, diff_base, head_commit = resolve_range(repo_path, base, head)
 
-    # 同一文件同一侧只读一次：(路径, 是否旧版本) → 源码事实
+    # 同一文件同一侧只读一次：(路径, 是否旧版本) → 符号表
     cache: dict[tuple[str, bool], list[Symbol]] = {}
     results: list[HunkWithSymbol] = []
     counter = 0
 
     for diff in sorted(diffs, key=lambda item: item.path):
         for hunk in diff.hunks:
-            counter += 1
-            results.append(
-                HunkWithSymbol(
-                    hunk=hunk,
-                    file_path=diff.path,
-                    symbols=_attribute(cache, repo, diff_base, head_commit, diff.path, hunk),
-                    hunk_id=f"{HUNK_ID_PREFIX}{counter:0{HUNK_ID_WIDTH}d}",
+            for piece in _split_hunk(hunk, cache, repo, diff_base, head_commit, diff.path):
+                counter += 1
+                results.append(
+                    HunkWithSymbol(
+                        hunk=piece,
+                        file_path=diff.path,
+                        symbols=_attribute(cache, repo, diff_base, head_commit, diff.path, piece),
+                        hunk_id=f"{HUNK_ID_PREFIX}{counter:0{HUNK_ID_WIDTH}d}",
+                    )
                 )
-            )
 
     unmatched = sum(1 for item in results if not item.symbols)
     logger.info("映射完成：%d 个 hunk，其中 %d 个未归属到符号", len(results), unmatched)
     return results
+
+
+def _split_hunk(
+    hunk: Hunk,
+    cache: dict[tuple[str, bool], list[Symbol]],
+    repo: pygit2.Repository,
+    base_commit: pygit2.Commit,
+    head_commit: pygit2.Commit,
+    path: str,
+) -> list[Hunk]:
+    """按实体边界拆分单个 hunk。
+
+    两侧符号表都给：`+` 行按新文件行号、`-` 行按旧文件行号各自查自己的表。
+
+    Args:
+        hunk: 待拆分的 hunk
+        cache: 文件符号表缓存
+        repo: pygit2 仓库
+        base_commit: merge-base 侧的 commit
+        head_commit: head 侧的 commit
+        path: 文件路径
+
+    Returns:
+        子 hunk 列表
+    """
+    return split_by_symbol(
+        hunk,
+        new_symbols=_file_symbols(cache, repo, head_commit, path, side=False),
+        old_symbols=_file_symbols(cache, repo, base_commit, path, side=True),
+    )
 
 
 def changed_lines(hunk: Hunk) -> tuple[list[int], list[int]]:
@@ -165,6 +198,108 @@ def format_symbols(symbols: list[Symbol]) -> str:
     return ", ".join(
         f"{symbol.name}（{KIND_LABELS.get(symbol.kind, symbol.kind)}）" for symbol in symbols
     )
+
+
+def split_by_symbol(hunk: Hunk, new_symbols: list[Symbol], old_symbols: list[Symbol]) -> list[Hunk]:
+    """按实体边界把 hunk 拆成若干只属于单一符号的子 hunk。
+
+    逐行遍历正文，算出每行的归属；归属变化处开一个新子 hunk。
+    **不属于任何实体的行（空行、独立注释）不触发切分**，直接留在当前子 hunk 里
+    —— 即「空隙行归给相邻子 hunk」，这样每个子 hunk 都恰好对应一个实体。
+    （实体之间一定有这种空隙行，所以不能按行号机械对半切。）
+
+    `+` 行用**新文件侧**符号表、`-` 行用**旧文件侧**符号表 —— 两侧行号是
+    两套坐标，混用会把删除行的旧行号拿去查新文件的符号表，拆出跨实体的碎片。
+
+    子 hunk 的行号范围与正文都是从原 hunk 切出来的，两者拼接回原样：
+    行号范围切分后并集等于原范围，正文切片的拼接等于原正文。
+
+    Args:
+        hunk: 待拆分的 hunk
+        new_symbols: 新文件侧的符号表
+        old_symbols: 旧文件侧的符号表
+
+    Returns:
+        子 hunk 列表；只有一个归属时原样返回 [hunk]
+    """
+    body = hunk.content.splitlines()
+    if not body:
+        return [hunk]
+
+    # 第一遍：找出切分点与每段的归属。
+    # 按**名字**比较而不是对象身份：新旧两侧符号表是两次提取的结果，同名
+    # 实体会是两个不同对象；用身份比较会把「一行改成另一行」（`-旧` + `+新`）
+    # 这种同一实体的改动误切成两半。也不能比整个对象：改动会让函数范围变化，
+    # 同名实体的行号在新旧两侧本来就可能不同。
+    cuts: list[int] = []
+    current_name: str | None = None
+
+    old_no, new_no = hunk.old_start, hunk.new_start
+    for index, line in enumerate(body):
+        if line.startswith("+"):
+            owner = _owner_at(new_symbols, new_no)
+            new_no += 1
+        elif line.startswith("-"):
+            owner = _owner_at(old_symbols, old_no)
+            old_no += 1
+        else:
+            # -U0 下不该出现上下文行；防御性处理，两侧都前进
+            owner, old_no, new_no = None, old_no + 1, new_no + 1
+
+        if index == 0:
+            cuts.append(0)
+        elif owner is not None and current_name is not None and owner.name != current_name:
+            cuts.append(index)
+
+        # 空隙行（owner 为 None）不改 current_name，等于归给当前子 hunk
+        if owner is not None:
+            current_name = owner.name
+
+    if len(cuts) == 1:
+        return [hunk]
+
+    # 第二遍：按切分点切出子 hunk，并用原 hunk 的游标算出各自的行号范围
+    bounds = [*cuts, len(body)]
+    return [_sub_hunk(hunk, body, bounds[i], bounds[i + 1] - 1) for i in range(len(cuts))]
+
+
+def _sub_hunk(hunk: Hunk, body: list[str], start: int, end: int) -> Hunk:
+    """由原 hunk 的一段正文切出子 hunk。
+
+    Args:
+        hunk: 原 hunk（提供起始行号）
+        body: 原 hunk 的正文行
+        start: 该段在正文中的起始下标（含）
+        end: 该段在正文中的结束下标（含）
+
+    Returns:
+        子 hunk
+    """
+    before = body[:start]
+    segment = body[start : end + 1]
+    return Hunk(
+        old_start=hunk.old_start + sum(1 for line in before if line.startswith("-")),
+        old_lines=sum(1 for line in segment if line.startswith("-")),
+        new_start=hunk.new_start + sum(1 for line in before if line.startswith("+")),
+        new_lines=sum(1 for line in segment if line.startswith("+")),
+        content="\n".join(segment),
+    )
+
+
+def _owner_at(symbols: list[Symbol], line_no: int) -> Symbol | None:
+    """取包含指定行的符号。
+
+    Args:
+        symbols: 文件符号表
+        line_no: 行号（1-based）
+
+    Returns:
+        命中的符号；没有则返回 None
+    """
+    for symbol in symbols:
+        if symbol.start_line <= line_no <= symbol.end_line:
+            return symbol
+    return None
 
 
 def _attribute(
