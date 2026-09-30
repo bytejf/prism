@@ -14,9 +14,10 @@
 """
 
 import logging
-from typing import Any, Protocol
+from collections.abc import Sequence
+from typing import Any, Protocol, cast
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 
@@ -77,7 +78,9 @@ class ChatInvoker(Protocol):
     只要求有 invoke，便于单元测试替换为 fake，不强绑 LLMClient。
     """
 
-    def invoke(self, messages: list[BaseMessage], tools: list[BaseTool] | None = None) -> AIMessage:
+    def invoke(
+        self, messages: Sequence[BaseMessage], tools: list[BaseTool] | None = None
+    ) -> AIMessage:
         """调用 LLM。
 
         Args:
@@ -296,9 +299,14 @@ def initial_state(group: Group, project_root: str, head_rev: str = "") -> MainSt
     return MainState(
         # 提示词文本在 guidance/templates.py 里整块书写；
         # 变量契约由 MAIN_PROMPT.input_variables 暴露，少传会直接报错
-        messages=tpl.MAIN_PROMPT.format_messages(
-            guidance=build_guidance(group),
-            diff_text=build_diff_text(group),
+        # format_messages 的返回类型标的是 list[BaseMessage]，实际总是具体消息
+        # 类型；MessagesState.messages 要的是 list[AnyMessage]，这里显式收窄
+        messages=cast(
+            "list[AnyMessage]",
+            tpl.MAIN_PROMPT.format_messages(
+                guidance=build_guidance(group),
+                diff_text=build_diff_text(group),
+            ),
         ),
         tool_context=ctx,
         round_count=0,

@@ -6,6 +6,7 @@
 """
 
 import logging
+from collections.abc import Sequence
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
@@ -73,7 +74,7 @@ class LLMClient:
 
     def invoke(
         self,
-        messages: list[BaseMessage],
+        messages: Sequence[BaseMessage],
         tools: list[BaseTool] | None = None,
     ) -> AIMessage:
         """调用 LLM。

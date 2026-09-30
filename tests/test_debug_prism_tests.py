@@ -29,6 +29,7 @@ LLM 用**脚本化的假实现**（不打真实 API）：可复现、秒级完�
 import logging
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -73,7 +74,9 @@ class ScriptedLLM:
         self._responses = list(responses)
         self.calls: list[list[BaseMessage]] = []
 
-    def invoke(self, messages: list[BaseMessage], tools: list[BaseTool] | None = None) -> AIMessage:
+    def invoke(
+        self, messages: Sequence[BaseMessage], tools: list[BaseTool] | None = None
+    ) -> AIMessage:
         """返回下一个脚本响应。
 
         Args:

@@ -1,11 +1,8 @@
 """Main 循环的状态定义。"""
 
 from dataclasses import dataclass, field
-from typing import Annotated
 
-from langchain_core.messages import BaseMessage
-from langgraph.graph.message import add_messages
-from typing_extensions import TypedDict
+from langgraph.graph import MessagesState
 
 from prism.core.tools.context import ToolContext
 from prism.models.grouping import Group
@@ -28,11 +25,13 @@ EXIT_MAX_ROUNDS = "max_rounds"
 EXIT_NO_PROGRESS = "no_progress"
 
 
-class MainState(TypedDict):
+class MainState(MessagesState):
     """Main 循环的状态。
 
+    继承 LangGraph 的 MessagesState，由它提供
+    `messages: Annotated[list[AnyMessage], add_messages]` 与 reducer 接线。
+
     Attributes:
-        messages: 消息历史（LangGraph 自动追加）
         tool_context: 工具执行上下文（含 hunk 状态、评论）
         round_count: 当前轮次
         max_rounds: 最大轮次
@@ -41,7 +40,6 @@ class MainState(TypedDict):
         no_report_rounds: 连续无产出的轮次数
     """
 
-    messages: Annotated[list[BaseMessage], add_messages]
     tool_context: ToolContext
     round_count: int
     max_rounds: int

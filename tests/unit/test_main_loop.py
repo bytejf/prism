@@ -3,6 +3,7 @@
 用脚本化的 fake LLM，不真实调用 DeepSeek。
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -46,7 +47,9 @@ class ScriptedLLM:
         self.calls: list[list[BaseMessage]] = []
         self.tools_seen: list[list[BaseTool]] = []
 
-    def invoke(self, messages: list[BaseMessage], tools: list[BaseTool] | None = None) -> AIMessage:
+    def invoke(
+        self, messages: Sequence[BaseMessage], tools: list[BaseTool] | None = None
+    ) -> AIMessage:
         """返回下一个脚本响应。
 
         Args:
