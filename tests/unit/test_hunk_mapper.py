@@ -231,11 +231,12 @@ def test_map_hunks_doc_comment_falls_to_following_declaration(
     assert [lines[ln - 1] for ln in added] == ["// Helper 只做打印。"]
 
 
-def test_map_hunks_orphan_comment_has_no_symbol(go_repo: Path, git: Callable[..., None]) -> None:
-    """测试与声明隔了空行的独立注释归属为空。
+def test_map_hunks_drops_orphan_comment_hunk(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试无归属的 hunk 被丢弃。
 
-    注释块与下一个声明之间有空行 → 按 Go 约定不是文档注释，落不到任何声明上，
-    应保持「<顶层>」而不是被挂到前后相邻的函数上。
+    注释块与下一个声明之间有空行 → 按 Go 约定不是文档注释，落不到任何声明上。
+    这类改动（独立注释、纯空行）没有可审的实体，送进 LLM 只是噪音，所以直接
+    丢掉、不进结果 —— 而不是带着「<顶层>」传给下游。
     """
     git(go_repo, "checkout", "-q", "-b", "orphan", "main")
     (go_repo / "svc.go").write_text(MODIFIED_ORPHAN_GO, encoding="utf-8")
@@ -245,15 +246,7 @@ def test_map_hunks_orphan_comment_has_no_symbol(go_repo: Path, git: Callable[...
     diffs = filter_files(load_diffs(go_repo, "main", "orphan")).reviewable
     mapped = map_hunks_to_symbols(go_repo, "main", "orphan", diffs)
 
-    assert len(mapped) == 1
-    item = mapped[0]
-    assert item.symbols == []
-    assert format_symbols(item.symbols) == TOP_LEVEL_LABEL
-
-    # 新增的是「注释 + 空行」两行，空行把注释与 func Helper 隔开
-    added, _ = changed_lines(item.hunk)
-    lines = MODIFIED_ORPHAN_GO.splitlines()
-    assert [lines[ln - 1] for ln in added] == ["// 与 Helper 无关的独立说明。", ""]
+    assert mapped == []
 
 
 def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[..., None]) -> None:
@@ -324,8 +317,8 @@ def test_map_hunks_empty_diffs(go_repo: Path) -> None:
     assert map_hunks_to_symbols(go_repo, "main", "feature", []) == []
 
 
-def test_map_hunks_missing_file_has_no_symbol(go_repo: Path, git: Callable[..., None]) -> None:
-    """测试 diff 里的文件在目标版本中不存在时不抛异常。"""
+def test_map_hunks_missing_file_is_dropped(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试 diff 里的文件在目标版本中不存在时，其 hunk 无归属被丢弃、不抛异常。"""
     diffs = load_diffs(go_repo, "main", "feature")
     fake = Diff(
         old_path="ghost.go",
@@ -338,8 +331,10 @@ def test_map_hunks_missing_file_has_no_symbol(go_repo: Path, git: Callable[..., 
         is_binary=False,
     )
     mapped = map_hunks_to_symbols(go_repo, "main", "feature", [*diffs, fake])
-    ghost = next(item for item in mapped if item.file_path == "ghost.go")
-    assert ghost.symbols == []
+
+    # 该文件取不到源码 → 符号表为空 → hunk 无归属 → 被丢弃
+    assert mapped
+    assert all(item.file_path != "ghost.go" for item in mapped)
 
 
 # ---------- 按实体边界拆分 hunk ----------

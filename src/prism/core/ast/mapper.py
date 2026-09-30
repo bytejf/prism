@@ -61,9 +61,9 @@ def map_hunks_to_symbols(
 ) -> list[HunkWithSymbol]:
     """把每个 hunk 归属到包含其改动行的符号。
 
-    先按实体边界把 hunk 拆开（`split_by_symbol`），再逐个子 hunk 归属 ——
-    这样每个结果要么属于唯一一个符号，要么不属于任何符号（真·顶层改动），
-    不会出现「一个 hunk 挂着一串符号」这种含糊状态。
+    先按实体边界把 hunk 拆开（`split_by_symbol`），再逐个子 hunk 归属，
+    最后丢掉没有符号的那些 —— 所以**返回的每个 hunk 都恰好归属一个符号**，
+    不会出现「一个 hunk 挂着一串符号」或「无归属」这两种含糊状态。
     有新增行时用新文件侧（新文件源码 + 新增行号），纯删除时用旧文件侧
     （merge-base 源码 + 删除行号）—— 与文档「删除用旧文件的 AST」一致。
     编号按文件路径排序、拆分后全局连续分配，保证同一输入产生同一编号。
@@ -75,7 +75,8 @@ def map_hunks_to_symbols(
         diffs: 待映射的 diff 列表
 
     Returns:
-        HunkWithSymbol 列表，按文件路径、文件内 hunk 顺序排列
+        HunkWithSymbol 列表，按文件路径、文件内 hunk 顺序排列；
+        每个元素的 symbols 恰好一个
 
     Raises:
         ValueError: 仓库无法打开，或版本无法解析
@@ -100,9 +101,16 @@ def map_hunks_to_symbols(
                     )
                 )
 
-    unmatched = sum(1 for item in results if not item.symbols)
-    logger.info("映射完成：%d 个 hunk，其中 %d 个未归属到符号", len(results), unmatched)
-    return results
+    # 丢掉没有符号的 hunk：改动只涉及 license 头这类「与声明隔了空行的独立注释」，
+    # 或只涉及空行 —— 没有可审的实体，送进 LLM 只是噪音。
+    # 实测 8 个 OCR 分支 333 个 hunk 里 0 次命中，属于防御性过滤；命中时打日志，
+    # 避免静默丢改动。
+    kept = [item for item in results if item.symbols]
+    dropped = len(results) - len(kept)
+    if dropped:
+        logger.info("丢弃 %d 个无归属 hunk（改动只涉及独立注释或空行）", dropped)
+    logger.info("映射完成：%d 个 hunk（原始 %d 个）", len(kept), len(results))
+    return kept
 
 
 def _split_hunk(
