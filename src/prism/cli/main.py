@@ -71,7 +71,7 @@ from pathlib import Path, PurePosixPath
 
 import typer
 
-from prism.core.ast.mapper import format_location, format_symbols, map_hunks_to_symbols
+from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.graph.main_loop import run_main_loop
@@ -239,7 +239,7 @@ def hunk_map(
         typer.echo("没有可映射的 hunk")
         return
 
-    blocks = [f"{format_location(item)}\n  归属：{format_symbols(item.symbols)}" for item in mapped]
+    blocks = [f"{format_location(item)}\n  归属：{format_symbol(item.symbol)}" for item in mapped]
     typer.echo("\n\n".join(blocks))
 
 

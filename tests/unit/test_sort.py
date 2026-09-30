@@ -8,11 +8,14 @@ from prism.core.output.sort import (
     sort_comments,
     to_comments,
 )
-from prism.models.ast import HunkWithSymbol
+from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.comment import Comment
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
+
+# 排序只关心文件与行号，符号内容无关紧要
+DUMMY_SYMBOL = Symbol(name="X", kind="function", start_line=1, end_line=1)
 
 
 def make_comment(
@@ -55,9 +58,9 @@ def make_group(hunk_paths: dict[str, str]) -> Group:
     """
     hunks = [
         HunkWithSymbol(
-            hunk=Hunk(old_start=1, old_lines=1, new_start=1, new_lines=1, content=""),
+            part=Hunk(old_start=1, old_lines=1, new_start=1, new_lines=1, content=""),
             file_path=path,
-            symbols=[],
+            symbol=DUMMY_SYMBOL,
             hunk_id=hunk_id,
         )
         for hunk_id, path in hunk_paths.items()

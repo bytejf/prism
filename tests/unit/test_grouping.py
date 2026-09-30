@@ -9,7 +9,7 @@ from prism.core.ast.mapper import map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import ROOT_PACKAGE, group_by_package, package_path
-from prism.models.ast import HunkWithSymbol
+from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 
 
@@ -28,7 +28,7 @@ def make_hunk_with_symbol(
         HunkWithSymbol 对象
     """
     return HunkWithSymbol(
-        hunk=Hunk(
+        part=Hunk(
             old_start=old_start,
             old_lines=1,
             new_start=new_start,
@@ -36,7 +36,7 @@ def make_hunk_with_symbol(
             content="",
         ),
         file_path=file_path,
-        symbols=[],
+        symbol=Symbol(name="Run", kind="function", start_line=1, end_line=9),
         hunk_id=hunk_id,
     )
 
@@ -92,7 +92,7 @@ def test_hunks_sorted_by_file_then_line() -> None:
     ]
     groups = group_by_package(hunks)
     assert len(groups) == 1
-    assert [(h.file_path, h.hunk.new_start) for h in groups[0].hunks] == [
+    assert [(h.file_path, h.part.new_start) for h in groups[0].hunks] == [
         ("pkg/a.go", 10),
         ("pkg/a.go", 90),
         ("pkg/b.go", 50),
@@ -177,7 +177,7 @@ def test_pre_review_pipeline_groups_by_package(two_package_repo: Path) -> None:
 
     alpha = next(g for g in groups if g.package_path == "internal/alpha")
     assert alpha.files == ["internal/alpha/a.go"]
-    assert [s.name for s in alpha.hunks[0].symbols] == ["Run"]
+    assert alpha.hunks[0].symbol.name == "Run"
 
     root = next(g for g in groups if g.package_path == ".")
     assert root.files == ["main.go"]

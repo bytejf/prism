@@ -35,7 +35,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import BaseTool
 
-from prism.core.ast.mapper import format_location, format_symbols, map_hunks_to_symbols
+from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.graph.main_loop import initial_state, run_main_loop
@@ -108,9 +108,9 @@ def report_all(group: Group) -> AIMessage:
                     "severity": "medium",
                     "category": "debug-sample",
                     "content": (
-                        f"[调试样例] {format_location(item)} 归属：{format_symbols(item.symbols)}"
+                        f"[调试样例] {format_location(item)} 归属：{format_symbol(item.symbol)}"
                     ),
-                    "existing_code": item.hunk.content.splitlines()[-1][:60],
+                    "existing_code": item.part.content.splitlines()[-1][:60],
                 }
             ],
         }
@@ -189,11 +189,11 @@ def test_debug_full_pipeline() -> None:
         print(f"    skip {skipped.path} ({skipped.reason})")
 
     # ── 阶段 3：hunk → 符号（-U0 改动行 ∩ tree-sitter 符号）──────────
-    # 断在这里逐个看 mapped[i].symbols —— 归属对不对就在这
+    # 断在这里逐个看 mapped[i].symbol —— 归属对不对就在这
     mapped = map_hunks_to_symbols(PRISM_TESTS, BASE_BRANCH, HEAD_BRANCH, filtered.reviewable)
     print(f"\n[3] 归属: {len(mapped)} 个 hunk")
     for hunk in mapped:
-        print(f"    {format_location(hunk)}  →  {format_symbols(hunk.symbols)}")
+        print(f"    {format_location(hunk)}  →  {format_symbol(hunk.symbol)}")
 
     # ── 阶段 4：按包分组 ─────────────────────────────────────────────
     # 断在这里看 groups —— prism-tests 按包分了 main / edge / multi 三组

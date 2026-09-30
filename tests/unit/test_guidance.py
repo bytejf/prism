@@ -9,7 +9,7 @@ from prism.models.grouping import Group
 
 
 def make_hunk_with_symbol(
-    hunk_id: str, file_path: str, new_start: int, new_lines: int, symbols: list[Symbol]
+    hunk_id: str, file_path: str, new_start: int, new_lines: int, symbol: Symbol
 ) -> HunkWithSymbol:
     """构造测试用 HunkWithSymbol。
 
@@ -18,13 +18,13 @@ def make_hunk_with_symbol(
         file_path: 文件路径
         new_start: 新文件起始行
         new_lines: 新文件行数
-        symbols: 归属符号
+        symbol: 归属符号
 
     Returns:
         HunkWithSymbol 对象
     """
     return HunkWithSymbol(
-        hunk=Hunk(
+        part=Hunk(
             old_start=new_start,
             old_lines=new_lines,
             new_start=new_start,
@@ -32,7 +32,7 @@ def make_hunk_with_symbol(
             content="",
         ),
         file_path=file_path,
-        symbols=symbols,
+        symbol=symbol,
         hunk_id=hunk_id,
     )
 
@@ -54,16 +54,22 @@ def group() -> Group:
                 "internal/agent/agent.go",
                 245,
                 16,
-                [Symbol(name="(*Agent).Run", kind="method", start_line=240, end_line=270)],
+                Symbol(name="(*Agent).Run", kind="method", start_line=240, end_line=270),
             ),
             make_hunk_with_symbol(
                 "H-02",
                 "internal/agent/agent.go",
                 310,
                 11,
-                [Symbol(name="ResolveComment", kind="function", start_line=300, end_line=330)],
+                Symbol(name="ResolveComment", kind="function", start_line=300, end_line=330),
             ),
-            make_hunk_with_symbol("H-03", "internal/diff/resolver.go", 100, 41, []),
+            make_hunk_with_symbol(
+                "H-03",
+                "internal/diff/resolver.go",
+                100,
+                41,
+                Symbol(name="Helper", kind="function", start_line=90, end_line=140),
+            ),
         ],
     )
 
@@ -88,7 +94,7 @@ def test_build_guidance_scope_lists_every_hunk(group: Group) -> None:
     assert "H-02 internal/agent/agent.go:310-320" in guidance
     assert "归属：ResolveComment（函数）" in guidance
     assert "H-03 internal/diff/resolver.go:100-140" in guidance
-    assert "归属：<顶层>" in guidance
+    assert "归属：Helper（函数）" in guidance
 
 
 def test_build_guidance_single_hunk_span(group: Group) -> None:
@@ -97,7 +103,7 @@ def test_build_guidance_single_hunk_span(group: Group) -> None:
         group_id="group-002",
         package_path="pkg",
         files=["pkg/a.go"],
-        hunks=[make_hunk_with_symbol("H-07", "pkg/a.go", 22, 1, [])],
+        hunks=[make_hunk_with_symbol("H-07", "pkg/a.go", 22, 1, Symbol("F", "function", 20, 30))],
     )
     assert "本组 hunk：H-07（共 1 个）" in build_guidance(single)
 

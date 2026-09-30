@@ -36,9 +36,6 @@ logger = logging.getLogger(__name__)
 HUNK_ID_PREFIX = "H-"
 HUNK_ID_WIDTH = 2
 
-# 无法归属到任何符号时的展示文本
-TOP_LEVEL_LABEL = "<顶层>"
-
 # 符号类型的中文展示
 KIND_LABELS: dict[str, str] = {
     KIND_PACKAGE: "包声明",
@@ -76,7 +73,7 @@ def map_hunks_to_symbols(
 
     Returns:
         HunkWithSymbol 列表，按文件路径、文件内 hunk 顺序排列；
-        每个元素的 symbols 恰好一个
+        每个元素的 symbol 恰好一个
 
     Raises:
         ValueError: 仓库无法打开，或版本无法解析
@@ -87,30 +84,33 @@ def map_hunks_to_symbols(
     cache: dict[tuple[str, bool], list[Symbol]] = {}
     results: list[HunkWithSymbol] = []
     counter = 0
+    dropped = 0
 
     for diff in sorted(diffs, key=lambda item: item.path):
         for hunk in diff.hunks:
-            for piece in _split_hunk(hunk, cache, repo, diff_base, head_commit, diff.path):
+            for part in _split_hunk(hunk, cache, repo, diff_base, head_commit, diff.path):
+                symbol = _symbol_of(cache, repo, diff_base, head_commit, diff.path, part)
+                # 没有符号的切片丢弃：改动只涉及 license 头这类「与声明隔了空行的
+                # 独立注释」或只涉及空行 —— 没有可审的实体，送进 LLM 只是噪音。
+                # 实测 8 个 OCR 分支 333 个 hunk 里 0 次命中，属于防御性过滤；
+                # 命中时打日志，避免静默丢改动。
+                if symbol is None:
+                    dropped += 1
+                    continue
                 counter += 1
                 results.append(
                     HunkWithSymbol(
-                        hunk=piece,
+                        part=part,
                         file_path=diff.path,
-                        symbols=_attribute(cache, repo, diff_base, head_commit, diff.path, piece),
+                        symbol=symbol,
                         hunk_id=f"{HUNK_ID_PREFIX}{counter:0{HUNK_ID_WIDTH}d}",
                     )
                 )
 
-    # 丢掉没有符号的 hunk：改动只涉及 license 头这类「与声明隔了空行的独立注释」，
-    # 或只涉及空行 —— 没有可审的实体，送进 LLM 只是噪音。
-    # 实测 8 个 OCR 分支 333 个 hunk 里 0 次命中，属于防御性过滤；命中时打日志，
-    # 避免静默丢改动。
-    kept = [item for item in results if item.symbols]
-    dropped = len(results) - len(kept)
     if dropped:
         logger.info("丢弃 %d 个无归属 hunk（改动只涉及独立注释或空行）", dropped)
-    logger.info("映射完成：%d 个 hunk（原始 %d 个）", len(kept), len(results))
-    return kept
+    logger.info("映射完成：%d 个 hunk（原始 %d 个）", len(results), len(results) + dropped)
+    return results
 
 
 def _split_hunk(
@@ -187,25 +187,21 @@ def format_location(item: HunkWithSymbol) -> str:
     Returns:
         ``H-01 internal/agent/agent.go:245-260`` 形式；单行 hunk 只显示一个行号
     """
-    start, end = display_range(item.hunk)
+    start, end = display_range(item.part)
     span = str(start) if start == end else f"{start}-{end}"
     return f"{item.hunk_id} {item.file_path}:{span}"
 
 
-def format_symbols(symbols: list[Symbol]) -> str:
-    """渲染 hunk 的归属符号文本。
+def format_symbol(symbol: Symbol) -> str:
+    """渲染 hunk 切片的归属符号文本。
 
     Args:
-        symbols: 归属的符号列表
+        symbol: 归属的符号
 
     Returns:
-        ``(*Agent).Run（方法）`` 形式；多个符号用 ``, `` 连接；无符号时为 ``<顶层>``
+        ``(*Agent).Run（方法）`` 形式
     """
-    if not symbols:
-        return TOP_LEVEL_LABEL
-    return ", ".join(
-        f"{symbol.name}（{KIND_LABELS.get(symbol.kind, symbol.kind)}）" for symbol in symbols
-    )
+    return f"{symbol.name}（{KIND_LABELS.get(symbol.kind, symbol.kind)}）"
 
 
 def split_by_symbol(hunk: Hunk, new_symbols: list[Symbol], old_symbols: list[Symbol]) -> list[Hunk]:
@@ -310,17 +306,20 @@ def _owner_at(symbols: list[Symbol], line_no: int) -> Symbol | None:
     return None
 
 
-def _attribute(
+def _symbol_of(
     cache: dict[tuple[str, bool], list[Symbol]],
     repo: pygit2.Repository,
     base_commit: pygit2.Commit,
     head_commit: pygit2.Commit,
     path: str,
-    hunk: Hunk,
-) -> list[Symbol]:
-    """把单个 hunk 归属到符号。
+    part: Hunk,
+) -> Symbol | None:
+    """取 hunk 切片归属的符号。
 
-    有新增行 → 新文件侧；纯删除 → 旧文件侧；两侧都没有改动行 → 空。
+    有新增行 → 查新文件侧；纯删除 → 查旧文件侧；两侧都没有改动行 → 无归属。
+    同一片内所有改动行（同一侧）必然落在同一个实体里（见 split_by_symbol），
+    所以取**第一个有归属的**改动行即可 —— 不能只看第一个改动行：切片开头
+    可能先是空隙行（空行、独立注释），后面才是有归属的改动。
     文档注释已经并进实体的行号范围（见 extractor._attach_comment_blocks），
     所以注释行直接就能命中，不需要额外落位。
 
@@ -330,17 +329,25 @@ def _attribute(
         base_commit: merge-base 侧的 commit
         head_commit: head 侧的 commit
         path: 文件路径
-        hunk: 待归属的 hunk
+        part: 待归属的 hunk 切片
 
     Returns:
-        命中的符号列表
+        归属的符号；切片无改动行或落不到实体上时返回 None
     """
-    added, removed = changed_lines(hunk)
+    added, removed = changed_lines(part)
     if added:
-        return _containing(_file_symbols(cache, repo, head_commit, path, side=False), added)
-    if removed:
-        return _containing(_file_symbols(cache, repo, base_commit, path, side=True), removed)
-    return []
+        symbols = _file_symbols(cache, repo, head_commit, path, side=False)
+        changed = added
+    elif removed:
+        symbols = _file_symbols(cache, repo, base_commit, path, side=True)
+        changed = removed
+    else:
+        return None
+
+    for line_no in changed:
+        if (symbol := _owner_at(symbols, line_no)) is not None:
+            return symbol
+    return None
 
 
 def _file_symbols(
@@ -371,16 +378,3 @@ def _file_symbols(
         else:
             cache[key] = extract_symbols(source)
     return cache[key]
-
-
-def _containing(symbols: list[Symbol], lines: list[int]) -> list[Symbol]:
-    """取出包含任一给定行的符号。
-
-    Args:
-        symbols: 候选符号
-        lines: 改动行号列表
-
-    Returns:
-        命中的符号列表，保持入参顺序
-    """
-    return [s for s in symbols if any(s.start_line <= line <= s.end_line for line in lines)]

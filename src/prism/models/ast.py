@@ -24,16 +24,19 @@ class Symbol:
 
 @dataclass
 class HunkWithSymbol:
-    """带归属符号的 hunk。
+    """带归属符号的 hunk 切片 —— 审查的最小单位。
 
     Attributes:
-        hunk: 原始 hunk
+        part: 原始 hunk 的一片。git 的 hunk 可能横跨多个实体，
+            `mapper.split_by_symbol` 按实体边界切开后才是这里的一片；
+            字段与 Hunk 完全一致，只是行号范围更窄
         file_path: 文件路径
-        symbols: 归属的符号（可能多个，无法归属时为空）
-        hunk_id: hunk 编号（如 "H-01"），全局连续分配
+        symbol: 归属的符号。恒为一个 —— 拆分保证同一片只落在一个实体里，
+            无归属的片（改动只涉及独立注释或空行）在映射阶段就被丢弃了
+        hunk_id: hunk 编号（如 "H-01"），拆分后全局连续分配
     """
 
-    hunk: Hunk
+    part: Hunk
     file_path: str
-    symbols: list[Symbol]
+    symbol: Symbol
     hunk_id: str

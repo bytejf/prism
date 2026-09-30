@@ -6,7 +6,7 @@ V1 不注入调用图、静态分析发现与规则；这四段全部是静态�
 
 import logging
 
-from prism.core.ast.mapper import format_location, format_symbols
+from prism.core.ast.mapper import format_location, format_symbol
 from prism.models.grouping import Group
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ def _render_scope(group: Group) -> str:
     for item in group.hunks:
         lines.append("")
         lines.append(format_location(item))
-        lines.append(f"  归属：{format_symbols(item.symbols)}")
+        lines.append(f"  归属：{format_symbol(item.symbol)}")
     return "\n".join(lines)
 
 
@@ -154,7 +154,7 @@ def build_diff_text(group: Group) -> str:
         parts.append(f"--- {path} ---")
         for item in hunks:
             parts.append(f"@@ {format_location(item)} @@")
-            parts.append(item.hunk.content)
+            parts.append(item.part.content)
     return "\n".join(parts)
 
 

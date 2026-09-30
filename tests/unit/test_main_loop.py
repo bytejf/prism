@@ -147,9 +147,9 @@ def make_group(hunk_ids: list[str], group_id: str = "group-001") -> Group:
     """
     hunks = [
         HunkWithSymbol(
-            hunk=Hunk(old_start=1, old_lines=1, new_start=1, new_lines=1, content="@@ -1 +1 @@"),
+            part=Hunk(old_start=1, old_lines=1, new_start=1, new_lines=1, content="@@ -1 +1 @@"),
             file_path="a.go",
-            symbols=[Symbol(name="Run", kind="function", start_line=1, end_line=9)],
+            symbol=Symbol(name="Run", kind="function", start_line=1, end_line=9),
             hunk_id=hunk_id,
         )
         for hunk_id in hunk_ids

@@ -6,11 +6,10 @@ from pathlib import Path
 import pytest
 
 from prism.core.ast.mapper import (
-    TOP_LEVEL_LABEL,
     changed_lines,
     display_range,
     format_location,
-    format_symbols,
+    format_symbol,
     map_hunks_to_symbols,
     split_by_symbol,
 )
@@ -44,18 +43,21 @@ def make_hunk(
     )
 
 
-def make_item(hunk: Hunk, symbols: list[Symbol], hunk_id: str = "H-01") -> HunkWithSymbol:
+DUMMY = Symbol(name="X", kind="function", start_line=1, end_line=1)
+
+
+def make_item(hunk: Hunk, symbol: Symbol = DUMMY, hunk_id: str = "H-01") -> HunkWithSymbol:
     """构造测试用 HunkWithSymbol。
 
     Args:
-        hunk: hunk
-        symbols: 归属符号
+        hunk: hunk 切片
+        symbol: 归属符号
         hunk_id: hunk 编号
 
     Returns:
         HunkWithSymbol 对象
     """
-    return HunkWithSymbol(hunk=hunk, file_path="a.go", symbols=symbols, hunk_id=hunk_id)
+    return HunkWithSymbol(part=hunk, file_path="a.go", symbol=symbol, hunk_id=hunk_id)
 
 
 def test_display_range_prefers_new_side() -> None:
@@ -94,22 +96,14 @@ def test_changed_lines_pure_deletion_has_no_added() -> None:
 
 def test_format_location_multi_line_and_single_line() -> None:
     """测试位置渲染：多行显示区间，单行只显示一个行号。"""
-    assert format_location(make_item(make_hunk(1, 3, 245, 16), [])) == "H-01 a.go:245-260"
-    assert format_location(make_item(make_hunk(1, 1, 22, 1), [])) == "H-01 a.go:22"
+    assert format_location(make_item(make_hunk(1, 3, 245, 16))) == "H-01 a.go:245-260"
+    assert format_location(make_item(make_hunk(1, 1, 22, 1))) == "H-01 a.go:22"
 
 
-def test_format_symbols_empty_is_top_level() -> None:
-    """测试无归属符号时显示 <顶层>。"""
-    assert format_symbols([]) == TOP_LEVEL_LABEL
-
-
-def test_format_symbols_with_kind_labels() -> None:
+def test_format_symbol_with_kind_label() -> None:
     """测试归属符号带中文类型标签。"""
-    symbols = [
-        Symbol(name="(*Agent).Run", kind="method", start_line=1, end_line=9),
-        Symbol(name="Resolve", kind="function", start_line=11, end_line=20),
-    ]
-    assert format_symbols(symbols) == "(*Agent).Run（方法）, Resolve（函数）"
+    symbol = Symbol(name="(*Agent).Run", kind="method", start_line=1, end_line=9)
+    assert format_symbol(symbol) == "(*Agent).Run（方法）"
 
 
 # --- 真实仓库集成测试 ---
@@ -197,9 +191,9 @@ def test_map_hunks_attributes_to_the_changed_function(
     item = mapped[0]
     assert item.hunk_id == "H-01"
     assert item.file_path == "svc.go"
-    assert [s.name for s in item.symbols] == ["Run"]
+    assert item.symbol.name == "Run"
 
-    added, _ = changed_lines(item.hunk)
+    added, _ = changed_lines(item.part)
     assert len(added) == 1
     lines = MODIFIED_GO.splitlines()
     assert lines[added[0] - 1].strip() == 'fmt.Println("extra")'
@@ -224,9 +218,9 @@ def test_map_hunks_doc_comment_falls_to_following_declaration(
 
     assert len(mapped) == 1
     item = mapped[0]
-    assert [s.name for s in item.symbols] == ["Helper"]
+    assert item.symbol.name == "Helper"
 
-    added, _ = changed_lines(item.hunk)
+    added, _ = changed_lines(item.part)
     lines = MODIFIED_DOC_GO.splitlines()
     assert [lines[ln - 1] for ln in added] == ["// Helper 只做打印。"]
 
@@ -264,9 +258,9 @@ def test_map_hunks_ids_are_globally_sequential(go_repo: Path, git: Callable[...,
     # （package + 空行、A），所以 3 个编号而不是 2 个
     assert [item.hunk_id for item in mapped] == ["H-01", "H-02", "H-03"]
     assert [item.file_path for item in mapped] == ["a.go", "a.go", "svc.go"]
-    assert [s.name for s in mapped[0].symbols] == ["package"]
-    assert [s.name for s in mapped[1].symbols] == ["A"]
-    assert [s.name for s in mapped[2].symbols] == ["Run"]
+    assert mapped[0].symbol.name == "package"
+    assert mapped[1].symbol.name == "A"
+    assert mapped[2].symbol.name == "Run"
 
 
 def test_map_hunks_top_level_change_attributes_to_const_block(
@@ -293,8 +287,8 @@ def test_map_hunks_top_level_change_attributes_to_const_block(
     mapped = map_hunks_to_symbols(go_repo, "consts", "bump", diffs)
 
     assert len(mapped) == 1
-    assert [s.name for s in mapped[0].symbols] == ["const"]
-    assert format_symbols(mapped[0].symbols) == "const（const 块）"
+    assert mapped[0].symbol.name == "const"
+    assert format_symbol(mapped[0].symbol) == "const（const 块）"
 
 
 def test_map_hunks_deleted_file_uses_old_source(go_repo: Path, git: Callable[..., None]) -> None:
@@ -307,8 +301,8 @@ def test_map_hunks_deleted_file_uses_old_source(go_repo: Path, git: Callable[...
     mapped = map_hunks_to_symbols(go_repo, "feature", "del", diffs)
 
     assert mapped
-    assert all(item.symbols for item in mapped)
-    names = {s.name for item in mapped for s in item.symbols}
+    assert mapped
+    names = {item.symbol.name for item in mapped}
     assert {"Run", "Helper"} <= names
 
 
@@ -434,9 +428,35 @@ def test_split_result_has_at_most_one_symbol(go_repo: Path, git: Callable[..., N
     mapped = map_hunks_to_symbols(go_repo, "main", "multi", diffs)
 
     assert mapped
-    assert all(len(item.symbols) <= 1 for item in mapped)
+    assert mapped
     # 新增文件被拆成多个子 hunk，整体仍覆盖全部行
-    names = [item.symbols[0].name for item in mapped if item.symbols]
+    names = [item.symbol.name for item in mapped]
     assert "package" in names
     assert "A" in names
     assert "B" in names
+
+
+def test_map_hunks_new_function_after_blank_line_is_kept(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """回归用例：切片首个改动行是空行时，整个切片不能被误丢。
+
+    新增「空行 + 文档注释 + 函数」时，切片第一个改动行是空行（无归属），
+    但它后面紧跟新函数。归属判定若只看第一个改动行，整个新函数会被判成
+    「无归属」而被丢弃 —— 改动的实体凭空消失，且不报错。
+    必须取第一个**有归属**的改动行。
+    """
+    git(go_repo, "checkout", "-q", "-b", "addfn", "main")
+    (go_repo / "svc.go").write_text(
+        BASELINE_GO + "\n// Extra 是新增的函数。\nfunc Extra() {}\n", encoding="utf-8"
+    )
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "addfn")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "addfn")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "addfn", diffs)
+
+    assert [item.symbol.name for item in mapped] == ["Extra"]
+    added, _ = changed_lines(mapped[0].part)
+    # 空行 + 文档注释 + 函数声明三行都在，没被丢
+    assert len(added) == 3
