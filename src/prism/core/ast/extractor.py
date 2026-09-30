@@ -22,6 +22,7 @@ FUNCTION_NODE = "function_declaration"
 METHOD_NODE = "method_declaration"
 PACKAGE_NODE = "package_clause"
 IMPORT_NODE = "import_declaration"
+COMMENT_NODE = "comment"
 CONST_NODE = "const_declaration"
 VAR_NODE = "var_declaration"
 # 类型声明：定义用 type_spec，别名用 type_alias，两者都有 name / type 字段
@@ -56,14 +57,13 @@ _parser = Parser(Language(tree_sitter_go.language()))
 
 
 def extract_symbols(source: str) -> list[Symbol]:
-    """从 Go 源码中提取可归属的符号。
+    """从 Go 源码中提取可归属的符号（带文档注释）。
 
     提取函数 / 方法与顶层声明（package / import / const / var 块、type 声明）。
     不进入函数体，因此闭包（func literal）不会被误当作符号。
 
-    顶层节点里唯一不提取的是 ``comment`` —— 注释在语法树里是独立节点，
-    不挂在它「描述」的声明下面，提成符号也只能得到「comment（注释）」这种
-    无用归属。它的补偿在 mapper 里做（见 `mapper._landing_line`）。
+    注释在语法树里是独立节点，不挂在它描述的声明下面，所以这里按 Go 的
+    文档注释约定把它们并进紧邻实体的行号范围（见 `_attach_comment_blocks`）。
 
     Args:
         source: Go 源码文本
@@ -72,9 +72,10 @@ def extract_symbols(source: str) -> list[Symbol]:
         Symbol 列表，按源码出现顺序排列；无符号时返回空列表
     """
     tree = _parser.parse(source.encode("utf-8", errors="replace"))
+    root = tree.root_node
 
     symbols: list[Symbol] = []
-    stack: list[Node] = [tree.root_node]
+    stack: list[Node] = [root]
     while stack:
         node = stack.pop()
         if node.type == FUNCTION_NODE:
@@ -90,7 +91,78 @@ def extract_symbols(source: str) -> list[Symbol]:
 
     # 用显式栈遍历，顺序不保证，按起始行排序还原源码顺序
     symbols.sort(key=lambda symbol: symbol.start_line)
-    return symbols
+    return _attach_comment_blocks(symbols, _top_level_comment_blocks(root))
+
+
+def _top_level_comment_blocks(root: Node) -> list[tuple[int, int]]:
+    """把顶层的连续注释行合成注释块。
+
+    tree-sitter 不会合并相邻注释：`//` 连续 3 行是 3 个独立节点，
+    而块注释 `/* ... */` 跨行本身就是 1 个节点。Go 的 ast.CommentGroup
+    定义是「相邻且无空行的注释序列」（不限 `//` 还是 `/* */`），
+    所以这里按行号相邻来合并：前一节点 end_line + 1 == 后一节点 start_line。
+
+    只取顶层（source_file 的直接子节点）且**独占一行**的注释：
+    - 实体内部的注释本来就在实体的行号范围内，不需要并
+    - 行尾注释（start_column > 0，如 `const X = 1 // 说明`）与所在声明
+      同行号，也已经在范围内；若不排除，它会与上方的文档注释块行号相邻
+      而被错误合并，把整个块的末行推到声明之后，rule 1 就永远算不中
+
+    Args:
+        root: source_file 节点
+
+    Returns:
+        [(起始行, 结束行)]，按出现顺序
+    """
+    blocks: list[list[int]] = []
+    for node in root.named_children:
+        if node.type != COMMENT_NODE or node.start_point.column != 0:
+            continue
+        start, end = node.start_point.row + 1, node.end_point.row + 1
+        if blocks and blocks[-1][1] + 1 == start:
+            blocks[-1][1] = end
+        else:
+            blocks.append([start, end])
+    return [(start, end) for start, end in blocks]
+
+
+def _attach_comment_blocks(symbols: list[Symbol], blocks: list[tuple[int, int]]) -> list[Symbol]:
+    """把注释块并进紧邻实体的行号范围。
+
+    规则（按优先级）：
+    1. 注释块**末行 + 1** == 某实体**首行** → 并进该实体（它是文档注释）
+    2. 否则注释块**首行 - 1** == 某实体**末行** → 并进该实体（它是后置说明）
+    3. 都不满足 → 保持独立（如 license 头，它与下面的声明之间隔了空行）
+
+    只改行号范围，name / kind 不变。
+
+    Args:
+        symbols: 已提取的实体，按起始行排序
+        blocks: 注释块列表
+
+    Returns:
+        行号范围可能被扩展的符号列表
+    """
+    starts = {symbol.start_line: index for index, symbol in enumerate(symbols)}
+    ends = {symbol.end_line: index for index, symbol in enumerate(symbols)}
+    new_starts = [symbol.start_line for symbol in symbols]
+    new_ends = [symbol.end_line for symbol in symbols]
+
+    for block_start, block_end in blocks:
+        if (index := starts.get(block_end + 1)) is not None:
+            new_starts[index] = block_start
+        elif (index := ends.get(block_start - 1)) is not None:
+            new_ends[index] = block_end
+
+    return [
+        Symbol(
+            name=symbol.name,
+            kind=symbol.kind,
+            start_line=new_starts[index],
+            end_line=new_ends[index],
+        )
+        for index, symbol in enumerate(symbols)
+    ]
 
 
 def _to_symbol(node: Node, kind: str) -> Symbol:
