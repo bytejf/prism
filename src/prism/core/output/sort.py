@@ -8,8 +8,8 @@
 
 import logging
 
+from prism.core.agent.state import MainLoopResult
 from prism.core.diff.parser import UNKNOWN_PATH
-from prism.core.graph.state import MainLoopResult
 from prism.models.comment import Comment
 from prism.models.grouping import Group
 

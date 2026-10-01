@@ -29,19 +29,23 @@ LLM 用**脚本化的假实现**（不打真实 API）：可复现、秒级完�
 import logging
 import os
 import sys
-from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, override
 
 import pytest
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.tools import BaseTool
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field
 
+from prism.core.agent.agent import initial_state, run_review_agent
+from prism.core.agent.state import ReviewState, max_rounds_for, pending_ids
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
-from prism.core.graph.main_loop import initial_state, run_main_loop
-from prism.core.graph.state import MainState
 from prism.core.grouping.packages import group_by_package
+from prism.core.guidance import templates as tpl
 from prism.core.output.renderer import TerminalRenderer
 from prism.core.output.sort import sort_comments, to_comments
 from prism.models.comment import ReviewStats
@@ -58,36 +62,64 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-class ScriptedLLM:
-    """按脚本返回预设响应的假 LLM。
+class ScriptedChatModel(BaseChatModel):
+    """按脚本返回预设响应的假 ChatModel。
 
-    结构与 LLMClient 一致（只要求有 invoke），因此断点可以顺着
-    main_loop.call_llm → 这里 一路走下去，只是不发网络请求。
+    必须是 `BaseChatModel`：循环由 `create_agent` 驱动，
+    框架调用的是 `model.bind_tools(...).invoke(...)`。
+    断点可以顺着框架的模型节点 → 这里 一路走下去，只是不发网络请求。
     """
 
-    def __init__(self, responses: list[AIMessage]) -> None:
-        """记录响应脚本。
+    responses: list[AIMessage]
+    calls: list[list[BaseMessage]] = Field(default_factory=list)
+
+    @property
+    @override
+    def _llm_type(self) -> str:
+        """模型类型标识。
+
+        Returns:
+            固定字符串
+        """
+        return "scripted-debug"
+
+    @override
+    def bind_tools(
+        self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any
+    ) -> "ScriptedChatModel":
+        """假模型不需要真的绑定工具。
 
         Args:
-            responses: 依次返回的响应
-        """
-        self._responses = list(responses)
-        self.calls: list[list[BaseMessage]] = []
+            tools: 工具列表（忽略）
+            tool_choice: 选择策略（忽略）
+            **kwargs: 其余参数（忽略）
 
-    def invoke(
-        self, messages: Sequence[BaseMessage], tools: list[BaseTool] | None = None
-    ) -> AIMessage:
+        Returns:
+            self
+        """
+        return self
+
+    @override
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
         """返回下一个脚本响应。
 
         Args:
             messages: 本轮收到的完整消息历史（含指导文本、工具结果、agent_status）
-            tools: 本轮暴露给 LLM 的工具
+            stop: 停止词（忽略）
+            run_manager: 回调管理器（忽略）
+            **kwargs: 其余参数（忽略）
 
         Returns:
-            下一个预设响应
+            ChatResult
         """
         self.calls.append(list(messages))
-        return self._responses.pop(0)
+        return ChatResult(generations=[ChatGeneration(message=self.responses.pop(0))])
 
 
 def report_all(group: Group) -> AIMessage:
@@ -139,12 +171,17 @@ def end_done() -> AIMessage:
     )
 
 
-def dump_state(state: MainState) -> None:
-    """打印组装好的第一条消息（system + user），便于核对送进 LLM 的内容。
+def dump_state(state: ReviewState) -> None:
+    """打印送进 LLM 的首轮内容，便于核对。
+
+    system 段现在由 `create_agent(system_prompt=...)` 提供，不在 state 里，
+    这里直接从模板取出来一起打。
 
     Args:
         state: initial_state 的产物
     """
+    print(f"\n{'=' * 30} system {'=' * 30}")
+    print(tpl.SYSTEM[:1500])
     for message in state["messages"]:
         print(f"\n{'=' * 30} {message.type} {'=' * 30}")
         print(str(message.content)[:1500])
@@ -210,18 +247,18 @@ def test_debug_full_pipeline() -> None:
     # dump_state 里能看到完整的送审内容：审查范围 / 审查要求 / 报告节奏 / 结束审查
     # 想调其他组就改这个下标
     first_group = groups[0]
-    state = initial_state(first_group, str(PRISM_TESTS), HEAD_BRANCH)
-    ctx = state["tool_context"]
+    state = initial_state(first_group, max_rounds_for(len(first_group.hunks)))
     print(
-        f"\n[5] 状态组装: {len(state['messages'])} 条初始消息，{len(ctx.hunk_status)} 个待审 hunk"
+        f"\n[5] 状态组装: {len(state['messages'])} 条初始消息，"
+        f"{len(state['hunk_status'])} 个待审 hunk"
     )
     dump_state(state)
-    assert state["tool_context"].pending_ids() == [h.hunk_id for h in first_group.hunks]
+    assert pending_ids(state["hunk_status"]) == [h.hunk_id for h in first_group.hunks]
 
     # ── 阶段 6：Main 循环（工具真实执行，只有 LLM 是假的）────────────
-    # 断在这里可以 step into：call_llm → execute_tools → 各工具实现 → check_exit
-    llm = ScriptedLLM([report_all(first_group), end_done()])
-    result = run_main_loop(first_group, llm, str(PRISM_TESTS), HEAD_BRANCH)
+    # 断在这里可以 step into：框架的模型节点 → middleware → 各工具实现
+    llm = ScriptedChatModel(responses=[report_all(first_group), end_done()])
+    result = run_review_agent(first_group, llm, str(PRISM_TESTS), HEAD_BRANCH)
     print(f"\n[6] 循环结束: exit_reason={result.exit_reason} 轮次={result.round_count}")
     print(f"    评论 {len(result.comments)} 条，未审 {result.pending_hunk_ids}")
     print(f"    第二轮 LLM 收到的消息数: {len(llm.calls[1])}（含工具结果与 agent_status）")

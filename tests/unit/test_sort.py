@@ -1,7 +1,7 @@
 """评论整理与排序的单元测试。"""
 
+from prism.core.agent.state import MainLoopResult
 from prism.core.diff.parser import UNKNOWN_PATH
-from prism.core.graph.state import MainLoopResult
 from prism.core.output.sort import (
     UNKNOWN_SEVERITY_RANK,
     build_hunk_index,

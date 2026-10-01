@@ -10,7 +10,8 @@ import subprocess
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
-from prism.core.graph.state import MainState
+from prism.core.agent.context import ReviewContext
+from prism.core.agent.state import ReviewState
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ RC_NO_MATCH = 1
 @tool
 def code_search(
     pattern: str,
-    runtime: ToolRuntime[None, MainState],
+    runtime: ToolRuntime[ReviewContext, ReviewState],
     file_pattern: str = "*.go",
     max_results: int = 50,
 ) -> str:
@@ -42,9 +43,9 @@ def code_search(
         匹配行列表（含文件路径、行号、内容）；无匹配或出错时返回说明文本
 
     Notes:
-        ToolContext.head_rev 已设置时搜索该版本，否则搜索工作区。
+        ReviewContext.head_rev 已设置时搜索该版本，否则搜索工作区。
     """
-    ctx = runtime.state["tool_context"]
+    ctx = runtime.context
     limit = max(1, min(max_results, MAX_RESULTS))
     logger.debug(
         "code_search 调用：pattern=%s file_pattern=%s max_results=%d",
@@ -55,7 +56,7 @@ def code_search(
 
     if not ctx.project_root:
         logger.warning("code_search 缺少 project_root")
-        return "错误：ToolContext.project_root 未设置"
+        return "错误：ReviewContext.project_root 未设置"
 
     # -c core.quotepath=false：含中文等非 ASCII 的路径按原样输出，
     #   否则 git 会转义成 "a-\346\234\200.md"，LLM 拿到后无法回传给 file_read

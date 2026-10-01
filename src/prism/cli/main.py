@@ -72,11 +72,11 @@ from pathlib import Path, PurePosixPath
 
 import typer
 
+from prism.core.agent.agent import run_review_agent
+from prism.core.agent.state import MainLoopResult
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
-from prism.core.graph.main_loop import run_main_loop
-from prism.core.graph.state import MainLoopResult
 from prism.core.grouping.packages import group_by_package
 from prism.core.llm.client import LLMClient
 from prism.core.output.renderer import TerminalRenderer
@@ -325,7 +325,7 @@ def _run_groups(
             f"Processing Group {index}: {item.package_path} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
-        result = run_main_loop(item, llm, str(project_root), head_rev)
+        result = run_review_agent(item, llm.model, str(project_root), head_rev)
         results.append(result)
         typer.echo(
             f"  {result.group_id} completed: {_plural(len(result.comments), 'comment')} "

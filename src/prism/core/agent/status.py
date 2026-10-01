@@ -4,11 +4,10 @@
 避免重复报告已完成的 hunk 或漏审。
 """
 
-from prism.core.tools.context import (
+from prism.core.agent.state import (
     STATUS_DONE,
     STATUS_IN_PROGRESS,
     HunkStatus,
-    ToolContext,
 )
 from prism.models.tool import CommentInput
 
@@ -20,19 +19,19 @@ STATUS_TAG_CLOSE = "</agent_status>"
 STATUS_FOOTER = "请确保所有 hunk 最终都标记为 complete。"
 
 
-def build_agent_status(ctx: ToolContext) -> str:
+def build_agent_status(hunk_status: dict[str, HunkStatus]) -> str:
     """渲染 hunk 审查进度快照。
 
     V1 只有 pending / done 两种状态流转，in_progress 分组固定为空，
     但保留该分组以对齐文档约定的输出格式。
 
     Args:
-        ctx: 工具执行上下文
+        hunk_status: hunk 状态表
 
     Returns:
         `<agent_status>...</agent_status>` 文本
     """
-    ordered = _sorted(ctx)
+    ordered = _sorted(hunk_status)
     done = [item for item in ordered if item.status == STATUS_DONE]
     in_progress = [item for item in ordered if item.status == STATUS_IN_PROGRESS]
     finished = (STATUS_DONE, STATUS_IN_PROGRESS)
@@ -40,7 +39,7 @@ def build_agent_status(ctx: ToolContext) -> str:
 
     lines = [
         STATUS_TAG_OPEN,
-        f"### Hunk 审查进度（{len(done)}/{len(ctx.hunk_status)} 完成）",
+        f"### Hunk 审查进度（{len(done)}/{len(hunk_status)} 完成）",
         "",
         f"✅ 完成审查（{len(done)}）：",
     ]
@@ -57,16 +56,16 @@ def build_agent_status(ctx: ToolContext) -> str:
     return "\n".join(lines)
 
 
-def _sorted(ctx: ToolContext) -> list[HunkStatus]:
+def _sorted(hunk_status: dict[str, HunkStatus]) -> list[HunkStatus]:
     """按编号排序取出 hunk 状态。
 
     Args:
-        ctx: 工具执行上下文
+        hunk_status: hunk 状态表
 
     Returns:
         HunkStatus 列表，按 hunk_id 升序
     """
-    return [ctx.hunk_status[hunk_id] for hunk_id in sorted(ctx.hunk_status)]
+    return [hunk_status[hunk_id] for hunk_id in sorted(hunk_status)]
 
 
 def _describe(comments: list[CommentInput]) -> str:

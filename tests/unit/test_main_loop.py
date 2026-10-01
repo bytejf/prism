@@ -1,73 +1,112 @@
-"""Main 循环的单元测试。
+"""审查循环的单元测试。
 
-用脚本化的 fake LLM，不真实调用 DeepSeek。
+用脚本化的 fake ChatModel，不真实调用 DeepSeek。
+
+注意：假模型必须是 **`BaseChatModel`** —— 循环现在由 `create_agent` 驱动，
+框架会调用 `model.bind_tools(...).invoke(...)`，旧的自定义 ChatInvoker
+Protocol 已经接不上了。
 """
 
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, override
 
 import pytest
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
+from pydantic import Field
 
-from prism.core.graph.main_loop import (
-    build_tools,
-    initial_state,
-    route_after_check,
-    route_after_llm,
-    run_main_loop,
-    update_no_report_rounds,
-)
-from prism.core.graph.state import (
+from prism.core.agent.agent import build_tools, initial_state, run_review_agent
+from prism.core.agent.middleware import should_exit, update_no_report_rounds
+from prism.core.agent.state import (
     EXIT_END_DONE,
     EXIT_END_DONE_WITH_GAPS,
     EXIT_MAX_ROUNDS,
     EXIT_NO_PROGRESS,
-    MainState,
+    STATUS_DONE,
+    STATUS_PENDING,
+    HunkStatus,
+    ReviewState,
     max_rounds_for,
+    pending_ids,
 )
-from prism.core.graph.status import build_agent_status
-from prism.core.tools.context import STATUS_DONE, HunkStatus, ToolContext
+from prism.core.agent.status import build_agent_status
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
+from prism.models.tool import CommentInput
 
 
-class ScriptedLLM:
-    """按脚本依次返回响应的假 LLM。"""
+class ScriptedChatModel(BaseChatModel):
+    """按脚本依次返回响应的假 ChatModel。
 
-    def __init__(self, responses: list[AIMessage]) -> None:
-        """记录响应脚本。
+    同时记录每次模型调用收到的消息与工具，供断言使用。
+    """
+
+    responses: list[AIMessage]
+    calls: list[list[BaseMessage]] = Field(default_factory=list)
+    tools_seen: list[list[BaseTool]] = Field(default_factory=list)
+
+    @property
+    @override
+    def _llm_type(self) -> str:
+        """模型类型标识。
+
+        Returns:
+            固定字符串
+        """
+        return "scripted"
+
+    @override
+    def bind_tools(
+        self,
+        tools: Any,
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> "ScriptedChatModel":
+        """记录被绑定的工具，原样返回自己。
 
         Args:
-            responses: 依次返回的响应
-        """
-        self._responses = list(responses)
-        self.calls: list[list[BaseMessage]] = []
-        self.tools_seen: list[list[BaseTool]] = []
+            tools: 工具列表
+            tool_choice: 选择策略（忽略）
+            **kwargs: 其余参数（忽略）
 
-    def invoke(
-        self, messages: Sequence[BaseMessage], tools: list[BaseTool] | None = None
-    ) -> AIMessage:
+        Returns:
+            self
+        """
+        self.tools_seen.append(list(tools))
+        return self
+
+    @override
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
         """返回下一个脚本响应。
 
         Args:
             messages: 收到的消息
-            tools: 收到的工具
+            stop: 停止词（忽略）
+            run_manager: 回调管理器（忽略）
+            **kwargs: 其余参数（忽略）
 
         Returns:
-            下一个预设响应
+            ChatResult
 
         Raises:
-            AssertionError: 脚本已用尽
+            AssertionError: 脚本已用尽（顺带防住死循环）
         """
         self.calls.append(list(messages))
-        self.tools_seen.append(list(tools or []))
-        if not self._responses:
-            msg = "ScriptedLLM 的响应脚本已用尽"
+        if not self.responses:
+            msg = "ScriptedChatModel 的响应脚本已用尽"
             raise AssertionError(msg)
-        return self._responses.pop(0)
+        return ChatResult(generations=[ChatGeneration(message=self.responses.pop(0))])
 
 
 def ai_text(content: str = "（无工具调用）") -> AIMessage:
@@ -196,46 +235,63 @@ def test_update_no_report_rounds_increments_on_exploration() -> None:
     assert update_no_report_rounds(4, []) == 5
 
 
-def routing_state(**fields: Any) -> MainState:
-    """构造只含路由所需字段的最小状态。
-
-    路由函数只读 messages 与 exit_reason，这里用 cast 表达「测试只关心这两个键」。
+def state_with(**fields: Any) -> ReviewState:
+    """构造只含判定所需字段的最小状态。
 
     Args:
         fields: 需要设置的字段
 
     Returns:
-        MainState（字段不完整）
+        ReviewState（字段不完整）
     """
-    return cast(MainState, fields)
+    return cast(ReviewState, fields)
 
 
-def test_route_after_llm() -> None:
-    """测试按是否有 tool_calls 路由。"""
-    assert route_after_llm(routing_state(messages=[ai_call("file_read", {})])) == "execute_tools"
-    assert route_after_llm(routing_state(messages=[ai_text()])) == "inject_reminder"
+def test_should_exit_false_by_default() -> None:
+    """测试默认不退出。"""
+    state = state_with(
+        hunk_status={"H-01": HunkStatus("H-01", STATUS_PENDING)},
+        end_done_count=0,
+        no_report_rounds=0,
+    )
+    assert should_exit(state) is False
 
 
-def test_route_after_check() -> None:
-    """测试按 exit_reason 路由。"""
-    assert route_after_check(routing_state(exit_reason=None)) == "call_llm"
-    assert route_after_check(routing_state(exit_reason=EXIT_END_DONE)) == "end"
+def test_should_exit_on_accepted_end_done() -> None:
+    """测试 end_done 被接受（含带缺口）时退出。"""
+    done = {"H-01": HunkStatus("H-01", STATUS_DONE)}
+    assert should_exit(state_with(hunk_status=done, end_done_count=1, no_report_rounds=0)) is True
+
+    pending = {"H-01": HunkStatus("H-01", STATUS_PENDING)}
+    once = state_with(hunk_status=pending, end_done_count=1, no_report_rounds=0)
+    twice = state_with(hunk_status=pending, end_done_count=2, no_report_rounds=0)
+    assert should_exit(once) is False
+    assert should_exit(twice) is True
 
 
-def test_initial_state_builds_messages_and_round_budget(project_root: str) -> None:
-    """测试初始状态：system + user 两条消息、hunk 全部 pending、轮次上限。"""
-    state = initial_state(make_group(["H-01", "H-02"]), project_root)
+def test_should_exit_on_no_progress() -> None:
+    """测试连续无产出到阈值时退出。"""
+    state = state_with(hunk_status={}, end_done_count=0, no_report_rounds=8)
+    assert should_exit(state) is True
 
-    assert len(state["messages"]) == 2
-    assert state["messages"][0].type == "system"
-    assert state["messages"][1].type == "human"
+
+def test_initial_state_builds_user_message_and_round_budget(project_root: str) -> None:
+    """测试初始状态：一条 user 消息、hunk 全部 pending、轮次上限。
+
+    system 段不在这里 —— 它交给 `create_agent(system_prompt=...)`。
+    """
+    max_rounds = max_rounds_for(2)
+    state = initial_state(make_group(["H-01", "H-02"]), max_rounds)
+
+    assert len(state["messages"]) == 1
+    assert state["messages"][0].type == "human"
     assert state["round_count"] == 0
     assert state["max_rounds"] == 30
     assert state["no_report_rounds"] == 0
-    assert state["exit_reason"] is None
-    assert state["tool_context"].pending_ids() == ["H-01", "H-02"]
+    assert state["end_done_count"] == 0
+    assert pending_ids(state["hunk_status"]) == ["H-01", "H-02"]
 
-    user_text = str(state["messages"][1].content)
+    user_text = str(state["messages"][0].content)
     assert "审查范围" in user_text
     assert "### 本组 diff" in user_text
 
@@ -251,13 +307,13 @@ def test_build_tools_exposes_four_tools() -> None:
 
 def test_build_agent_status_reports_progress() -> None:
     """测试进度快照的内容与格式。"""
-    ctx = ToolContext()
-    ctx.init_hunks(["H-01", "H-02", "H-03"])
-    ctx.hunk_status["H-01"].status = STATUS_DONE
-    ctx.hunk_status["H-01"].comments = []
-    ctx.hunk_status["H-02"].status = STATUS_DONE
+    hunk_status = {
+        "H-01": HunkStatus("H-01", STATUS_DONE),
+        "H-02": HunkStatus("H-02", STATUS_DONE),
+        "H-03": HunkStatus("H-03", STATUS_PENDING),
+    }
 
-    status = build_agent_status(ctx)
+    status = build_agent_status(hunk_status)
     assert "<agent_status>" in status
     assert "### Hunk 审查进度（2/3 完成）" in status
     assert "H-01 — 无问题" in status
@@ -267,20 +323,17 @@ def test_build_agent_status_reports_progress() -> None:
 
 def test_build_agent_status_counts_severity() -> None:
     """测试有问题的 hunk 按 severity 汇总。"""
-    ctx = ToolContext()
-    ctx.init_hunks(["H-01"])
-    ctx.hunk_status["H-01"] = HunkStatus(
-        hunk_id="H-01",
-        status=STATUS_DONE,
-        comments=[],
-    )
-    from prism.models.tool import CommentInput
-
-    ctx.hunk_status["H-01"].comments = [
-        CommentInput(severity="high", category="c", content="x", existing_code="y"),
-        CommentInput(severity="medium", category="c", content="x", existing_code="y"),
-    ]
-    status = build_agent_status(ctx)
+    hunk_status = {
+        "H-01": HunkStatus(
+            "H-01",
+            STATUS_DONE,
+            comments=[
+                CommentInput(severity="high", category="c", content="x", existing_code="y"),
+                CommentInput(severity="medium", category="c", content="x", existing_code="y"),
+            ],
+        )
+    }
+    status = build_agent_status(hunk_status)
     assert "H-01 — 2 issues（high:1, medium:1）" in status
 
 
@@ -289,8 +342,8 @@ def test_build_agent_status_counts_severity() -> None:
 
 def test_main_loop_exits_on_end_done(project_root: str) -> None:
     """测试 end_done 正常退出。"""
-    llm = ScriptedLLM([report_call(["H-01"]), done_call()])
-    result = run_main_loop(make_group(["H-01"]), llm, project_root)
+    llm = ScriptedChatModel(responses=[report_call(["H-01"]), done_call()])
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
 
     assert result.exit_reason == EXIT_END_DONE
     assert result.round_count == 2
@@ -299,8 +352,8 @@ def test_main_loop_exits_on_end_done(project_root: str) -> None:
 
 def test_main_loop_passes_tools_to_llm(project_root: str) -> None:
     """测试每轮都把 4 个工具传给 LLM。"""
-    llm = ScriptedLLM([report_call(["H-01"]), done_call()])
-    run_main_loop(make_group(["H-01"]), llm, project_root)
+    llm = ScriptedChatModel(responses=[report_call(["H-01"]), done_call()])
+    run_review_agent(make_group(["H-01"]), llm, project_root)
 
     assert [len(tools) for tools in llm.tools_seen] == [4, 4]
 
@@ -310,29 +363,36 @@ def test_main_loop_exits_on_max_rounds(project_root: str) -> None:
 
     每轮都调 report_hunks 把 no_report_rounds 压回 0，
     保证触发的是 max_rounds 而不是 no_progress。
+    轮次上限现在由框架的 ModelCallLimitMiddleware 执行。
     """
     max_rounds = max_rounds_for(1)
-    llm = ScriptedLLM([report_call(["H-01"], complete=False) for _ in range(max_rounds)])
+    llm = ScriptedChatModel(
+        responses=[report_call(["H-01"], complete=False) for _ in range(max_rounds)]
+    )
 
-    result = run_main_loop(make_group(["H-01"]), llm, project_root)
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
     assert result.exit_reason == EXIT_MAX_ROUNDS
     assert result.round_count == max_rounds
 
 
 def test_main_loop_exits_on_no_progress(project_root: str) -> None:
     """测试连续无产出退出：一直只调 file_read。"""
-    llm = ScriptedLLM([read_call(call_id=f"call-{i}") for i in range(20)])
+    llm = ScriptedChatModel(responses=[read_call(call_id=f"call-{i}") for i in range(20)])
 
-    result = run_main_loop(make_group(["H-01"]), llm, project_root)
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
     assert result.exit_reason == EXIT_NO_PROGRESS
     assert result.round_count == 8
 
 
 def test_main_loop_exits_on_no_progress_for_plain_text(project_root: str) -> None:
-    """测试纯文本输出也算无产出。"""
-    llm = ScriptedLLM([ai_text() for _ in range(20)])
+    """测试纯文本输出也算无产出。
 
-    result = run_main_loop(make_group(["H-01"]), llm, project_root)
+    这条同时验证了 prism 与框架默认行为的冲突点：框架遇到「模型没调工具」
+    会直接结束循环，是 middleware 返回 jump_to="model" 把它拉回来的。
+    """
+    llm = ScriptedChatModel(responses=[ai_text() for _ in range(20)])
+
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
     assert result.exit_reason == EXIT_NO_PROGRESS
     assert result.round_count == 8
 
@@ -344,8 +404,8 @@ def test_no_report_rounds_reset_on_end_done_rejected(project_root: str) -> None:
     → end_done 接受并带缺口退出。
     若重置没生效，第 9 轮就会因计数超 8 而以 no_progress 退出。
     """
-    llm = ScriptedLLM(
-        [
+    llm = ScriptedChatModel(
+        responses=[
             read_call("call-1"),
             read_call("call-2"),
             read_call("call-3"),
@@ -358,7 +418,7 @@ def test_no_report_rounds_reset_on_end_done_rejected(project_root: str) -> None:
             done_call("call-10"),
         ]
     )
-    result = run_main_loop(make_group(["H-01"]), llm, project_root)
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
 
     assert result.exit_reason == EXIT_END_DONE_WITH_GAPS
     assert result.round_count == 10
@@ -386,8 +446,8 @@ def test_main_loop_collects_comments(project_root: str) -> None:
             ]
         },
     )
-    llm = ScriptedLLM([report, done_call()])
-    result = run_main_loop(make_group(["H-01"]), llm, project_root)
+    llm = ScriptedChatModel(responses=[report, done_call()])
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
 
     assert len(result.comments) == 1
     assert result.comments[0].severity == "high"
@@ -396,8 +456,8 @@ def test_main_loop_collects_comments(project_root: str) -> None:
 
 def test_main_loop_injects_agent_status_after_report(project_root: str) -> None:
     """测试 report_hunks 之后追加了进度快照消息。"""
-    llm = ScriptedLLM([report_call(["H-01"]), done_call()])
-    run_main_loop(make_group(["H-01"]), llm, project_root)
+    llm = ScriptedChatModel(responses=[report_call(["H-01"]), done_call()])
+    run_review_agent(make_group(["H-01"]), llm, project_root)
 
     # 第二轮调用 LLM 时，消息里应已含 agent_status
     second_round = llm.calls[1]
@@ -406,8 +466,8 @@ def test_main_loop_injects_agent_status_after_report(project_root: str) -> None:
 
 def test_main_loop_injects_reminder_on_plain_text(project_root: str) -> None:
     """测试纯文本轮次注入推进提醒。"""
-    llm = ScriptedLLM([ai_text(), report_call(["H-01"]), done_call()])
-    run_main_loop(make_group(["H-01"]), llm, project_root)
+    llm = ScriptedChatModel(responses=[ai_text(), report_call(["H-01"]), done_call()])
+    run_review_agent(make_group(["H-01"]), llm, project_root)
 
     assert any("agent_reminder" in str(m.content) for m in llm.calls[1])
 
@@ -415,21 +475,23 @@ def test_main_loop_injects_reminder_on_plain_text(project_root: str) -> None:
 def test_main_loop_unknown_tool_returns_error_text(project_root: str) -> None:
     """测试调用不存在的工具时回灌错误文本而非崩溃。
 
-    错误文本由 LangGraph 的 ToolNode 生成（`Error: xxx is not a valid tool`），
-    这里只断言「有错误文本回灌给模型」，不锁具体措辞。
+    错误文本由框架的 ToolNode 生成，这里只断言
+    「有错误文本回灌给模型」，不锁具体措辞。
     """
-    llm = ScriptedLLM([ai_call("no_such_tool", {}), report_call(["H-01"]), done_call()])
-    result = run_main_loop(make_group(["H-01"]), llm, project_root)
+    llm = ScriptedChatModel(
+        responses=[ai_call("no_such_tool", {}), report_call(["H-01"]), done_call()]
+    )
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
 
     assert result.exit_reason == EXIT_END_DONE
     feedback = [str(m.content) for m in llm.calls[1] if m.type == "tool"]
-    assert any("no_such_tool" in text and "Error" in text for text in feedback), feedback
+    assert any("no_such_tool" in text for text in feedback), feedback
 
 
 def test_main_loop_empty_group(project_root: str) -> None:
     """测试没有 hunk 的组：end_done 立即通过。"""
-    llm = ScriptedLLM([done_call()])
-    result = run_main_loop(make_group([]), llm, project_root)
+    llm = ScriptedChatModel(responses=[done_call()])
+    result = run_review_agent(make_group([]), llm, project_root)
 
     assert result.exit_reason == EXIT_END_DONE
     assert result.comments == []

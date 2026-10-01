@@ -1,7 +1,7 @@
 """工具相关的纯数据模型。
 
 只描述数据结构，不含行为、不含可变状态。
-运行时对象（HunkStatus / ToolContext）放在 core/tools/context.py。
+运行时对象（HunkStatus / ReviewState）放在 core/agent/state.py。
 """
 
 from dataclasses import dataclass

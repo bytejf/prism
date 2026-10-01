@@ -1,0 +1,185 @@
+"""审查 Agent 的组装与运行。
+
+整个 Main 循环交给 LangChain v1 的 `create_agent`：
+
+- **模型节点 / 工具节点 / 循环边** —— 框架内置，不再手写 StateGraph
+- **轮次上限** —— 框架的 `ModelCallLimitMiddleware`
+- **语义退出、进度快照、纯文本提醒** —— `middleware.py` 里的两个钩子
+- **静态上下文** —— `context_schema`，按次传入
+- **审查状态** —— `state_schema`，跟着 checkpoint 走
+
+对照旧实现：5 个手写节点 + 3 个路由函数，全部消失。
+"""
+
+import logging
+from typing import Any, cast
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import BaseTool
+
+from prism.core.agent.context import ReviewContext
+from prism.core.agent.middleware import review_pacing, review_progress
+from prism.core.agent.state import (
+    STATUS_PENDING,
+    HunkStatus,
+    MainLoopResult,
+    ReviewState,
+    exit_reason_of,
+    max_rounds_for,
+    pending_ids,
+)
+from prism.core.guidance import templates as tpl
+from prism.core.guidance.builder import build_diff_text, build_guidance
+from prism.core.tools.code_search import code_search
+from prism.core.tools.end_done import end_done
+from prism.core.tools.file_read import file_read
+from prism.core.tools.report_hunks import report_hunks
+from prism.models.grouping import Group
+
+logger = logging.getLogger(__name__)
+
+
+def build_tools() -> list[BaseTool]:
+    """构造 4 个审查工具。
+
+    工具通过 `ToolRuntime` 取静态上下文与状态（框架注入，模型看不到该参数），
+    因此不需要按运行时构造 —— 图构建时定一次即可。
+
+    Returns:
+        工具列表
+    """
+    return [file_read, code_search, report_hunks, end_done]
+
+
+def build_review_agent(model: BaseChatModel, max_rounds: int) -> Any:
+    """组装审查 Agent。
+
+    Args:
+        model: LangChain ChatModel
+        max_rounds: 单组最大模型调用次数（框架的 ModelCallLimitMiddleware 执行）
+
+    Returns:
+        编译好的 agent 图
+    """
+    return create_agent(
+        model=model,
+        tools=build_tools(),
+        system_prompt=tpl.SYSTEM,
+        # cast 是框架的签名缺口：create_agent 的 middleware 参数只填了
+        # AgentMiddleware 的两个类型参数，框架自带的 ModelCallLimitMiddleware
+        # 同样过不了这个检查
+        middleware=cast(
+            "list[AgentMiddleware[Any, Any, Any]]",
+            [
+                review_progress,
+                review_pacing,
+                # 轮次上限：框架自带，不用自己数
+                ModelCallLimitMiddleware(run_limit=max_rounds, exit_behavior="end"),
+            ],
+        ),
+        state_schema=ReviewState,
+        context_schema=ReviewContext,
+    )
+
+
+def initial_state(group: Group, max_rounds: int) -> ReviewState:
+    """构造审查循环的初始状态。
+
+    提示词文本在 `guidance/templates.py` 里整块书写：
+    system 段交给 `create_agent(system_prompt=...)`，
+    user 段（指导 + diff）作为首条用户消息。
+
+    Args:
+        group: 审查单元
+        max_rounds: 单组最大模型调用次数
+
+    Returns:
+        初始 ReviewState
+    """
+    user_text = tpl.USER.format(
+        guidance=build_guidance(group),
+        diff_text=build_diff_text(group),
+    )
+    return ReviewState(
+        messages=[HumanMessage(content=user_text)],
+        hunk_status={
+            item.hunk_id: HunkStatus(hunk_id=item.hunk_id, status=STATUS_PENDING)
+            for item in group.hunks
+        },
+        all_comments=[],
+        round_count=0,
+        max_rounds=max_rounds,
+        no_report_rounds=0,
+        end_done_count=0,
+        group=group,
+    )
+
+
+def run_review_agent(
+    group: Group, model: BaseChatModel, project_root: str, head_rev: str = ""
+) -> MainLoopResult:
+    """跑一个审查单元的循环。
+
+    Args:
+        group: 审查单元
+        model: LangChain ChatModel
+        project_root: 项目根目录
+        head_rev: 被审查的版本，工具据此读取源码而不是读工作区
+
+    Returns:
+        循环产出（退出原因、评论、未审 hunk 等）
+
+    Raises:
+        ValueError: 图结束时读不出退出原因
+    """
+    max_rounds = max_rounds_for(len(group.hunks))
+    logger.info(
+        "开始审查 %s（%s，%d 个文件，%d 个 hunk，上限 %d 轮）",
+        group.group_id,
+        group.package_path,
+        len(group.files),
+        len(group.hunks),
+        max_rounds,
+    )
+
+    agent = build_review_agent(model, max_rounds)
+    final: ReviewState = agent.invoke(
+        initial_state(group, max_rounds),
+        context=ReviewContext(project_root=project_root, head_rev=head_rev),
+                # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约
+        # 6.1 步（30 轮 = 182 步），旧手写图的 ×5 不够，取 ×7 留余量。
+        # 真正的终止保证是 ModelCallLimitMiddleware，这里只是防图跑飞。
+        config={"recursion_limit": max_rounds * 7 + 20},
+    )
+
+    exit_reason = exit_reason_of(final)
+    if exit_reason is None:
+        msg = "审查循环结束时读不出 exit_reason，退出判定有误"
+        raise ValueError(msg)
+
+    hunk_status = final["hunk_status"]
+    # 按 hunk 编号键控返回：CommentInput 不带 hunk_id，
+    # 输出阶段要靠这个键补文件路径
+    hunk_comments = {
+        hunk_id: list(status.comments) for hunk_id, status in sorted(hunk_status.items())
+    }
+    pending = pending_ids(hunk_status)
+    total_comments = sum(len(items) for items in hunk_comments.values())
+    logger.info(
+        "结束审查 %s：exit_reason=%s，轮次 %d，评论 %d 条，未审 %d 个",
+        group.group_id,
+        exit_reason,
+        final["round_count"],
+        total_comments,
+        len(pending),
+    )
+    return MainLoopResult(
+        group_id=group.group_id,
+        exit_reason=exit_reason,
+        round_count=final["round_count"],
+        hunk_comments=hunk_comments,
+        pending_hunk_ids=pending,
+    )
