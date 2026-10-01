@@ -19,6 +19,7 @@ from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddlewar
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
+from langgraph.graph.state import CompiledStateGraph
 
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.middleware import review_pacing, review_progress
@@ -54,7 +55,19 @@ def build_tools() -> list[BaseTool]:
     return [file_read, code_search, report_hunks, end_done]
 
 
-def build_review_agent(model: BaseChatModel, max_rounds: int) -> Any:
+# 交给 `create_agent` 的那个图和它的实际类型不一样，这里手写一份更精确的。
+#
+# `create_agent` 的四个 overload 都不把 `state_schema` / `context_schema`
+# 串进返回类型：传 `ReviewState` + `ReviewContext`，mypy 推出来仍然是
+# `CompiledStateGraph[AgentState[Any], Any, InputAgentState, OutputAgentState[Any]]`。
+# 照抄那个签名，`invoke` 的 `context=` 就会退化成 `Any`，传错也不报错。
+#
+# 四个类型参数是 `CompiledStateGraph[StateT, ContextT, InputT, OutputT]`，
+# 按我们的用法填：状态进、状态出，上下文是 ReviewContext。
+Agent = CompiledStateGraph[ReviewState, ReviewContext, ReviewState, ReviewState]
+
+
+def build_review_agent(model: BaseChatModel, max_rounds: int) -> Agent:
     """组装审查 Agent。
 
     Args:
@@ -64,25 +77,29 @@ def build_review_agent(model: BaseChatModel, max_rounds: int) -> Any:
     Returns:
         编译好的 agent 图
     """
-    return create_agent(
-        model=model,
-        tools=build_tools(),
-        system_prompt=tpl.SYSTEM,
-        # cast 是框架的签名缺口：AgentMiddleware 声明了三个类型参数，
-        # 而 create_agent 的 middleware 参数只填了两个（漏了 ResponseT），
-        # 框架自带的 ModelCallLimitMiddleware 同样过不了这个检查。
-        # 三个 Any 补齐后 mypy 与 IDE 都能接受。
-        middleware=cast(
-            list[AgentMiddleware[Any, Any, Any]],
-            [
-                review_progress,
-                review_pacing,
-                # 轮次上限：框架自带，不用自己数
-                ModelCallLimitMiddleware(run_limit=max_rounds, exit_behavior="end"),
-            ],
+    # 两处 cast，各是一处框架的签名缺口：
+    # 1. middleware：AgentMiddleware 声明了三个类型参数，而 create_agent 的
+    #    middleware 参数只填了两个（漏了 ResponseT），框架自带的
+    #    ModelCallLimitMiddleware 同样过不了这个检查。
+    # 2. 整体：框架推出来的返回类型不含上面 Agent 别名里的精确参数。
+    return cast(
+        Agent,
+        create_agent(
+            model=model,
+            tools=build_tools(),
+            system_prompt=tpl.SYSTEM,
+            middleware=cast(
+                list[AgentMiddleware[Any, Any, Any]],
+                [
+                    review_progress,
+                    review_pacing,
+                    # 轮次上限：框架自带，不用自己数
+                    ModelCallLimitMiddleware(run_limit=max_rounds, exit_behavior="end"),
+                ],
+            ),
+            state_schema=ReviewState,
+            context_schema=ReviewContext,
         ),
-        state_schema=ReviewState,
-        context_schema=ReviewContext,
     )
 
 
@@ -147,13 +164,19 @@ def run_review_agent(
     )
 
     agent = build_review_agent(model, max_rounds)
-    final: ReviewState = agent.invoke(
-        initial_state(group, max_rounds),
-        context=ReviewContext(project_root=project_root, head_rev=head_rev),
-        # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约
-        # 6.1 步（30 轮 = 182 步），旧手写图的 ×5 不够，取 ×7 留余量。
-        # 真正的终止保证是 ModelCallLimitMiddleware，这里只是防图跑飞。
-        config={"recursion_limit": max_rounds * 7 + 20},
+    # 出参 cast：不传 version 时框架走 `version="v1"` 那个 overload，
+    # 返回类型是 `dict[str, Any] | Any`，不认识 state_schema 里的自定义键。
+    # 不 cast，下面 `final["hunk_status"]` 就退化成 Any，这一层的检查等于没加。
+    final = cast(
+        ReviewState,
+        agent.invoke(
+            initial_state(group, max_rounds),
+            context=ReviewContext(project_root=project_root, head_rev=head_rev),
+            # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约
+            # 6.1 步（30 轮 = 182 步），旧手写图的 ×5 不够，取 ×7 留余量。
+            # 真正的终止保证是 ModelCallLimitMiddleware，这里只是防图跑飞。
+            config={"recursion_limit": max_rounds * 7 + 20},
+        ),
     )
 
     exit_reason = exit_reason_of(final)
