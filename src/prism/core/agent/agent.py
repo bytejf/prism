@@ -39,6 +39,7 @@ from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
 from prism.core.tools.report_hunks import report_hunks
 from prism.models.grouping import Group
+from prism.observability.llm_trace import trace_model_call
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,9 @@ def build_review_agent(model: BaseChatModel, max_rounds: int) -> Agent:
             middleware=cast(
                 list[AgentMiddleware[Any, Any, Any]],
                 [
+                    # 可观测性放最外层：它包住的是「真正发给模型的请求」，
+                    # 排在语义中间件后面才能看到它们改完之后的最终形态
+                    trace_model_call,
                     review_progress,
                     review_pacing,
                     # 轮次上限：框架自带，不用自己数
@@ -127,11 +131,11 @@ def initial_state(group: Group, max_rounds: int) -> ReviewState:
             item.hunk_id: HunkStatus(hunk_id=item.hunk_id, status=STATUS_PENDING)
             for item in group.hunks
         },
-        all_comments=[],
         round_count=0,
         max_rounds=max_rounds,
         no_report_rounds=0,
         end_done_count=0,
+        end_done_mark=0,
         group=group,
     )
 

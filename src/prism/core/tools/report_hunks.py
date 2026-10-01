@@ -83,8 +83,9 @@ def report_hunks(
     """
     state = runtime.state
     hunk_status = dict(state["hunk_status"])
-    all_comments = list(state["all_comments"])
-    end_done_count = state["end_done_count"]
+    # 只把**本次改动**的 hunk 写回去（增量）。并行调用时两份增量按 key 合并，
+    # 各改各的互不覆盖；写全量表会被后一份快照整个盖掉
+    changed: dict[str, HunkStatus] = {}
 
     logger.debug("report_hunks 调用：%d 个 hunk 报告", len(reports))
 
@@ -92,7 +93,6 @@ def report_hunks(
     unknown: list[str] = []
     already_done: list[str] = []
     new_comment_count = 0
-    newly_done = 0
 
     for raw in reports:
         hunk_id = raw.hunk_id.strip()
@@ -109,25 +109,18 @@ def report_hunks(
             continue
 
         comments = [_to_comment(item) for item in raw.comments]
-        all_comments.extend(comments)
         new_comment_count += len(comments)
 
         # complete=False 表示「报了部分结论但还没审完」，置为审查中
-        complete = raw.complete
-        if complete:
-            newly_done += 1
         # 整体替换成新对象，不做原地修改
-        hunk_status[hunk_id] = HunkStatus(
+        updated = HunkStatus(
             hunk_id=hunk_id,
-            status=STATUS_DONE if complete else STATUS_IN_PROGRESS,
+            status=STATUS_DONE if raw.complete else STATUS_IN_PROGRESS,
             comments=[*current.comments, *comments],
         )
+        hunk_status[hunk_id] = updated
+        changed[hunk_id] = updated
         recorded.append(hunk_id)
-
-    # 「纠正机会」绑到进展上，不是全局计数：本轮有新 hunk 审完就重置。
-    # 否则早先一次误调的 end_done 会把机会提前耗尽，后面真误判时没有第二次机会。
-    if newly_done:
-        end_done_count = 0
 
     done = done_count(hunk_status)
     total = len(hunk_status)
@@ -162,11 +155,13 @@ def report_hunks(
     parts.append(f"进度：{done}/{total} 完成")
     parts.append(f"剩余未审：{', '.join(pending) if pending else '无'}")
 
+    # 写回去的是**增量** `changed`，不是全量 `hunk_status` —— 并行调用要靠
+    # reducer 按 key 合并增量。另外 `end_done_count` 的重置挪到了
+    # `review_progress`（middleware 是单写者，工具节点可以并行）：两个工具
+    # 同时写同一个键会触发 LangGraph 的 InvalidUpdateError
     return Command(
         update={
-            "hunk_status": hunk_status,
-            "all_comments": all_comments,
-            "end_done_count": end_done_count,
+            "hunk_status": changed,
             "messages": [ToolMessage(content="\n".join(parts), tool_call_id=runtime.tool_call_id)],
         }
     )

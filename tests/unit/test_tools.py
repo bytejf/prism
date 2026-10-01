@@ -24,6 +24,7 @@ from prism.core.agent.state import (
     ReviewState,
     done_count,
     end_done_verdict,
+    merge_hunk_status,
     pending_ids,
 )
 from prism.core.tools.code_search import MAX_RESULTS, code_search
@@ -48,7 +49,7 @@ def make_state(*hunk_ids: str) -> ReviewState:
         hunk_status={
             hunk_id: HunkStatus(hunk_id=hunk_id, status=STATUS_PENDING) for hunk_id in hunk_ids
         },
-        all_comments=[],
+        end_done_mark=0,
         round_count=0,
         max_rounds=30,
         no_report_rounds=0,
@@ -141,7 +142,14 @@ class ToolUnderTest:
         assert isinstance(result, Command), f"期望 Command，实际 {type(result).__name__}"
         # Command.update 是可选的（框架类型如此），本文件的工具都会给出，空值兜底只是过类型
         updates = dict(result.update or {})
-        self._state.update(updates)  # type: ignore[typeddict-item]
+        # 工具写的是**增量**，图会用 reducer 按 key 合并（见 ReviewState 的
+        # merge_hunk_status）。这里照做，否则多次调用时后一次的增量会把
+        # 上一次的结果整个替换掉，测出来的行为与真实图不一致
+        for key, value in updates.items():
+            if key == "hunk_status":
+                self._state["hunk_status"] = merge_hunk_status(self._state["hunk_status"], value)
+            else:
+                self._state[key] = value  # type: ignore[literal-required]
         return updates
 
     @property
@@ -493,10 +501,11 @@ def test_report_hunks_records_comments_and_marks_done() -> None:
     assert "已记录" in tool_message_text(update)
     assert "剩余" in tool_message_text(update)
     assert hunk_status["H-01"].status == STATUS_DONE
-    assert hunk_status["H-02"].status == STATUS_PENDING
-    assert len(update["all_comments"]) == 1
-    assert update["all_comments"][0].content == "goroutine 缺少退出路径"
-    assert update["all_comments"][0].suggestion_code is None
+    assert "H-02" not in hunk_status, "增量里不该带没改动的 hunk"
+    h01_comments = hunk_status["H-01"].comments
+    assert len(h01_comments) == 1
+    assert h01_comments[0].content == "goroutine 缺少退出路径"
+    assert h01_comments[0].suggestion_code is None
     # 工具不再原地改状态：调用前的快照没被动过（工具只是**返回**了新对象）
     assert before["H-01"].status == STATUS_PENDING
     assert before["H-01"].comments == []
@@ -526,7 +535,7 @@ def test_report_hunks_ignores_unknown_hunk_id() -> None:
 
     update = tool.update({"reports": [{"hunk_id": "H-99", "complete": True, "comments": []}]})
     assert "未知 hunk 编号" in tool_message_text(update)
-    assert update["all_comments"] == []
+    assert update["hunk_status"] == {}, "未知编号不该写回任何增量"
 
 
 def test_report_hunks_marks_incomplete_hunk_in_progress() -> None:
@@ -568,9 +577,10 @@ def test_report_hunks_normalizes_optional_fields() -> None:
             ]
         }
     )
-    assert update["all_comments"][0].severity == "high"
-    assert update["all_comments"][0].category == "x"
-    assert update["all_comments"][0].suggestion_code is None
+    saved = update["hunk_status"]["H-01"].comments[0]
+    assert saved.severity == "high"
+    assert saved.category == "x"
+    assert saved.suggestion_code is None
 
 
 def test_report_hunks_rejects_invalid_severity() -> None:
@@ -648,21 +658,22 @@ def test_report_hunks_rejects_duplicate_report_of_done_hunk() -> None:
     first = tool.update(
         {"reports": [{"hunk_id": "H-01", "complete": True, "comments": one_comment}]}
     )
-    assert len(first["all_comments"]) == 1
+    assert len(first["hunk_status"]["H-01"].comments) == 1
 
     # 第二次、第三次报同一个 hunk —— 应被忽略
     repeat = tool.update(
         {"reports": [{"hunk_id": "H-01", "complete": True, "comments": one_comment}]}
     )
 
-    assert len(repeat["all_comments"]) == 1, "重复报告把评论成倍放大了"
-    assert len(repeat["hunk_status"]["H-01"].comments) == 1
+    # 重复报告不写回增量 —— 这一条同时证明了评论没有成倍放大
+    assert repeat["hunk_status"] == {}, "重复报告写回了增量，评论会被放大"
+    assert len(state["hunk_status"]["H-01"].comments) == 1
     text = tool_message_text(repeat)
     assert "已审查完毕" in text
     assert "本次报告已忽略" in text
     assert "未记录任何 hunk" in text
-    # 拒绝报告不应影响进度
-    assert done_count(repeat["hunk_status"]) == 1
+    # 拒绝报告不应影响进度（增量是空的，看合并后的状态）
+    assert done_count(state["hunk_status"]) == 1
 
 
 def test_report_hunks_duplicate_and_new_in_one_call() -> None:
@@ -682,7 +693,9 @@ def test_report_hunks_duplicate_and_new_in_one_call() -> None:
     text = tool_message_text(update)
     assert "已记录 1 个 hunk：H-02" in text
     assert "已审查完毕" in text
-    assert done_count(update["hunk_status"]) == 2
+    # 增量只含 H-02，进度要看合并后的状态
+    assert set(update["hunk_status"]) == {"H-02"}
+    assert done_count(state["hunk_status"]) == 2
 
 
 def test_report_hunks_incomplete_hunk_accepts_repeat() -> None:
@@ -698,42 +711,6 @@ def test_report_hunks_incomplete_hunk_accepts_repeat() -> None:
 
     assert "已审查完毕" not in tool_message_text(update)
     assert len(update["hunk_status"]["H-01"].comments) == 2
-
-
-def test_report_hunks_resets_end_done_count_on_progress() -> None:
-    """测试有新 hunk 审完时重置 end_done_count（纠正机会绑到进展上）。
-
-    回归用例：计数从不重置时，早先一次误调的 end_done 会把纠正机会提前
-    耗尽，后面真误判时直接被接受并带缺口退出。
-    """
-    state = make_state("H-01", "H-02")
-    state["end_done_count"] = 1  # 模拟之前误调过一次 end_done 被拒
-    tool = ToolUnderTest(report_hunks, ReviewContext(), state)
-
-    update = tool.update({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
-    assert update["end_done_count"] == 0, "有审查产出却没有重置纠正机会"
-
-    # 只报评论、没有 hunk 变成 done 时不算进展，不重置
-    state2 = make_state("H-02")
-    state2["end_done_count"] = 1
-    tool2 = ToolUnderTest(report_hunks, ReviewContext(), state2)
-    update2 = tool2.update({"reports": [{"hunk_id": "H-02", "complete": False, "comments": []}]})
-    assert update2["end_done_count"] == 1, "没有实际进展却重置了纠正机会"
-
-
-def test_report_hunks_duplicate_does_not_reset_end_done_count() -> None:
-    """测试被忽略的重复报告不算进展，不重置 end_done_count。
-
-    否则 LLM 可以「调 end_done 被拒 → 重复报一个已完成的 hunk → 再来一次」
-    无限绕开兜底退出。
-    """
-    state = make_state("H-01", "H-02")
-    tool = ToolUnderTest(report_hunks, ReviewContext(), state)
-    tool.update({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
-
-    state["end_done_count"] = 1
-    update = tool.update({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
-    assert update["end_done_count"] == 1
 
 
 # ---------- end_done ----------

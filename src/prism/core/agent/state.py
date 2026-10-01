@@ -7,6 +7,7 @@
 """
 
 from dataclasses import dataclass, field
+from typing import Annotated
 
 from langchain.agents.middleware import AgentState
 
@@ -53,6 +54,28 @@ class HunkStatus:
     comments: list[CommentInput] = field(default_factory=list)
 
 
+def merge_hunk_status(
+    left: dict[str, HunkStatus], right: dict[str, HunkStatus]
+) -> dict[str, HunkStatus]:
+    """合并 hunk 状态表 —— 并行工具调用的写入 reducer。
+
+    必须在 `ReviewState` **之前**定义：reducer 是在类体求值时就被引用的，
+    放到后面会 NameError。
+
+    前提是工具写回的是**增量**（只含本次改动的 hunk，见 `report_hunks`）：
+    并行调用各改各的 hunk，按 key 合并即可。写全量表不行 —— 两份全量快照里
+    都记着对方那个 hunk 的旧值，后一份会把前一份的改动整个盖掉。
+
+    Args:
+        left: 已有状态表
+        right: 本次写入的增量
+
+    Returns:
+        合并后的状态表
+    """
+    return {**left, **right}
+
+
 class ReviewState(AgentState):
     """审查循环的状态。
 
@@ -65,22 +88,28 @@ class ReviewState(AgentState):
     它认不出「泛型 TypedDict 再被下标」这层。mypy strict 与 pyright 对两种写法
     都无异议，取不打扰 IDE 的那个。
 
+    带 `Annotated` 的字段有 reducer —— 模型一轮里可以并行发多个工具调用，
+    这些调用在**同一个 super-step** 里跑，返回的 `Command.update` 会被同时写入。
+    LangGraph 对没有 reducer 的键只允许一步一写，两个 `report_hunks` 撞在一起
+    就会抛 `InvalidUpdateError: At key 'hunk_status': Can receive only one value
+    per step`。实测 21 轮里有 8 轮是并行调用，其中 1 轮正是这种情况。
+
     Attributes:
-        hunk_status: hunk 状态表（hunk_id → HunkStatus）
-        all_comments: 所有已收集的评论
+        hunk_status: hunk 状态表（hunk_id → HunkStatus）。并行写按 key 合并
         round_count: 已完成的模型调用轮次
         max_rounds: 最大轮次
         no_report_rounds: 连续无产出的轮次数
-        end_done_count: end_done 被调用的次数（用于拒绝机制）
+        end_done_count: 上次有进展以来 end_done 被调用的次数（拒绝机制用）
+        end_done_mark: 上次重置时已完成的 hunk 数，用来判断「有没有新进展」
         group: 当前审查单元
     """
 
-    hunk_status: dict[str, HunkStatus]
-    all_comments: list[CommentInput]
+    hunk_status: Annotated[dict[str, HunkStatus], merge_hunk_status]
     round_count: int
     max_rounds: int
     no_report_rounds: int
     end_done_count: int
+    end_done_mark: int
     group: Group
 
 

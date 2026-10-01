@@ -26,6 +26,7 @@ from prism.core.agent.state import (
     NO_PROGRESS_EXIT_ROUNDS,
     NO_PROGRESS_REMIND_ROUNDS,
     ReviewState,
+    done_count,
     end_done_verdict,
     pending_ids,
 )
@@ -79,7 +80,30 @@ def update_no_report_rounds(current: int, tool_calls: Sequence[Mapping[str, Any]
     return current + 1
 
 
-def should_exit(state: ReviewState) -> bool:
+def end_done_reset(state: ReviewState) -> dict[str, Any]:
+    """有新 hunk 审完时，返回 end_done 计数的重置更新。
+
+    「纠正机会」绑到进展上，不是全局计数：不重置的话，早先一次误调的
+    end_done 会把机会提前耗尽，后面真误判时直接被接受并带缺口退出。
+
+    这里而不是 `report_hunks` 里：工具节点一轮可以并行跑多个调用，两个工具
+    同时写 `end_done_count` 会撞 LangGraph 的 InvalidUpdateError；middleware
+    在模型节点里，是单写者。
+
+    Args:
+        state: 当前状态
+
+    Returns:
+        需要重置时返回 ``{"end_done_count": 0, "end_done_mark": <已完成数>}``，
+        否则返回空字典
+    """
+    done = done_count(state["hunk_status"])
+    if done <= state["end_done_mark"]:
+        return {}
+    return {"end_done_count": 0, "end_done_mark": done}
+
+
+def should_exit(state: ReviewState, *, end_done_count: int | None = None) -> bool:
     """语义退出判定。
 
     轮次上限**不在这里** —— 那是 `ModelCallLimitMiddleware` 的职责。
@@ -87,12 +111,15 @@ def should_exit(state: ReviewState) -> bool:
 
     Args:
         state: 当前状态
+        end_done_count: 覆盖状态里的 end_done 计数。本步刚重置过时传重置后的值 ——
+            否则会拿旧计数把「刚有新进展」误判成「该收尾了」
 
     Returns:
         是否应当结束循环
     """
     pending = pending_ids(state["hunk_status"])
-    if state["end_done_count"] > 0 and end_done_verdict(state["end_done_count"], pending)[0]:
+    count = state["end_done_count"] if end_done_count is None else end_done_count
+    if count > 0 and end_done_verdict(count, pending)[0]:
         return True
     return state["no_report_rounds"] >= NO_PROGRESS_EXIT_ROUNDS
 
@@ -136,7 +163,14 @@ def review_progress(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     if any(str(call.get("name", "")) == "report_hunks" for call in calls):
         updates["messages"] = [HumanMessage(content=build_agent_status(state["hunk_status"]))]
 
-    if should_exit(state):
+    reset = end_done_reset(state)
+    if reset:
+        logger.debug("新审完 hunk，重置 end_done 纠正机会")
+        updates.update(reset)
+
+    # 退出判定要看重置之后的值
+    end_done_count = 0 if reset else state["end_done_count"]
+    if should_exit(state, end_done_count=end_done_count):
         logger.info("退出：end_done 或连续无产出已达阈值")
         return {**updates, "jump_to": "end"}
 

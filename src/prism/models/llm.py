@@ -11,6 +11,11 @@ DEFAULT_MODEL = "deepseek-flash"
 # API key 所在的环境变量名
 API_KEY_ENV = "DEEPSEEK_API_KEY"
 
+# 思考强度默认值。API 的默认档位是 high，显式降到 low：
+# 审查任务里模型绝大多数轮次只是「读文件 → 报告结论」，不需要深推理，
+# 而思考 token 计费且会让 prompt 一起变长（实测 thinking 开/关：38 vs 12 tokens）
+DEFAULT_REASONING_EFFORT = "low"
+
 
 @dataclass
 class LLMConfig:
@@ -20,7 +25,12 @@ class LLMConfig:
         model: 模型名，如 "deepseek-flash"
         base_url: API base URL
         api_key: API key（从环境变量读）
-        temperature: 温度，默认 0
+        reasoning_effort: 思考强度。DeepSeek 的思考模式**默认开启且默认档位是
+            high**（实测：不传任何参数也会有 reasoning_tokens），所以这里显式
+            指定，避免默认值悄悄变化。可选 minimal / low / medium / high /
+            xhigh / max / ultra（会映射到实际档位）
+        temperature: 温度，默认 0。**思考模式下被 API 忽略**（文档明确不支持），
+            保留字段只为非思考模型
         max_retries: 重试次数，默认 3
         timeout: 超时秒数，默认 60
     """
@@ -28,6 +38,7 @@ class LLMConfig:
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
     api_key: str = ""
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
     temperature: float = 0.0
     max_retries: int = 3
     timeout: int = 60

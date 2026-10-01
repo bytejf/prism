@@ -19,13 +19,14 @@ from langchain_core.tools import BaseTool
 from pydantic import Field
 
 from prism.core.agent.agent import build_tools, initial_state, run_review_agent
-from prism.core.agent.middleware import should_exit, update_no_report_rounds
+from prism.core.agent.middleware import end_done_reset, should_exit, update_no_report_rounds
 from prism.core.agent.state import (
     EXIT_END_DONE,
     EXIT_END_DONE_WITH_GAPS,
     EXIT_MAX_ROUNDS,
     EXIT_NO_PROGRESS,
     STATUS_DONE,
+    STATUS_IN_PROGRESS,
     STATUS_PENDING,
     HunkStatus,
     ReviewState,
@@ -275,6 +276,59 @@ def test_should_exit_on_no_progress() -> None:
     assert should_exit(state) is True
 
 
+def test_end_done_reset_on_progress() -> None:
+    """测试有新 hunk 审完时重置 end_done 计数（纠正机会绑到进展上）。
+
+    回归用例：计数从不重置时，早先一次误调的 end_done 会把纠正机会提前
+    耗尽，后面真误判时直接被接受并带缺口退出。
+    """
+    state = state_with(
+        hunk_status={
+            "H-01": HunkStatus("H-01", STATUS_DONE),
+            "H-02": HunkStatus("H-02", STATUS_PENDING),
+        },
+        end_done_count=1,
+        end_done_mark=0,
+    )
+    assert end_done_reset(state) == {"end_done_count": 0, "end_done_mark": 1}
+
+
+def test_end_done_reset_needs_actual_progress() -> None:
+    """测试「审查中」不算进展，不重置。"""
+    state = state_with(
+        hunk_status={"H-01": HunkStatus("H-01", STATUS_IN_PROGRESS)},
+        end_done_count=1,
+        end_done_mark=0,
+    )
+    assert end_done_reset(state) == {}
+
+
+def test_end_done_reset_is_idempotent() -> None:
+    """测试同一批进度只重置一次：mark 已经追上时不再重置。
+
+    否则每轮都会把计数清零，拒绝机制形同虚设。
+    """
+    state = state_with(
+        hunk_status={"H-01": HunkStatus("H-01", STATUS_DONE)},
+        end_done_count=1,
+        end_done_mark=1,
+    )
+    assert end_done_reset(state) == {}
+
+
+def test_should_exit_honours_overridden_end_done_count() -> None:
+    """测试退出判定用传入的计数覆盖状态里的旧值。
+
+    `review_progress` 本步刚重置过 end_done 时仍按旧计数判定的话，会把
+    「刚有新进展」误判成「该收尾了」，带缺口提前退出。
+    """
+    pending = {"H-01": HunkStatus("H-01", STATUS_PENDING)}
+    state = state_with(hunk_status=pending, end_done_count=2, no_report_rounds=0)
+
+    assert should_exit(state) is True
+    assert should_exit(state, end_done_count=0) is False
+
+
 def test_initial_state_builds_user_message_and_round_budget(project_root: str) -> None:
     """测试初始状态：一条 user 消息、hunk 全部 pending、轮次上限。
 
@@ -512,6 +566,42 @@ def test_main_loop_feeds_back_schema_error_and_continues(project_root: str) -> N
     assert result.exit_reason == EXIT_END_DONE
     feedback = [str(m.content) for m in llm.calls[1] if m.type == "tool"]
     assert any("severity" in text for text in feedback), feedback
+
+
+def test_main_loop_survives_parallel_report_hunks(project_root: str) -> None:
+    """测试一轮里并行调两个 report_hunks 不崩，且两个 hunk 都记上了。
+
+    回归用例：模型一轮可以发多个工具调用，它们在**同一个 super-step** 里跑，
+    返回的 Command 同时写 hunk_status。没有 reducer 时 LangGraph 直接抛
+    `InvalidUpdateError: At key 'hunk_status': Can receive only one value per step`。
+
+    实测 21 轮里 8 轮有并行调用，其中 1 轮就是两个 report_hunks，当场崩掉了
+    一组审查。这里两条断言缺一不可：不崩（reducer 生效）+ 两个都 done
+    （工具写的是增量而不是快照，否则后者会把前者盖掉）。
+    """
+    parallel = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "report_hunks",
+                "args": {"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]},
+                "id": "call-1",
+                "type": "tool_call",
+            },
+            {
+                "name": "report_hunks",
+                "args": {"reports": [{"hunk_id": "H-02", "complete": True, "comments": []}]},
+                "id": "call-2",
+                "type": "tool_call",
+            },
+        ],
+    )
+    llm = ScriptedChatModel(responses=[parallel, done_call()])
+
+    result = run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_END_DONE
+    assert result.pending_hunk_ids == [], "并行写入被后一份快照覆盖了"
 
 
 def test_main_loop_empty_group(project_root: str) -> None:
