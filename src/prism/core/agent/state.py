@@ -7,7 +7,6 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from langchain.agents.middleware import AgentState
 
@@ -54,16 +53,17 @@ class HunkStatus:
     comments: list[CommentInput] = field(default_factory=list)
 
 
-class ReviewState(AgentState[Any]):
+class ReviewState(AgentState):
     """审查循环的状态。
 
     继承 LangChain 的 `AgentState`（它已提供
     `messages: Annotated[list[AnyMessage], add_messages]` 与 jump_to 等）。
 
-    写成 `AgentState[Any]` 而不是裸 `AgentState`：`AgentState` 是
-    `TypedDict, Generic[ResponseT]`，留空会让类型参数变成未知，PyCharm 据此
-    判定它接不上 `create_agent(state_schema=type[AgentState[ResponseT]])`。
-    本状态不用 structured_response，`Any` 就是它的实际类型。
+    这里**故意写裸的 `AgentState`**，不写 `AgentState[Any]`：
+    后者虽然是框架自己的写法（见 `_DefaultAgentState`），但 PyCharm 会报
+    「TypedDict cannot inherit from a non-TypedDict base class」——
+    它认不出「泛型 TypedDict 再被下标」这层。mypy strict 与 pyright 对两种写法
+    都无异议，取不打扰 IDE 的那个。
 
     Attributes:
         hunk_status: hunk 状态表（hunk_id → HunkStatus）

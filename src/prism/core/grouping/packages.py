@@ -84,4 +84,4 @@ def _hunk_sort_key(item: HunkWithSymbol) -> tuple[str, int, int]:
     Returns:
         (文件路径, 新文件起始行, 旧文件起始行)
     """
-    return (item.file_path, item.part.new_start, item.part.old_start)
+    return item.file_path, item.part.new_start, item.part.old_start

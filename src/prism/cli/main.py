@@ -114,7 +114,7 @@ def _version_callback(value: bool) -> None:
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    version_: bool = typer.Option(
+    _version: bool = typer.Option(
         False,
         "--version",
         callback=_version_callback,
@@ -128,7 +128,9 @@ def main(
 
     Args:
         ctx: Typer 上下文，用于判断是否指定了子命令
-        version_: 是否传入 `--version`（由 `_version_callback` 处理）
+        _version: 是否传入 `--version`；值本身不读，全部由 `_version_callback`
+            处理（`is_eager` 保证它在函数体之前执行）。下划线前缀表明这是
+            「只为声明 CLI 参数而存在」的形参。
     """
     setup_logging()
     if ctx.invoked_subcommand is None:
@@ -204,12 +206,16 @@ def diff(
         typer.echo(f"  {item.path}: {len(item.hunks)} hunks (+{item.insertions}/-{item.deletions})")
 
 
-@app.command()
-def filter(
+@app.command("filter")
+def filter_cmd(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
 ) -> None:
-    """按规则过滤文件，打印可审查 / 跳过清单（不调用 LLM）。"""
+    """按规则过滤文件，打印可审查 / 跳过清单（不调用 LLM）。
+
+    函数名带 ``_cmd`` 后缀：命令名由 ``@app.command("filter")`` 显式给出，
+    避免模块里出现一个叫 ``filter`` 的名字遮蔽内置函数。
+    """
     logger.info("过滤文件: base=%s head=%s", base, head)
     diffs = _load_or_exit(base, head)
     result = filter_files(diffs)

@@ -116,7 +116,7 @@ def _last_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
 
 
 @before_model(state_schema=ReviewState, can_jump_to=["end"], name="ReviewProgress")
-def review_progress(state: ReviewState, runtime: Any) -> dict[str, Any] | None:
+def review_progress(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     """模型调用前：追加进度快照，并判定语义退出。
 
     进度快照挂在这里而不是工具里，是为了**保持与旧实现完全相同的时序**：
@@ -124,7 +124,8 @@ def review_progress(state: ReviewState, runtime: Any) -> dict[str, Any] | None:
 
     Args:
         state: 当前状态
-        runtime: 运行时（框架注入）
+        _runtime: 运行时。框架按位置传参（`func(state, runtime)`），位置必须留着，
+            但本钩子用不到，故加下划线前缀表明「占位而非遗漏」
 
     Returns:
         状态更新；需要退出时带 ``jump_to="end"``
@@ -143,7 +144,7 @@ def review_progress(state: ReviewState, runtime: Any) -> dict[str, Any] | None:
 
 
 @after_model(state_schema=ReviewState, can_jump_to=["model", "end"], name="ReviewPacing")
-def review_pacing(state: ReviewState, runtime: Any) -> dict[str, Any] | None:
+def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     """模型返回后：记轮次、更新无产出计数；纯文本时注入提醒并**继续循环**。
 
     纯文本返回时若不干预，框架会直接结束循环。这里返回 ``jump_to="model"``
@@ -151,7 +152,7 @@ def review_pacing(state: ReviewState, runtime: Any) -> dict[str, Any] | None:
 
     Args:
         state: 当前状态
-        runtime: 运行时（框架注入）
+        _runtime: 运行时，占位（同 `review_progress`）
 
     Returns:
         状态更新；纯文本时带提醒消息与 ``jump_to``

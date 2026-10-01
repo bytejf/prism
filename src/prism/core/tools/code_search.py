@@ -36,6 +36,7 @@ def code_search(
 
     Args:
         pattern: 搜索模式（支持正则）
+        runtime: 运行时（框架注入，模型看不到）
         file_pattern: 文件过滤，默认 "*.go"
         max_results: 最大结果数，默认 50
 

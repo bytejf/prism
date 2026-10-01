@@ -112,4 +112,4 @@ def _sort_key(comment: Comment) -> tuple[int, str, int]:
         排序键元组
     """
     rank = SEVERITY_RANK.get(comment.severity, UNKNOWN_SEVERITY_RANK)
-    return (rank, comment.path, comment.start_line)
+    return rank, comment.path, comment.start_line

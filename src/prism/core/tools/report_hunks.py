@@ -172,25 +172,26 @@ def report_hunks(
     )
 
 
-def _to_comment(raw: CommentArg) -> CommentInput:
+def _to_comment(arg: CommentArg) -> CommentInput:
     """把模型报的评论转成 CommentInput。
 
     severity 由 `Literal` 保证合法 —— 非法值在进到这里之前就被 Pydantic
     拦下、作为错误回灌给模型重试，不会静默变成空字符串。
 
     Args:
-        raw: 模型报的评论
+        arg: 模型报的评论（参数名不叫 `raw`，避免与调用点的循环变量同名，
+            PyCharm 会把两者混起来推断）
 
     Returns:
         CommentInput 对象
     """
     return CommentInput(
-        severity=raw.severity,
-        category=raw.category.strip(),
-        content=raw.content.strip(),
-        existing_code=raw.existing_code.strip(),
-        suggestion_code=_optional_text(raw.suggestion_code),
-        rule_ref=_optional_text(raw.rule_ref),
+        severity=arg.severity,
+        category=arg.category.strip(),
+        content=arg.content.strip(),
+        existing_code=arg.existing_code.strip(),
+        suggestion_code=_optional_text(arg.suggestion_code),
+        rule_ref=_optional_text(arg.rule_ref),
     )
 
 

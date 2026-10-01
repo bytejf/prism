@@ -111,8 +111,8 @@ def _parse_block(lines: list[str]) -> Diff | None:
         if header is None:
             return
         hunks.append(_make_hunk(header, body))
-        insertions += sum(1 for line in body if line.startswith("+"))
-        deletions += sum(1 for line in body if line.startswith("-"))
+        insertions += sum(1 for body_line in body if body_line.startswith("+"))
+        deletions += sum(1 for body_line in body if body_line.startswith("-"))
         header, body = None, []
 
     for line in lines:

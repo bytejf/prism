@@ -7,3 +7,6 @@ __pycache__/
 .ruff_cache/
 .env
 .idea/
+
+# PyCharm Inspect Code 导出（临时产物）
+/xml/

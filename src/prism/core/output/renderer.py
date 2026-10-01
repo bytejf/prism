@@ -54,7 +54,8 @@ class TerminalRenderer:
         logger.info("渲染完成：输出 %d 字符", len(text))
         return text
 
-    def _render_header(self, stats: ReviewStats) -> str:
+    @staticmethod
+    def _render_header(stats: ReviewStats) -> str:
         """渲染头部：审查范围 + 文件数 + 评论数 + 耗时。
 
         Args:
@@ -72,7 +73,8 @@ class TerminalRenderer:
             )
         )
 
-    def _render_comment(self, comment: Comment) -> str:
+    @staticmethod
+    def _render_comment(comment: Comment) -> str:
         """渲染单条评论。
 
         格式：
@@ -94,7 +96,8 @@ class TerminalRenderer:
             )
         )
 
-    def _render_footer(self, comments: list[Comment]) -> str:
+    @staticmethod
+    def _render_footer(comments: list[Comment]) -> str:
         """渲染尾部统计。
 
         非 high/medium/low 的 severity 也计入，排在三个已知值之后，
