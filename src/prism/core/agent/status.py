@@ -45,14 +45,16 @@ def build_agent_status(hunk_status: dict[str, HunkStatus]) -> str:
     ]
     lines.extend(f"  {item.hunk_id} — {_describe(item.comments)}" for item in done)
 
-    lines.extend(("", f"🔄 审查中（{len(in_progress)}）："))
+    # 统一传 list 而不是 tuple：PyCharm 对 extend(tuple) 会误报
+    # 「Unresolved attribute reference 'extend'」
+    lines.extend(["", f"🔄 审查中（{len(in_progress)}）："])
     lines.extend(f"  {item.hunk_id}" for item in in_progress)
 
-    lines.extend(("", f"⏳ 待审查（{len(pending)}）："))
+    lines.extend(["", f"⏳ 待审查（{len(pending)}）："])
     if pending:
         lines.append(f"  {', '.join(item.hunk_id for item in pending)}")
 
-    lines.extend(("", STATUS_FOOTER, STATUS_TAG_CLOSE))
+    lines.extend(["", STATUS_FOOTER, STATUS_TAG_CLOSE])
     return "\n".join(lines)
 
 

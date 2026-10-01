@@ -7,6 +7,7 @@
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from langchain.agents.middleware import AgentState
 
@@ -53,11 +54,16 @@ class HunkStatus:
     comments: list[CommentInput] = field(default_factory=list)
 
 
-class ReviewState(AgentState):
+class ReviewState(AgentState[Any]):
     """审查循环的状态。
 
     继承 LangChain 的 `AgentState`（它已提供
     `messages: Annotated[list[AnyMessage], add_messages]` 与 jump_to 等）。
+
+    写成 `AgentState[Any]` 而不是裸 `AgentState`：`AgentState` 是
+    `TypedDict, Generic[ResponseT]`，留空会让类型参数变成未知，PyCharm 据此
+    判定它接不上 `create_agent(state_schema=type[AgentState[ResponseT]])`。
+    本状态不用 structured_response，`Any` 就是它的实际类型。
 
     Attributes:
         hunk_status: hunk 状态表（hunk_id → HunkStatus）
