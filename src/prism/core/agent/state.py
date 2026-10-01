@@ -87,9 +87,7 @@ def pending_ids(hunk_status: dict[str, HunkStatus]) -> list[str]:
     Returns:
         编号列表，按字典序排序
     """
-    return sorted(
-        hunk_id for hunk_id, item in hunk_status.items() if item.status != STATUS_DONE
-    )
+    return sorted(hunk_id for hunk_id, item in hunk_status.items() if item.status != STATUS_DONE)
 
 
 def done_count(hunk_status: dict[str, HunkStatus]) -> int:

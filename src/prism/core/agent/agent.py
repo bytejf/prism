@@ -68,11 +68,12 @@ def build_review_agent(model: BaseChatModel, max_rounds: int) -> Any:
         model=model,
         tools=build_tools(),
         system_prompt=tpl.SYSTEM,
-        # cast 是框架的签名缺口：create_agent 的 middleware 参数只填了
-        # AgentMiddleware 的两个类型参数，框架自带的 ModelCallLimitMiddleware
-        # 同样过不了这个检查
+        # cast 是框架的签名缺口：AgentMiddleware 声明了三个类型参数，
+        # 而 create_agent 的 middleware 参数只填了两个（漏了 ResponseT），
+        # 框架自带的 ModelCallLimitMiddleware 同样过不了这个检查。
+        # 三个 Any 补齐后 mypy 与 IDE 都能接受。
         middleware=cast(
-            "list[AgentMiddleware[Any, Any, Any]]",
+            list[AgentMiddleware[Any, Any, Any]],
             [
                 review_progress,
                 review_pacing,
@@ -149,7 +150,7 @@ def run_review_agent(
     final: ReviewState = agent.invoke(
         initial_state(group, max_rounds),
         context=ReviewContext(project_root=project_root, head_rev=head_rev),
-                # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约
+        # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约
         # 6.1 步（30 轮 = 182 步），旧手写图的 ×5 不够，取 ×7 留余量。
         # 真正的终止保证是 ModelCallLimitMiddleware，这里只是防图跑飞。
         config={"recursion_limit": max_rounds * 7 + 20},

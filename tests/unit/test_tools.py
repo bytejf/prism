@@ -7,13 +7,13 @@
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
@@ -139,7 +139,8 @@ class ToolUnderTest:
         """
         result = self.invoke(args)
         assert isinstance(result, Command), f"期望 Command，实际 {type(result).__name__}"
-        updates = dict(result.update)
+        # Command.update 是可选的（框架类型如此），本文件的工具都会给出，空值兜底只是过类型
+        updates = dict(result.update or {})
         self._state.update(updates)  # type: ignore[typeddict-item]
         return updates
 
@@ -594,22 +595,38 @@ def test_report_hunks_rejects_invalid_severity() -> None:
         tool.invoke(bad)
 
     # 漏填 severity 同样拦下
-    missing = {"reports": [{"hunk_id": "H-01", "complete": True,
-                            "comments": [{"category": "x", "content": "y", "existing_code": "z"}]}]}
+    missing = {
+        "reports": [
+            {
+                "hunk_id": "H-01",
+                "complete": True,
+                "comments": [{"category": "x", "content": "y", "existing_code": "z"}],
+            }
+        ]
+    }
     with pytest.raises(ValidationError, match="severity"):
         tool.invoke(missing)
 
     # 大小写敏感的枚举：写 "CRITICAL" 也拦下（模型看到的 enum 是小写）
-    wrong = {"reports": [{"hunk_id": "H-01", "complete": True,
-                          "comments": [{"severity": "CRITICAL", "category": "x",
-                                        "content": "y", "existing_code": "z"}]}]}
+    wrong = {
+        "reports": [
+            {
+                "hunk_id": "H-01",
+                "complete": True,
+                "comments": [
+                    {"severity": "CRITICAL", "category": "x", "content": "y", "existing_code": "z"}
+                ],
+            }
+        ]
+    }
     with pytest.raises(ValidationError, match="severity"):
         tool.invoke(wrong)
 
 
 def test_report_hunks_schema_is_visible_to_model() -> None:
     """测试模型能从 schema 里看到 severity 的取值与含义，不需要猜。"""
-    schema = report_hunks.tool_call_schema.model_json_schema()
+    # tool_call_schema 的类型是 pydantic v1/v2 模型或 dict 的联合，框架没写窄
+    schema = cast(type[BaseModel], report_hunks.tool_call_schema).model_json_schema()
     props = schema["$defs"]["HunkReportArg"]["properties"]
     comment = schema["$defs"]["CommentArg"]["properties"]
 

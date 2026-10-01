@@ -167,9 +167,7 @@ def report_hunks(
             "hunk_status": hunk_status,
             "all_comments": all_comments,
             "end_done_count": end_done_count,
-            "messages": [
-                ToolMessage(content="\n".join(parts), tool_call_id=runtime.tool_call_id)
-            ],
+            "messages": [ToolMessage(content="\n".join(parts), tool_call_id=runtime.tool_call_id)],
         }
     )
 

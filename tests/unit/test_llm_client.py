@@ -7,7 +7,7 @@
 调用与工具绑定已经交给框架（`create_agent`），这里不再测 invoke。
 """
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -76,7 +76,9 @@ def test_model_property_exposes_configured_chatopenai(fake_model: list[FakeChatM
     调用与 bind_tools 都由框架负责，这里只保证「拿得到配好的模型」。
     """
     client = LLMClient(make_config())
-    assert client.model is fake_model[0]
+    # 假模型是 monkeypatch 塞进去的普通类，与 BaseChatModel 无继承关系，
+    # cast 成 object 只为让 mypy 的 identity 重叠检查放行
+    assert cast(object, client.model) is fake_model[0]
 
 
 def test_empty_api_key_is_rejected() -> None:
