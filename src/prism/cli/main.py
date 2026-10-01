@@ -37,7 +37,7 @@
 
 ## 完整审查（调用 LLM，产生 token 成本）
 
-    prism review    [--base main] [--head HEAD] [--model M] [--base-url URL]
+    prism review    [--base main] [--head HEAD]
         串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。
 
         审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
@@ -276,23 +276,16 @@ def group(
     typer.echo("\n\n".join(blocks))
 
 
-def _llm_or_exit(model: str | None = None, base_url: str | None = None) -> LLMClient:
+def _llm_or_exit() -> LLMClient:
     """构造 LLM 客户端，失败时打印错误并终止进程。
 
-    Args:
-        model: 覆盖默认模型名（可选）
-        base_url: 覆盖默认 base URL（可选），用于切到其他 OpenAI 兼容端点
+    model / base_url 固定在 `models/llm.py`，这里只从环境变量取 api_key。
 
     Returns:
         LLMClient 实例
     """
     try:
-        config = LLMConfig.from_env()
-        if model:
-            config.model = model
-        if base_url:
-            config.base_url = base_url
-        return LLMClient(config)
+        return LLMClient(LLMConfig.from_env())
     except ValueError as exc:
         logger.error("LLM 初始化失败: %s", exc)
         typer.echo(f"错误：{exc}", err=True)
@@ -303,8 +296,6 @@ def _run_groups(
     groups: list[Group],
     project_root: Path,
     head_rev: str,
-    model: str | None = None,
-    base_url: str | None = None,
 ) -> list[MainLoopResult]:
     """串行跑完所有审查单元（V1 不做并发）。
 
@@ -312,13 +303,11 @@ def _run_groups(
         groups: 审查单元列表
         project_root: 项目根目录
         head_rev: 被审查的版本，传给工具读源码用
-        model: 覆盖默认模型名（可选）
-        base_url: 覆盖默认 base URL（可选）
 
     Returns:
         各组的循环产出
     """
-    llm = _llm_or_exit(model, base_url)
+    llm = _llm_or_exit()
     results: list[MainLoopResult] = []
     for index, item in enumerate(groups, start=1):
         typer.echo(
@@ -338,8 +327,6 @@ def _run_groups(
 def review(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
-    model: str = typer.Option("", "--model", help="覆盖默认模型名，如 deepseek-chat"),
-    base_url: str = typer.Option("", "--base-url", help="覆盖默认 base URL，切到其他兼容端点"),
 ) -> None:
     """完整审查：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。"""
     started = time.monotonic()
@@ -363,7 +350,7 @@ def review(
     if not groups:
         typer.echo("没有可审查的 hunk。")
 
-    results = _run_groups(groups, root, head, model or None, base_url or None) if groups else []
+    results = _run_groups(groups, root, head) if groups else []
     comments = sort_comments(to_comments(results, groups))
 
     stats = ReviewStats(

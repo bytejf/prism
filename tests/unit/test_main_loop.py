@@ -488,6 +488,32 @@ def test_main_loop_unknown_tool_returns_error_text(project_root: str) -> None:
     assert any("no_such_tool" in text for text in feedback), feedback
 
 
+def test_main_loop_feeds_back_schema_error_and_continues(project_root: str) -> None:
+    """测试工具参数不合法时，校验错误被回灌给模型，循环继续而不是崩掉。
+
+    回归用例：report_hunks 的参数曾是 `list[dict]`，模型漏填 severity 时
+    静默变成空字符串（实测 55% 的评论如此）。改成 Pydantic 后由 schema 拦下。
+    """
+    bad = ai_call(
+        "report_hunks",
+        {
+            "reports": [
+                {
+                    "hunk_id": "H-01",
+                    "complete": True,
+                    "comments": [{"category": "x", "content": "y", "existing_code": "z"}],
+                }
+            ]
+        },
+    )
+    llm = ScriptedChatModel(responses=[bad, report_call(["H-01"]), done_call()])
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_END_DONE
+    feedback = [str(m.content) for m in llm.calls[1] if m.type == "tool"]
+    assert any("severity" in text for text in feedback), feedback
+
+
 def test_main_loop_empty_group(project_root: str) -> None:
     """测试没有 hunk 的组：end_done 立即通过。"""
     llm = ScriptedChatModel(responses=[done_call()])

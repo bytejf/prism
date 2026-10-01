@@ -8,12 +8,13 @@ LLM 只报告原始数据（结论 + 评论），进度由代码统计。
 """
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
@@ -28,29 +29,50 @@ from prism.models.tool import CommentInput
 
 logger = logging.getLogger(__name__)
 
-# 合法严重程度，其余值原样保留（排序时会被排到最后）但打 WARNING
-VALID_SEVERITIES = ("high", "medium", "low")
+
+class CommentArg(BaseModel):
+    """LLM 报告的单条评论。
+
+    字段说明就是模型看到的 schema —— 用 `list[dict]` 时模型只能靠 docstring 猜，
+    实测 55% 的评论漏填 severity，渲染成 `[类别 · ]`。
+    """
+
+    severity: Literal["high", "medium", "low"] = Field(
+        description=(
+            "严重程度，必填。high=会导致错误/崩溃/数据损坏；"
+            "medium=有风险或明显的维护性问题；low=风格与可读性"
+        )
+    )
+    category: str = Field(description="问题类别，如 并发安全 / 边界条件 / 跨文件一致性")
+    content: str = Field(description="评论正文：说清问题、影响与依据")
+    existing_code: str = Field(description="用于定位的代码片段，取自本 hunk 的 diff")
+    suggestion_code: str | None = Field(default=None, description="建议的修改代码（可选）")
+    rule_ref: str | None = Field(default=None, description="引用的规则编号（可选，V1 不用）")
+
+
+class HunkReportArg(BaseModel):
+    """单个 hunk 的审查结论。"""
+
+    hunk_id: str = Field(description="hunk 编号，必须来自审查范围，如 H-01")
+    complete: bool = Field(
+        description="是否审查完毕。true=已审完（之后再报该 hunk 会被忽略）；"
+        "false=只报部分结论，仍需继续审查"
+    )
+    comments: list[CommentArg] = Field(default_factory=list, description="评论列表，可为空")
 
 
 @tool
 def report_hunks(
-    reports: list[dict[str, Any]],
+    reports: list[HunkReportArg],
     runtime: ToolRuntime[ReviewContext, ReviewState],
 ) -> Command[Any]:
     """报告 hunk 的审查结论。
 
+    参数结构由 `HunkReportArg` / `CommentArg` 定义，模型直接看到那份 schema。
+
     Args:
-        reports: hunk 报告列表，每项含：
-            - hunk_id: str，hunk 编号（如 "H-01"）
-            - complete: bool，是否审查完毕
-            - comments: list[dict]，评论列表（可为空）
-                每条评论含：
-                - severity: str，high/medium/low
-                - category: str，问题类别
-                - content: str，评论正文
-                - existing_code: str，用于定位的代码片段
-                - suggestion_code: str，建议的修改（可选）
-                - rule_ref: str，引用的规则编号（可选，V1 不用）
+        reports: hunk 报告列表
+        runtime: 运行时（框架注入，模型看不到）
 
     Returns:
         状态更新（新 hunk 状态表 + 新评论 + 进度文本的 ToolMessage）
@@ -73,7 +95,7 @@ def report_hunks(
     newly_done = 0
 
     for raw in reports:
-        hunk_id = str(raw.get("hunk_id", "")).strip()
+        hunk_id = raw.hunk_id.strip()
         current = hunk_status.get(hunk_id)
         if current is None:
             unknown.append(hunk_id or "<空编号>")
@@ -86,12 +108,12 @@ def report_hunks(
             already_done.append(hunk_id)
             continue
 
-        comments = [_to_comment(item) for item in raw.get("comments") or []]
+        comments = [_to_comment(item) for item in raw.comments]
         all_comments.extend(comments)
         new_comment_count += len(comments)
 
         # complete=False 表示「报了部分结论但还没审完」，置为审查中
-        complete = bool(raw.get("complete"))
+        complete = raw.complete
         if complete:
             newly_done += 1
         # 整体替换成新对象，不做原地修改
@@ -152,29 +174,25 @@ def report_hunks(
     )
 
 
-def _to_comment(raw: dict[str, Any]) -> CommentInput:
-    """把 LLM 报告的评论字典转成 CommentInput。
+def _to_comment(raw: CommentArg) -> CommentInput:
+    """把模型报的评论转成 CommentInput。
 
-    字段缺失补空串；severity 不在合法集合内时原样保留并打 WARNING
-    （排序阶段会把未知 severity 排到最后，不在这里静默改写）。
+    severity 由 `Literal` 保证合法 —— 非法值在进到这里之前就被 Pydantic
+    拦下、作为错误回灌给模型重试，不会静默变成空字符串。
 
     Args:
-        raw: LLM 报告的评论字典
+        raw: 模型报的评论
 
     Returns:
         CommentInput 对象
     """
-    severity = str(raw.get("severity", "")).strip().lower()
-    if severity not in VALID_SEVERITIES:
-        logger.warning("评论 severity 非法：%r（将排在最后）", severity)
-
     return CommentInput(
-        severity=severity,
-        category=str(raw.get("category", "")).strip(),
-        content=str(raw.get("content", "")).strip(),
-        existing_code=str(raw.get("existing_code", "")).strip(),
-        suggestion_code=_optional_text(raw.get("suggestion_code")),
-        rule_ref=_optional_text(raw.get("rule_ref")),
+        severity=raw.severity,
+        category=raw.category.strip(),
+        content=raw.content.strip(),
+        existing_code=raw.existing_code.strip(),
+        suggestion_code=_optional_text(raw.suggestion_code),
+        rule_ref=_optional_text(raw.rule_ref),
     )
 
 

@@ -13,6 +13,7 @@ import pytest
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
@@ -543,8 +544,8 @@ def test_report_hunks_marks_incomplete_hunk_in_progress() -> None:
     assert done_count(hunk_status) == 0
 
 
-def test_report_hunks_preserves_unknown_severity() -> None:
-    """测试非法 severity 原样保留（交由排序阶段处理），不改写为 low。"""
+def test_report_hunks_normalizes_optional_fields() -> None:
+    """测试可选字段留空时转成 None，必填字段去掉首尾空白。"""
     tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
 
     update = tool.update(
@@ -555,8 +556,8 @@ def test_report_hunks_preserves_unknown_severity() -> None:
                     "complete": True,
                     "comments": [
                         {
-                            "severity": "CRITICAL",
-                            "category": "x",
+                            "severity": "high",
+                            "category": "  x  ",
                             "content": "y",
                             "existing_code": "z",
                             "suggestion_code": "  ",
@@ -566,8 +567,56 @@ def test_report_hunks_preserves_unknown_severity() -> None:
             ]
         }
     )
-    assert update["all_comments"][0].severity == "critical"
+    assert update["all_comments"][0].severity == "high"
+    assert update["all_comments"][0].category == "x"
     assert update["all_comments"][0].suggestion_code is None
+
+
+def test_report_hunks_rejects_invalid_severity() -> None:
+    """测试非法 severity 被 schema 拦下，而不是静默变成空字符串。
+
+    回归用例：参数曾是 `list[dict]`，模型拿不到 schema，实测 55% 的评论
+    漏填 severity，渲染成 `[类别 · ]`，排序也失效。
+    """
+    tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
+    bad = {
+        "reports": [
+            {
+                "hunk_id": "H-01",
+                "complete": True,
+                "comments": [
+                    {"severity": "", "category": "x", "content": "y", "existing_code": "z"}
+                ],
+            }
+        ]
+    }
+    with pytest.raises(ValidationError, match="severity"):
+        tool.invoke(bad)
+
+    # 漏填 severity 同样拦下
+    missing = {"reports": [{"hunk_id": "H-01", "complete": True,
+                            "comments": [{"category": "x", "content": "y", "existing_code": "z"}]}]}
+    with pytest.raises(ValidationError, match="severity"):
+        tool.invoke(missing)
+
+    # 大小写敏感的枚举：写 "CRITICAL" 也拦下（模型看到的 enum 是小写）
+    wrong = {"reports": [{"hunk_id": "H-01", "complete": True,
+                          "comments": [{"severity": "CRITICAL", "category": "x",
+                                        "content": "y", "existing_code": "z"}]}]}
+    with pytest.raises(ValidationError, match="severity"):
+        tool.invoke(wrong)
+
+
+def test_report_hunks_schema_is_visible_to_model() -> None:
+    """测试模型能从 schema 里看到 severity 的取值与含义，不需要猜。"""
+    schema = report_hunks.tool_call_schema.model_json_schema()
+    props = schema["$defs"]["HunkReportArg"]["properties"]
+    comment = schema["$defs"]["CommentArg"]["properties"]
+
+    assert set(comment) >= {"severity", "category", "content", "existing_code"}
+    assert comment["severity"]["enum"] == ["high", "medium", "low"]
+    assert "必填" in comment["severity"]["description"]
+    assert "hunk_id" in props
 
 
 def test_report_hunks_rejects_duplicate_report_of_done_hunk() -> None:

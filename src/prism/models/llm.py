@@ -3,9 +3,10 @@
 import os
 from dataclasses import dataclass
 
-# 默认对接 DeepSeek；换成任意 OpenAI 兼容端点只需改 base_url
-DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
-DEFAULT_MODEL = "deepseek-chat"
+# 固定对接 DeepSeek（OpenAI 兼容端点）。V1 不做配置文件，
+# 换 provider / 换模型直接改这两行。
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-flash"
 
 # API key 所在的环境变量名
 API_KEY_ENV = "DEEPSEEK_API_KEY"
@@ -16,7 +17,7 @@ class LLMConfig:
     """LLM 配置。
 
     Attributes:
-        model: 模型名，如 "deepseek-chat"
+        model: 模型名，如 "deepseek-flash"
         base_url: API base URL
         api_key: API key（从环境变量读）
         temperature: 温度，默认 0
