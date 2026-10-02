@@ -15,24 +15,31 @@
 
 跑法（真实调用 DeepSeek，会花钱）：
 
-    uv run pytest tests/e2e/test_min_walkthrough.py --log-cli-level=INFO
+    PRISM_LOG_LEVEL=DEBUG uv run pytest tests/e2e/test_min_walkthrough.py -s
 
 想只看审查前流程、不花钱：在 `[4/4]` 那行打个断点，跑到就停。
 
-## 为什么必须加 `--log-cli-level=INFO`
+## 日志怎么看
 
-不加的话，`logger.info(...)` **一条都不会出现在控制台**，只有 `print` 能看见 ——
-因为 pytest 的 logging 插件会把根 logger 上的 handler 换成自己的捕获 handler，
-我们的 `basicConfig` 装的 StreamHandler 被摘掉了。日志进了 pytest 的缓冲区，
-只在用例失败时以「Captured log call」的形式打出来。
+**必须设 `PRISM_LOG_LEVEL`** —— conftest 里那个 autouse 夹具看到它才会把 rich
+的 handler 挂到 `prism` logger 上。不设的话只有 `print` 能看到，`logger.info(...)`
+一条都不会出现。
 
-`-s` **救不了**：它关的是 stdout/stderr 捕获，跟 logging 插件是两回事。
-
-加上 `--log-cli-level=INFO` 之后，`observability/llm_trace.py` 每轮的请求/响应
-轨迹会实时打到控制台，配合断点最直观。
+原因是 pytest 的 logging 插件会把**根 logger** 的 handler 换成自己的捕获 handler，
+`setup_logging()` 用 `basicConfig` 装的 StreamHandler 被摘掉，日志只进缓冲区、
+只在用例失败时以「Captured log call」打出来。**`-s` 救不了** —— 它关的是
+stdout/stderr 捕获，跟 logging 插件是两回事。夹具绕过这一点的办法是把 handler
+挂在 `prism` logger 上，那个不在 pytest 的替换范围内。
 
 PyCharm：Run/Debug Configurations → 选中该用例的配置 →
-**Additional Arguments** 填 `--log-cli-level=INFO`。
+**Environment variables** 填 `PRISM_LOG_LEVEL=DEBUG`。
+
+## 另两个顺手的旋钮
+
+- **`COLUMNS`**：rich 在非终端环境下按 80 列折行（PyCharm 的控制台就被判成非终端）。
+  嫌折得难看就在同一处设 `COLUMNS=160`。
+- **`--log-cli-level=INFO`**：只对**第三方库**（httpx / openai）的日志有用。
+  我们自己的日志走上一条路，不需要它。
 """
 
 import os

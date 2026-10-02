@@ -1,10 +1,40 @@
 """pytest 共享夹具。"""
 
+import logging
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from rich.logging import RichHandler
+
+from prism.observability.logging import PRISM_LOGGER, build_handler, setup_logging
+
+
+@pytest.fixture(autouse=True)
+def prism_logging_to_console() -> None:
+    """设了 `PRISM_LOG_LEVEL` 时，把 prism 的日志打到控制台。
+
+    为什么不能只靠 `setup_logging()`：pytest 的 logging 插件会把**根 logger**
+    上的 handler 换成自己的捕获 handler，`basicConfig` 装的 StreamHandler 被摘掉，
+    日志只进缓冲区、只在用例失败时以「Captured log call」打出来。
+    所以这里把 handler 直接挂到 `prism` logger 上 —— 它不在 pytest 的替换范围内。
+
+    为什么默认不开：一次 e2e 的 LLM 轨迹近千行，普通跑测试会被淹掉。
+    想看得显式设环境变量：
+
+        PRISM_LOG_LEVEL=DEBUG uv run pytest tests/e2e/test_min_walkthrough.py -s
+
+    PyCharm 就填在 Run/Debug Configurations 的 Environment variables 里。
+    """
+    if not os.getenv("PRISM_LOG_LEVEL"):
+        return
+
+    setup_logging()
+    logger = logging.getLogger(PRISM_LOGGER)
+    if not any(isinstance(handler, RichHandler) for handler in logger.handlers):
+        logger.addHandler(build_handler())
 
 
 @pytest.fixture
