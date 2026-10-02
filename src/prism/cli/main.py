@@ -8,36 +8,43 @@
     prism --version                 显示版本号并退出
     prism --help / prism            打印帮助（不带子命令时）
 
-    所有命令都在「当前工作目录」这个 git 仓库里运行，以 merge-base(base, head)
-    为基准比较，所以只统计 PR 实际引入的改动 —— base 分支上的新提交不会混进来。
+    **所有子命令都必须用 `--path` 指定被审查的项目**：
+
+        prism group --path ~/Projects/foo
+
+    `--path` 必须指向一个 git 仓库，以该仓库的 merge-base(base, head) 为基准
+    比较，所以只统计 PR 实际引入的改动 —— base 分支上的新提交不会混进来。
+
+    V1 刻意**不做「默认当前目录」**：审查是有成本的破坏性操作（花 token、
+    发代码给外部 API），少敲一个参数就审错仓库的代价，比每次多敲 `--path` 大。
 
 ## 审查前流程（确定性，不调用 LLM、零 token 成本）
 
 纯读取命令，用于在花钱调 LLM 之前确认「改了什么、审哪些、怎么分组」。
 四个命令依次是流水线的下一个环节，可以逐个跑、逐个核对。
 
-    prism diff      [--base main] [--head HEAD]
+    prism diff      --path <repo> [--base main] [--head HEAD]
         加载并解析 diff，打印文件数 / hunk 数 / 增删行数。
         对应 core/diff/：pygit2 算 merge-base + 状态机解析 unified diff。
 
-    prism filter    [--base main] [--head HEAD]
+    prism filter    --path <repo> [--base main] [--head HEAD]
         按规则过滤文件，打印可审查 / 跳过清单（含跳过原因）。
         三级过滤：硬性排除（二进制 / 符号链接）→ 扩展名白名单（.go）
         → 内置降噪（*_test.go、*.pb.go）。对应 core/filter/。
 
-    prism hunk-map  [--base main] [--head HEAD]
+    prism hunk-map  --path <repo> [--base main] [--head HEAD]
         把每个 hunk 归属到包含其改动行的符号，打印 hunk 位置与归属符号。
         只处理通过过滤的 .go 文件。对应 core/ast/：tree-sitter 提取符号
         （函数 / 方法 / 包声明 / import / const / var / type），按改动行求交。
 
-    prism group     [--base main] [--head HEAD]
+    prism group     --path <repo> [--base main] [--head HEAD]
         按包路径（目录）分组，打印审查单元。
         这是审查前流程的最后一个环节，输出即为送进 LLM 的「审查单元」。
         对应 core/grouping/。
 
 ## 完整审查（调用 LLM，产生 token 成本）
 
-    prism review    [--base main] [--head HEAD]
+    prism review    --path <repo> [--base main] [--head HEAD]
         串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。
 
         审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
@@ -50,18 +57,18 @@
 ## 典型用法
 
     # 先干跑一遍看清范围（不花钱），确认后再真审
-    prism group  --base main --head origin/some-branch
-    prism review --base main --head origin/some-branch
+    prism group  --path ~/Projects/foo --base main --head origin/some-branch
+    prism review --path ~/Projects/foo --base main --head origin/some-branch
 
     # 排查「为什么某个文件没被审」
-    prism filter --base main --head origin/some-branch
+    prism filter --path ~/Projects/foo --base main --head origin/some-branch
 
     # 排查「某个 hunk 归属不准」
-    prism hunk-map --base main --head origin/some-branch
+    prism hunk-map --path ~/Projects/foo --base main --head origin/some-branch
 
 注意：`review` 的 `--head` 是**被审查的版本**，工具读源码时读的就是它，
 不是当前工作区。所以工作区停在别的分支也能正确审查
-（见 core/tools/context.py 的 head_rev）。
+（见 core/agent/context.py 的 head_rev）。
 """
 
 import logging
@@ -69,6 +76,7 @@ import time
 from importlib.metadata import version
 from itertools import groupby
 from pathlib import Path, PurePosixPath
+from typing import Annotated
 
 import typer
 
@@ -91,6 +99,43 @@ from prism.observability.logging import setup_logging
 logger = logging.getLogger(__name__)
 
 app = typer.Typer(help="Prism — 确定性优先的 Go 代码审查 Agent")
+
+# 每个子命令都要声明它 —— 抽成别名，免得五处各写一遍还写歪
+RepoPath = Annotated[
+    Path | None,
+    typer.Option("--path", help="被审查的项目路径，须是 git 仓库"),
+]
+
+
+def _resolve_repo(path: Path | None) -> Path:
+    """校验 `--path` 并返回仓库根目录。
+
+    没给路径就直接报错退出，**不回落当前目录**：审查会花 token、会把代码发给
+    外部 API，少敲一个参数就审错仓库的代价比多敲一个大。
+
+    Args:
+        path: `--path` 传入的路径
+
+    Returns:
+        仓库根目录的绝对路径
+
+    Raises:
+        typer.Exit: 未指定路径，或该路径不是 git 仓库
+    """
+    if path is None:
+        logger.error("缺少 --path")
+        typer.echo("错误：必须用 --path 指定被审查的项目路径（例如 --path .）", err=True)
+        raise typer.Exit(code=1)
+
+    root = path.expanduser().resolve()
+    # .git 可能是目录（普通仓库）也可能是文件（worktree / 子模块），exists 两者都覆盖
+    if not (root / ".git").exists():
+        logger.error("--path 不是 git 仓库: %s", root)
+        typer.echo(f"错误：{root} 不是 git 仓库", err=True)
+        raise typer.Exit(code=1)
+
+    logger.debug("被审查仓库: %s", root)
+    return root
 
 
 def _version_callback(value: bool) -> None:
@@ -139,10 +184,11 @@ def main(
         raise typer.Exit
 
 
-def _load_or_exit(base: str, head: str) -> list[Diff]:
+def _load_or_exit(root: Path, base: str, head: str) -> list[Diff]:
     """加载 diff，失败时打印错误并终止进程。
 
     Args:
+        root: 被审查仓库的根目录
         base: base 分支 / 版本
         head: head 分支 / 版本
 
@@ -150,7 +196,7 @@ def _load_or_exit(base: str, head: str) -> list[Diff]:
         Diff 列表
     """
     try:
-        return load_diffs(Path.cwd(), base, head)
+        return load_diffs(root, base, head)
     except ValueError as exc:
         logger.error("diff 加载失败: %s", exc)
         typer.echo(f"错误：{exc}", err=True)
@@ -170,19 +216,20 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
-def _map_or_exit(base: str, head: str) -> list[HunkWithSymbol]:
+def _map_or_exit(root: Path, base: str, head: str) -> list[HunkWithSymbol]:
     """跑完审查前流程（diff → 过滤 → hunk 映射），失败时终止进程。
 
     Args:
+        root: 被审查仓库的根目录
         base: base 分支 / 版本
         head: head 分支 / 版本
 
     Returns:
         带归属符号的 hunk 列表
     """
-    reviewable = filter_files(_load_or_exit(base, head)).reviewable
+    reviewable = filter_files(_load_or_exit(root, base, head)).reviewable
     try:
-        return map_hunks_to_symbols(Path.cwd(), base, head, reviewable)
+        return map_hunks_to_symbols(root, base, head, reviewable)
     except ValueError as exc:
         logger.error("hunk 映射失败: %s", exc)
         typer.echo(f"错误：{exc}", err=True)
@@ -193,13 +240,15 @@ def _map_or_exit(base: str, head: str) -> list[HunkWithSymbol]:
 def diff(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+    path: RepoPath = None,
 ) -> None:
     """加载并解析 diff，打印结构摘要（不调用 LLM）。
 
     以 merge-base(base, head) 为基准，只统计 PR 实际引入的改动。
     """
-    logger.info("加载 diff: base=%s head=%s", base, head)
-    diffs = _load_or_exit(base, head)
+    root = _resolve_repo(path)
+    logger.info("加载 diff: root=%s base=%s head=%s", root, base, head)
+    diffs = _load_or_exit(root, base, head)
 
     typer.echo(f"Loaded {len(diffs)} files, {sum(len(d.hunks) for d in diffs)} hunks")
     for item in diffs:
@@ -210,14 +259,16 @@ def diff(
 def filter_cmd(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+    path: RepoPath = None,
 ) -> None:
     """按规则过滤文件，打印可审查 / 跳过清单（不调用 LLM）。
 
     函数名带 ``_cmd`` 后缀：命令名由 ``@app.command("filter")`` 显式给出，
     避免模块里出现一个叫 ``filter`` 的名字遮蔽内置函数。
     """
-    logger.info("过滤文件: base=%s head=%s", base, head)
-    diffs = _load_or_exit(base, head)
+    root = _resolve_repo(path)
+    logger.info("过滤文件: root=%s base=%s head=%s", root, base, head)
+    diffs = _load_or_exit(root, base, head)
     result = filter_files(diffs)
 
     typer.echo(f"Reviewable: {_plural(len(result.reviewable), 'file')}")
@@ -234,13 +285,15 @@ def filter_cmd(
 def hunk_map(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+    path: RepoPath = None,
 ) -> None:
     """把每个 hunk 归属到符号，打印映射结果（不调用 LLM）。
 
     只处理通过文件过滤的 .go 文件。
     """
-    logger.info("映射 hunk: base=%s head=%s", base, head)
-    mapped = _map_or_exit(base, head)
+    root = _resolve_repo(path)
+    logger.info("映射 hunk: root=%s base=%s head=%s", root, base, head)
+    mapped = _map_or_exit(root, base, head)
 
     if not mapped:
         typer.echo("没有可映射的 hunk")
@@ -254,13 +307,15 @@ def hunk_map(
 def group(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+    path: RepoPath = None,
 ) -> None:
     """按包路径分组，打印审查单元（不调用 LLM）。
 
     这是审查前流程的最后一个环节：输出即为送入 LLM 的「审查单元」。
     """
-    logger.info("分组: base=%s head=%s", base, head)
-    groups = group_by_package(_map_or_exit(base, head))
+    root = _resolve_repo(path)
+    logger.info("分组: root=%s base=%s head=%s", root, base, head)
+    groups = group_by_package(_map_or_exit(root, base, head))
 
     if not groups:
         typer.echo("没有可审查的 hunk")
@@ -274,9 +329,10 @@ def group(
         )
         lines = [header]
         # hunks 已按文件路径排序，同文件的连续 → groupby 一次即可
-        for path, hunks in groupby(item.hunks, key=lambda h: h.file_path):
+        # 变量叫 file_path 不叫 path：后者是 `--path` 参数的名字，遮蔽它两边都读不懂
+        for file_path, hunks in groupby(item.hunks, key=lambda h: h.file_path):
             hunk_ids = ", ".join(h.hunk_id for h in hunks)
-            lines.append(f"  - {PurePosixPath(path).name} ({hunk_ids})")
+            lines.append(f"  - {PurePosixPath(file_path).name} ({hunk_ids})")
         blocks.append("\n".join(lines))
 
     typer.echo("\n\n".join(blocks))
@@ -333,14 +389,15 @@ def _run_groups(
 def review(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+    path: RepoPath = None,
 ) -> None:
     """完整审查：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。"""
     started = time.monotonic()
-    root = Path.cwd()
-    logger.info("开始审查: base=%s head=%s root=%s", base, head, root)
+    root = _resolve_repo(path)
+    logger.info("开始审查: root=%s base=%s head=%s", root, base, head)
 
     typer.echo("Loading diffs...")
-    diffs = _load_or_exit(base, head)
+    diffs = _load_or_exit(root, base, head)
 
     typer.echo(f"Filtering files... ({_plural(len(diffs), 'file')} in diff)")
     reviewable = filter_files(diffs).reviewable

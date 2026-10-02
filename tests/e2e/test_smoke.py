@@ -57,7 +57,7 @@ def sample_repo(tmp_path: Path, git: Callable[..., None]) -> Path:
 def test_smoke_review(sample_repo: Path) -> None:
     """跑一次完整审查，验证不崩溃且有输出。"""
     result = subprocess.run(
-        ["prism", "review", "--base", "main", "--head", "feature"],
+        ["prism", "review", "--path", str(sample_repo), "--base", "main", "--head", "feature"],
         cwd=sample_repo,
         capture_output=True,
         text=True,
@@ -77,7 +77,7 @@ def test_smoke_review(sample_repo: Path) -> None:
 def test_smoke_review_reports_progress(sample_repo: Path) -> None:
     """验证审查前的三个阶段都有进度输出。"""
     result = subprocess.run(
-        ["prism", "review", "--base", "main", "--head", "feature"],
+        ["prism", "review", "--path", str(sample_repo), "--base", "main", "--head", "feature"],
         cwd=sample_repo,
         capture_output=True,
         text=True,
@@ -98,7 +98,7 @@ def test_smoke_review_without_api_key_fails_clearly(sample_repo: Path) -> None:
     # 继承当前环境（保住 venv 的 PATH），只摘掉 API key
     env = {key: value for key, value in os.environ.items() if key != API_KEY_ENV}
     result = subprocess.run(
-        ["prism", "review", "--base", "main", "--head", "feature"],
+        ["prism", "review", "--path", str(sample_repo), "--base", "main", "--head", "feature"],
         cwd=sample_repo,
         capture_output=True,
         text=True,

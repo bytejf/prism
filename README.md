@@ -17,11 +17,15 @@ uv sync
 export DEEPSEEK_API_KEY=sk-...
 
 # 先干跑一遍看清范围（不花钱、不调用 LLM）
-prism group --base main --head origin/some-branch
+prism group --path ~/Projects/some-repo --base main --head origin/some-branch
 
 # 确认后再真审
-prism review --base main --head origin/some-branch
+prism review --path ~/Projects/some-repo --base main --head origin/some-branch
 ```
+
+`--path` 是**必填**的，指向被审查的 git 仓库；不给会直接报错。
+刻意不做「默认当前目录」：审查会花 token、会把代码发给外部 API，
+少敲一个参数就审错仓库的代价比多敲一个大。
 
 `review` 的输出：
 
@@ -60,8 +64,8 @@ high: 4 | medium: 1 | low: 0
 |------|------|
 | `prism review` | diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染 |
 
-带 `--base` / `--head` 选项（默认 `main` / `HEAD`）。完整命令清单与参数见
-`prism --help`。
+所有命令都要 `--path` 指定被审查仓库，另有 `--base` / `--head`（默认
+`main` / `HEAD`）。完整命令清单与参数见 `prism --help`。
 
 ## 环境变量
 
