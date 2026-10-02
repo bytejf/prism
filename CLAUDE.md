@@ -77,6 +77,15 @@ per step`，整组审查崩掉（实测 21 轮里有 8 轮是并行调用）。
 
 **不使用已废弃的 API**（尤其 `langchain-classic` 包）；其余尽量用框架，别自己重造。
 
+v1 的「框架味」在 **`langchain` 包**（agents / middleware），不在 `langchain-core`
+——后者只是底座。反方向也要警惕：`langchain` 已把 chains 移到 `langchain-classic`，
+所以把流水线包成 LCEL 链是往 v1 弱化的方向走。
+
+## 代码约定
+
+注释、docstring、提交信息、设计文档**一律用中文**；`models/` 下**一个模型一个文件**。
+`ruff check .` + `mypy src tests` 是硬门槛，改完必须全绿（配置见 `pyproject.toml`）。
+
 ## 模型与成本（DeepSeek）
 
 - **思考模式默认开启、默认档位 `high`** —— 不显式配就是一直在按最贵档付费。
@@ -116,7 +125,10 @@ PyCharm：Environment variables 填 `PRISM_LOG_LEVEL=INFO`，Additional Argument
 
 - `~/Projects/python/prism-min-test` —— 2 个 Go 文件、6 个 hunk、**单审查单元**，
   约 5 轮收尾。`NOTES.md` 列了埋的 6 处问题，专供走查与断点调试
-- `~/Projects/python/prism-tests` —— 多组、覆盖边缘情况；改过 Go 文件后跑 `./regen-diff.sh`
+- `~/Projects/python/prism-tests` —— 多组、覆盖边缘情况。它维护三个 diff 产物
+  （`diff.txt` / `diff-U0.txt` / `diff-stat.txt`，在 `.gitignore` 里）供**人工研读**，
+  所以**改过它的 Go 文件或切过分支之后必须跑 `./regen-diff.sh`**，否则读到的是过期 diff
+- `~/Projects/golang/open-code-review`（OCR）—— 大样本对账，用于规模类问题
 
 ```bash
 PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
@@ -130,5 +142,7 @@ PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
   - 6 = 实现与 1~5 不符之处，按「文档缺口 / 文档写错 / 前提失效 / 工程取舍 / 文档不一致」五类分
   - 7 = 设计复盘，含 20 条踩坑清单与「共性」归纳
 - **那个目录不在 git 里**，别试图提交
+
+- **实现发生变更后要同步 6 / 7**：改完代码就顺手记一笔，别攒着
 
 实现与文档不符时，**记进 6 / 7，不要回头改 1~5**。
