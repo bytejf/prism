@@ -44,7 +44,7 @@ high: 4 | medium: 1 | low: 0
 
 ## 命令
 
-全部命令都在**当前工作目录**这个 git 仓库里运行，以 `merge-base(base, head)`
+全部命令都用 `--path` 指定被审查的 git 仓库，以它的 `merge-base(base, head)`
 为基准比较，只统计 PR 实际引入的改动。
 
 ### 审查前流程（确定性，不调用 LLM）
