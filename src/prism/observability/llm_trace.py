@@ -40,10 +40,11 @@
 状态会串到下一组审查去。所以改成类，由 `build_review_agent` 每组造一个。
 """
 
+import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -52,6 +53,7 @@ from langchain.agents.middleware import (
     ToolCallRequest,
 )
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
@@ -125,6 +127,50 @@ def _format_usage(message: AIMessage, prev_input_tokens: int | None) -> str:
     finish = message.response_metadata.get("finish_reason")
     if finish:
         lines.append(f"finish_reason {finish}")
+    return "\n".join(lines)
+
+
+def _tool_schema(tool: BaseTool) -> dict[str, Any]:
+    """取工具的参数 schema。
+
+    `tool_call_schema` 的类型是 pydantic v1/v2 模型或 dict 的联合，框架没写窄，
+    所以这里运行时按能力取。
+
+    Args:
+        tool: 工具
+
+    Returns:
+        JSON Schema 字典；取不到时为空字典
+    """
+    schema = getattr(tool, "tool_call_schema", None)
+    if isinstance(schema, dict):
+        return schema
+    build = getattr(schema, "model_json_schema", None)
+    if callable(build):
+        return cast("dict[str, Any]", build())
+    return {}
+
+
+def _describe_tool(tool: BaseTool | dict[str, Any]) -> str:
+    """渲染一个工具的完整定义。
+
+    **参数打原始 JSON 而不是转成表格**：`report_hunks` 的参数里有嵌套的
+    `$defs`，拍平成「名字 / 类型 / 必填」会把嵌套结构丢掉 —— 而模型看到的是
+    完整的 schema，日志要跟着它走。
+
+    Args:
+        tool: 工具，或已经是字典形式的工具定义
+
+    Returns:
+        多行文本
+    """
+    if not isinstance(tool, BaseTool):
+        # 框架也允许直接给 dict 形式的工具定义，原样打
+        return json.dumps(tool, ensure_ascii=False, indent=2)
+
+    lines = [f"name: {tool.name}", f"description: {tool.description or EMPTY}"]
+    if schema := _tool_schema(tool):
+        lines += ["", "parameters:", json.dumps(schema, ensure_ascii=False, indent=2)]
     return "\n".join(lines)
 
 
@@ -227,6 +273,7 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
         if not self._config_logged:
             self._config_logged = True
             self._log_config(request)
+            self._log_tools(request)
             system_message = request.system_message
             if system_message is not None:
                 logger.info("system\n%s", fields(("message", str(system_message.content))))
@@ -268,10 +315,32 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
                             f" · temperature={getattr(model, 'temperature', '?')}",
                             f"max_retries={getattr(model, 'max_retries', '?')}"
                             f" · timeout={getattr(model, 'request_timeout', '?')}",
-                            f"tools({len(request.tools)})="
-                            + ", ".join(str(getattr(tool, "name", tool)) for tool in request.tools),
+                            f"tools={len(request.tools)} 个（定义见下一条）",
                         ]
                     ),
+                )
+            ),
+        )
+
+    def _log_tools(self, request: ModelRequest[Any]) -> None:
+        """打一次工具定义。
+
+        工具和模型配置一样是**一次审查只打一次**的静态量 —— 但它决定了模型
+        「能用什么、怎么用」，调工具相关的问题（模型不调、调错参数、描述写得
+        有歧义）第一眼要看的就是它。
+
+        Args:
+            request: 模型调用请求
+        """
+        if not request.tools:
+            return
+        logger.info(
+            "工具定义 · %d 个\n%s",
+            len(request.tools),
+            fields(
+                *(
+                    (f"tool_{index}", _describe_tool(tool))
+                    for index, tool in enumerate(request.tools, start=1)
                 )
             ),
         )

@@ -61,6 +61,10 @@ class HunkReportArg(BaseModel):
     comments: list[CommentArg] = Field(default_factory=list, description="评论列表，可为空")
 
 
+# 这里**故意不加** `parse_docstring=True`：它会把 `Notes:` 段从工具描述里剥掉，
+# 而那段正是「已完成的 hunk 会被拒绝重复报告、没审完要用 complete=false」的规则，
+# 模型必须看到。参数说明由 `HunkReportArg` / `CommentArg` 的 Field 提供，
+# 嵌套字段的 9 条描述一条不少 —— 不开也已经够用。
 @tool
 def report_hunks(
     reports: list[HunkReportArg],

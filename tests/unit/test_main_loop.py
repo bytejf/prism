@@ -438,6 +438,33 @@ def test_main_loop_exits_on_no_progress(project_root: str) -> None:
     assert result.round_count == 8
 
 
+def test_plain_text_after_tool_call_does_not_end_loop(project_root: str) -> None:
+    """测试「先调工具、再返回纯文本」时循环不会提前结束。
+
+    回归用例：`_last_tool_calls` 曾从后往前找**任意**一条带 tool_calls 的消息。
+    纯文本响应的 `tool_calls` 是空列表（假值），于是它继续往前翻、翻到了上一轮
+    的调用 —— `review_pacing` 误判「这轮有工具调用」，既不注入提醒也不
+    `jump_to="model"`，框架按默认的「没调工具就结束」收尾，
+    而我们的三个退出条件（end_done / 轮次耗尽 / 连续无产出）一个都不满足，
+    `exit_reason_of` 返回 None，整个审查以 ValueError 崩掉。
+
+    这条路径要「纯文本紧跟在一次工具调用之后」才会走到，所以常态跑不出来 ——
+    实测在真实审查里偶发过一次，表现为 `ValueError: 读不出 exit_reason`。
+    """
+    llm = ScriptedChatModel(
+        responses=[
+            report_call(["H-01"]),  # 调工具
+            ai_text(),  # 纯文本 —— 旧实现在这里把循环结束掉
+            report_call(["H-02"]),
+            done_call(),
+        ]
+    )
+    result = run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_END_DONE
+    assert result.round_count == 4, "纯文本那一轮被当成「有工具调用」，循环提前结束了"
+
+
 def test_main_loop_exits_on_no_progress_for_plain_text(project_root: str) -> None:
     """测试纯文本输出也算无产出。
 

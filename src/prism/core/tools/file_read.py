@@ -22,7 +22,11 @@ MAX_LINES = 500
 TRUNCATED_HINT = "（已截断：单次最多读取 {max_lines} 行）"
 
 
-@tool
+# parse_docstring=True：把 docstring 里 `Args:` 的逐条说明填进参数 schema。
+# 默认是 False —— 不开的话**模型看不到任何参数说明**，我们写在 docstring 里的
+# 「文件相对路径」「1-based」一个字都传不出去（实测：3 个参数有描述的 0 个）。
+# 顺带把 `Args:` / `Returns:` 段从工具描述里剥掉，模型只看到摘要那一段。
+@tool(parse_docstring=True)
 def file_read(
     path: str,
     start_line: int,

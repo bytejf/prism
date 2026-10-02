@@ -25,7 +25,8 @@ TIMEOUT_SECONDS = 30
 RC_NO_MATCH = 1
 
 
-@tool
+# parse_docstring=True 的理由同 file_read：不开的话参数说明传不到模型
+@tool(parse_docstring=True)
 def code_search(
     pattern: str,
     runtime: ToolRuntime[ReviewContext, ReviewState],

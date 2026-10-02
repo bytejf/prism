@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langchain.agents.middleware import after_model, before_model
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from prism.core.agent.state import (
     NO_PROGRESS_EXIT_ROUNDS,
@@ -125,20 +125,26 @@ def should_exit(state: ReviewState, *, end_done_count: int | None = None) -> boo
 
 
 def _last_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
-    """取最近一条带 tool_calls 的消息里的调用列表。
+    """取**最近一条 AI 消息**的调用列表。
 
-    工具跑完后消息尾部是 ToolMessage，要知道本轮调了什么得往上找那条 AI 消息。
+    工具跑完后消息尾部是 ToolMessage，要知道本轮调了什么得往上找那条 AI 消息
+    —— 但**必须停在遇到的第一条 AI 消息上**，不能继续往前翻。
+
+    之前是「找最近一条 tool_calls 非空的消息」，于是纯文本响应（`tool_calls`
+    是空列表，假值）会被跳过、翻到上一轮的调用上去。后果：`review_pacing`
+    误判「这轮有工具调用」，既不注入推进提醒也不 `jump_to="model"`，
+    框架按默认的「没调工具就结束」收尾，而三个退出条件一个都不满足 ——
+    整个审查以 `ValueError: 读不出 exit_reason` 崩掉。
 
     Args:
         messages: 消息历史
 
     Returns:
-        工具调用列表；找不到时为空列表
+        工具调用列表；历史里没有 AI 消息时为空列表
     """
     for message in reversed(messages):
-        calls = getattr(message, "tool_calls", None)
-        if calls:
-            return [dict(call) for call in calls]
+        if isinstance(message, AIMessage):
+            return [dict(call) for call in message.tool_calls]
     return []
 
 
