@@ -13,11 +13,26 @@
 那个项目是独立于本仓库的 git 仓库（`main` 是干净版，`feature` 是改动版），
 不在本仓库里 —— 主仓库跟踪不了嵌套仓库。
 
-跑法（真实调用 DeepSeek，会花钱；`-s` 是必须的，下面靠 print 打出每一段）：
+跑法（真实调用 DeepSeek，会花钱）：
 
-    uv run pytest tests/e2e/test_min_walkthrough.py -s
+    uv run pytest tests/e2e/test_min_walkthrough.py --log-cli-level=INFO
 
 想只看审查前流程、不花钱：在 `[4/4]` 那行打个断点，跑到就停。
+
+## 为什么必须加 `--log-cli-level=INFO`
+
+不加的话，`logger.info(...)` **一条都不会出现在控制台**，只有 `print` 能看见 ——
+因为 pytest 的 logging 插件会把根 logger 上的 handler 换成自己的捕获 handler，
+我们的 `basicConfig` 装的 StreamHandler 被摘掉了。日志进了 pytest 的缓冲区，
+只在用例失败时以「Captured log call」的形式打出来。
+
+`-s` **救不了**：它关的是 stdout/stderr 捕获，跟 logging 插件是两回事。
+
+加上 `--log-cli-level=INFO` 之后，`observability/llm_trace.py` 每轮的请求/响应
+轨迹会实时打到控制台，配合断点最直观。
+
+PyCharm：Run/Debug Configurations → 选中该用例的配置 →
+**Additional Arguments** 填 `--log-cli-level=INFO`。
 """
 
 import os
