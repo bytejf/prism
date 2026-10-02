@@ -39,7 +39,7 @@ from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
 from prism.core.tools.report_hunks import report_hunks
 from prism.models.grouping import Group
-from prism.observability.llm_trace import trace_model_call
+from prism.observability.llm_trace import ReviewTrace
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +93,10 @@ def build_review_agent(model: BaseChatModel, max_rounds: int) -> Agent:
                 list[AgentMiddleware[Any, Any, Any]],
                 [
                     # 可观测性放最外层：它包住的是「真正发给模型的请求」，
-                    # 排在语义中间件后面才能看到它们改完之后的最终形态
-                    trace_model_call,
+                    # 排在语义中间件后面才能看到它们改完之后的最终形态。
+                    # 每组审查新建一个实例 —— 它持有跨轮次的状态（已打过的
+                    # 消息数、上一轮输入 token），共用实例会串到下一组去
+                    ReviewTrace(),
                     review_progress,
                     review_pacing,
                     # 轮次上限：框架自带，不用自己数

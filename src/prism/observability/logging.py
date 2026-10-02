@@ -1,45 +1,128 @@
 """日志配置模块。
 
-提供统一的日志初始化，从环境变量 PRISM_LOG_LEVEL 读取日志级别。
-V1 使用 Python 标准库 `logging` + `rich` 渲染，阶段 4 接入 Langfuse 后本模块继续保留。
+提供两件事：
 
-## 为什么用 RichHandler
+- `setup_logging()`：初始化，日志级别从 `PRISM_LOG_LEVEL` 读
+- `PrismHandler`：把日志渲染成 ``时间 级别 [短路径:行号] 消息``
 
-1. **多行消息不会糊在一起。** 一条 `llm_trace` 记录就二十多行，用标准
-   `StreamHandler` 时下一条的抬头紧贴着上一条的末尾，看不出记录边界。
-   RichHandler 把续行缩进到消息列对齐，时间戳那一栏留空，一眼能看出
-   「这条记录到哪结束」。
-2. **颜色闸门是现成的**，且与业界共识一致：`NO_COLOR` > `FORCE_COLOR` >
-   isatty 判定 > `TERM=dumb`。实测重定向到文件时输出零 ANSI 转义，
-   `NO_COLOR=1` 时只剩粗体、颜色被剥掉。
-3. **只给级别上色**，消息正文保持原样 —— 正文染色会让 `grep` 和重定向都坏掉。
-4. 右侧的 `file.py:line` 还是一个 **OSC-8 超链接**，显示短名、点开是完整路径。
+## 格式约定
+
+    14:23:45.123 INFO [core/diff/loader.py:135] Loaded 2 files, 6 hunks (+4/-16)
+
+- 时间到**毫秒**；级别与路径都**不做对齐** —— 对齐会让字段之间出现大段空白，
+  而且路径长度一变整列就歪，不如单空格紧凑
+- **短路径**相对包根（`src/prism/`）计算，比绝对路径短，又保留目录结构。
+  包外调用方（测试、脚本）只留文件名
+- **每条日志之间空一行** —— 多行日志（LLM 上下文那种）不空行会糊成一片，
+  看不出这条记录到哪结束
+
+## 为什么自己写 Handler
+
+不用 rich 的 `RichHandler`：它的版面是硬编码的（时间 + 级别 | 正文 |
+右对齐路径），改不了。但**颜色闸门继续用 rich 的 `Console`** ——
+`NO_COLOR` / `FORCE_COLOR` / isatty / `TERM=dumb` 是现成的，实测重定向到文件时
+输出零 ANSI 转义，`NO_COLOR=1` 时颜色被剥掉、只剩粗体。
 
 ## 两个必须显式设的开关（都是实测踩出来的）
 
-- `console=Console(stderr=True)`：`RichHandler()` **默认写 stdout**，
-  而 stdout 是留给审查结果的。不改的话 `prism review > out.txt` 会把日志一起写进去。
-- `markup=False`：默认开着 rich 标记解析，日志里的 `[high · 并发安全]`
-  会被当成标记**整段吃掉**（实测真的消失了）。
+- ``Console(stderr=True)``：日志走 stderr，stdout 留给审查结果
+- ``Console(soft_wrap=True)``：**关掉折行**。rich 默认在终端宽度处插入真换行，
+  而 LLM 上下文的正文是「原生的具体内容」，被折了复制回模型就不是原文了
 """
 
 import logging
 import os
+from datetime import datetime
+from pathlib import Path
 
 from rich.console import Console
-from rich.logging import RichHandler
-
-# 时间 / 级别 / 路径都由 RichHandler 渲染，模板只负责消息本身
-LOG_FORMAT = "%(message)s"
-
-# 时间精确到秒即可：一次审查几十秒，带上日期纯属噪声
-LOG_TIME_FORMAT = "%H:%M:%S"
+from rich.text import Text
 
 # 默认日志级别，PRISM_LOG_LEVEL 未设置或取值非法时使用
 DEFAULT_LEVEL = "INFO"
 
 # 本项目自己的 logger 走这个命名空间，第三方库不受 PRISM_LOG_LEVEL 影响
 PRISM_LOGGER = "prism"
+
+# 级别配色，沿用 uvicorn 那套
+LEVEL_STYLES = {
+    "DEBUG": "cyan",
+    "INFO": "green",
+    "WARNING": "yellow",
+    "ERROR": "red",
+    "CRITICAL": "bright_red",
+}
+
+PATH_STYLE = "dim cyan"
+TIME_STYLE = "dim"
+
+# 包根：src/prism/observability/logging.py 往上数两级
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def short_path(pathname: str) -> str:
+    """把源码绝对路径压成相对包根的短路径。
+
+    Args:
+        pathname: ``record.pathname``，通常是绝对路径
+
+    Returns:
+        ``core/diff/loader.py`` 这样的短路径；不在包内时退化为文件名
+    """
+    path = Path(pathname)
+    try:
+        return str(path.resolve().relative_to(_PACKAGE_ROOT))
+    except ValueError:
+        return path.name
+
+
+def _timestamp(created: float) -> str:
+    """把 LogRecord 的创建时间格式化成毫秒精度。
+
+    `logging` 的 `datefmt` 走 `time.strftime`，不支持 `%f`，所以自己拼。
+
+    Args:
+        created: ``record.created``（Unix 时间戳）
+
+    Returns:
+        ``14:23:45.123``
+    """
+    moment = datetime.fromtimestamp(created)
+    return f"{moment:%H:%M:%S}.{moment.microsecond // 1000:03d}"
+
+
+class PrismHandler(logging.Handler):
+    """按本项目的格式渲染日志的 handler。
+
+    版面：``时间 级别 [短路径:行号] 消息``，每条记录之后补一个空行。
+    """
+
+    def __init__(self, console: Console | None = None) -> None:
+        """初始化。
+
+        Args:
+            console: rich 控制台；不传时用「stderr + 不折行」的默认配置
+        """
+        super().__init__()
+        self._console = console or Console(stderr=True, soft_wrap=True)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """渲染并输出一条日志。
+
+        Args:
+            record: 日志记录
+        """
+        try:
+            text = Text()
+            text.append(f"{_timestamp(record.created)} ", style=TIME_STYLE)
+            text.append(f"{record.levelname} ", style=LEVEL_STYLES.get(record.levelname))
+            text.append(f"[{short_path(record.pathname)}:{record.lineno}]", style=PATH_STYLE)
+            text.append(f" {record.getMessage()}")
+            self._console.print(text)
+            # 每条日志之间空一行，多行记录才不会糊在一起
+            self._console.print()
+        except Exception:
+            self.handleError(record)
 
 
 def resolve_level(name: str | None) -> int:
@@ -55,27 +138,6 @@ def resolve_level(name: str | None) -> int:
     return level if isinstance(level, int) else logging.INFO
 
 
-def build_handler() -> RichHandler:
-    """构造日志 handler。
-
-    Returns:
-        配置好的 RichHandler（写 stderr、关 markup、右侧显示 file:line）
-    """
-    handler = RichHandler(
-        # 日志走 stderr，stdout 留给审查结果
-        console=Console(stderr=True),
-        # 关掉标记解析，否则 `[high · 并发安全]` 这类方括号会被吃掉
-        markup=False,
-        # 右侧显示 file.py:line，定位用
-        show_path=True,
-        # 只影响 logger.exception；未捕获的异常不走 logging，另由 Python 打印
-        rich_tracebacks=True,
-        log_time_format=LOG_TIME_FORMAT,
-    )
-    handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    return handler
-
-
 def setup_logging() -> None:
     """初始化日志配置。
 
@@ -86,5 +148,5 @@ def setup_logging() -> None:
 
     重复调用无副作用（basicConfig 在已有 handler 时为空操作）。
     """
-    logging.basicConfig(level=logging.WARNING, handlers=[build_handler()])
+    logging.basicConfig(level=logging.WARNING, handlers=[PrismHandler()])
     logging.getLogger(PRISM_LOGGER).setLevel(resolve_level(os.getenv("PRISM_LOG_LEVEL")))

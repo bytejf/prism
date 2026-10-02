@@ -1,178 +1,316 @@
-"""每轮模型调用的可观测性中间件。
+"""LLM 上下文与响应的可观测性。
 
-`create_agent` 造出来的图是个黑盒：提示词写错了、历史膨胀了、缓存没命中，
-从外面看不出来。这个中间件挂在模型调用外面，把**本轮**的请求与响应原样打出来。
+`create_agent` 造出来的图是个黑盒：提示词写错了、历史膨胀了、缓存没命中、
+思考档位开得过高，从外面全看不见。这里把每次模型调用的上下文与响应打出来。
 
-打什么、为什么这么打：
+## 一条消息 = 一条日志
 
-- **system 段**：每轮长度都一样，全量重打是浪费，但有内容要校验，所以打全文
-- **历史消息**：打「条数 + 每条 role/长度」，一眼看出历史有没有异常膨胀
-- **最后一条消息全文**：它是本轮真正新增的那条（工具结果、进度快照、提醒）
-- **响应**：正文、工具调用、思考正文、token（输入/输出/缓存/思考）
+    14:23:45.433 INFO [observability/llm_trace.py:184] ai · 轮次=1 · 耗时 8421ms
+    <content>
+    （空）
 
-轮次编号由「历史里已有的 AIMessage 条数 + 1」推出来，不从 agent 状态里读 ——
-这样本模块不需要 import 任何 prism 的东西，observability 不会反向依赖业务层。
+    <reasoning_content>
+    diff 里 Label 的索引看着不对，先把整个文件读出来确认边界。
 
-日志走 stderr（`observability/logging.py` 统一配置），stdout 留给审查结果。
+    <tool_calls>
+    file_read(path='format.go', start_line=1, end_line=30)
+
+    <usage>
+    in 1701 / out 92 / total 1793 / reasoning 41
+    finish_reason tool_calls
+
+标签可以扩展 —— 加字段就往 `fields()` 里多塞一项，不用改渲染。
+
+## 只打「变化的部分」
+
+不做「每轮重打全量上下文」：30 轮循环里那是 O(n²) 的日志量。
+所以按**产生者**打，而不是按请求打：
+
+| 消息 | 谁打 |
+|---|---|
+| system 提示词、模型配置 | `ReviewTrace.wrap_model_call`，首次调用时 |
+| 新增的 user / ai 消息 | `ReviewTrace.wrap_model_call`，逐条比对已打过的下标 |
+| 工具结果 | `ReviewTrace.wrap_tool_call`（顺带测工具执行耗时） |
+| 中间件注入的 user（进度快照 / 提醒） | 也走 `wrap_model_call` —— 它们在下一次请求里才出现 |
+
+## 为什么是类式中间件
+
+`ReviewTrace` 持有跨轮次的状态（已打过的消息数、上一轮的输入 token）。
+用 `@wrap_model_call` 装饰模块级函数的话，**所有 agent 共用一个实例**，
+状态会串到下一组审查去。所以改成类，由 `build_review_agent` 每组造一个。
 """
 
-import json
 import logging
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Sequence
 from typing import Any
 
-from langchain.agents.middleware import ModelRequest, ModelResponse, wrap_model_call
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    ModelRequest,
+    ModelResponse,
+    ToolCallRequest,
+)
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
 
-# 单段正文的打印上限（字符）。prompt 校验需要看到内容，但整份 diff 可能上万字符，
-# 不设上限会把日志冲垮。要完整内容就调到足够大，比如 PRISM_LOG_LEVEL=DEBUG 配合调大本值。
-MAX_BODY_CHARS = 8000
-
-# 消息摘要行里正文长度的列宽
-_WIDTH = 7
+# 字段为空时的占位。省略字段就看不出「确实没有」，统一打占位更清楚
+EMPTY = "（空）"
 
 
-def _clip(text: str) -> str:
-    """截断过长正文，并标注原始长度。
+def fields(*items: tuple[str, str]) -> str:
+    """把若干「标签 + 内容」拼成正文块。
+
+    字段为空也照样打标签 —— 统一比省略好读。
 
     Args:
-        text: 原始文本
+        *items: ``(标签名, 内容)`` 序列
 
     Returns:
-        截断后的文本
+        形如 ``<content>\\nA\\n\\n<tool_calls>\\nC`` 的正文
     """
-    if len(text) <= MAX_BODY_CHARS:
-        return text
-    return f"{text[:MAX_BODY_CHARS]}…（共 {len(text)} 字符，已截断）"
+    return "\n\n".join(f"<{tag}>\n{content or EMPTY}" for tag, content in items)
 
 
-def _summarize(message: BaseMessage) -> str:
-    """生成一条消息的摘要行。
+def _format_tool_calls(message: AIMessage) -> str:
+    """把一次响应里的工具调用渲染成 ``名字(参数)`` 逐行。
+
+    用 Python 关键字风格而不是原始 JSON：模型发过来的 JSON 在日志里带一堆转义，
+    没法读。`!r` 保证值仍可原样还原。
 
     Args:
-        message: 消息
+        message: AI 消息
 
     Returns:
-        形如 ``ai       210  tool_calls=report_hunks`` 的一行
+        每个调用一行；没有调用时返回空串
     """
-    parts = [f"{message.type:<8}", f"{len(str(message.content)):>{_WIDTH}}"]
-    if isinstance(message, AIMessage) and message.tool_calls:
-        names = ",".join(str(call.get("name", "?")) for call in message.tool_calls)
-        parts.append(f"tool_calls={names}")
-    return "  ".join(parts)
-
-
-def _describe_request(request: ModelRequest[Any]) -> str:
-    """描述本轮发给模型的请求。
-
-    Args:
-        request: 模型调用请求
-
-    Returns:
-        多行文本
-    """
-    lines = [f"model   : {getattr(request.model, 'model_name', type(request.model).__name__)}"]
-
-    system_message = request.system_message
-    if system_message is not None:
-        lines.append(f"system  : {len(str(system_message.content))} 字符")
-
-    lines.append(f"messages: {len(request.messages)} 条")
-    lines.extend(
-        f"  [{index}] {_summarize(message)}" for index, message in enumerate(request.messages)
-    )
-
-    if request.messages:
-        lines.append("--- 最后一条（本轮新增）---")
-        lines.append(_clip(str(request.messages[-1].content)))
-
-    if system_message is not None:
-        lines.append("--- system ---")
-        lines.append(_clip(str(system_message.content)))
-
+    lines = []
+    for call in message.tool_calls:
+        args = ", ".join(f"{key}={value!r}" for key, value in call.get("args", {}).items())
+        lines.append(f"{call.get('name', '?')}({args})")
     return "\n".join(lines)
 
 
-def _format_usage(message: AIMessage) -> str:
-    """格式化 token 消耗。
+def _format_usage(message: AIMessage, prev_input_tokens: int | None) -> str:
+    """渲染 token 消耗。
+
+    输入 token 带**环比增量** —— 历史膨胀是成本的大头，单看绝对值看不出来。
 
     Args:
-        message: 模型返回的 AI 消息（只有它带 usage_metadata）
+        message: AI 消息
+        prev_input_tokens: 上一轮的输入 token；首轮为 None
 
     Returns:
-        形如 ``in=8421 out=312 total=8733 | cache_read=7936 | reasoning=180`` 的文本
+        两行文本：token 明细 + ``finish_reason``
     """
     usage = message.usage_metadata
     if not usage:
-        return "（无）"
+        return ""
 
+    input_tokens = usage.get("input_tokens", 0)
+    delta = f" ({input_tokens - prev_input_tokens:+d})" if prev_input_tokens is not None else ""
     parts = [
-        f"in={usage.get('input_tokens', 0)}",
-        f"out={usage.get('output_tokens', 0)}",
-        f"total={usage.get('total_tokens', 0)}",
+        f"in {input_tokens}{delta}",
+        f"out {usage.get('output_tokens', 0)}",
+        f"total {usage.get('total_tokens', 0)}",
     ]
     if cache_read := (usage.get("input_token_details") or {}).get("cache_read"):
-        parts.append(f"cache_read={cache_read}")
+        parts.append(f"cache_read {cache_read}")
     if reasoning := (usage.get("output_token_details") or {}).get("reasoning"):
-        parts.append(f"reasoning={reasoning}")
-    return " | ".join(parts)
+        parts.append(f"reasoning {reasoning}")
 
-
-def _describe_response(response: ModelResponse[Any]) -> str:
-    """描述模型本轮返回的内容。
-
-    Args:
-        response: 模型调用响应
-
-    Returns:
-        多行文本
-    """
-    if not response.result:
-        return "（无消息）"
-
-    message = response.result[-1]
-    content = str(message.content)
-    lines = [f"content : {_clip(content) if content else '（空）'}"]
-
-    # usage / 工具调用 / 思考内容都只在 AI 消息上，非 AI 时只打正文
-    if isinstance(message, AIMessage):
-        if message.tool_calls:
-            lines.append("tools   :")
-            for call in message.tool_calls:
-                args = json.dumps(call.get("args", {}), ensure_ascii=False)
-                lines.append(f"  {call.get('name', '?')}({_clip(args)})")
-
-        reasoning = message.additional_kwargs.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning:
-            lines.append(f"思考    : {_clip(reasoning)}")
-
-        lines.append(f"usage   : {_format_usage(message)}")
-
+    lines = [" / ".join(parts)]
+    finish = message.response_metadata.get("finish_reason")
+    if finish:
+        lines.append(f"finish_reason {finish}")
     return "\n".join(lines)
 
 
-@wrap_model_call(name="LLMTrace")
-def trace_model_call(
-    request: ModelRequest[Any],
-    handler: Callable[[ModelRequest[Any]], ModelResponse[Any]],
-) -> ModelResponse[Any]:
-    """打印本轮模型调用的请求与响应。
-
-    轮次 = 历史里已有的 AIMessage 条数 + 1（第 n 次调用前恰好有 n-1 条 AI 消息）。
+def _ai_count(messages: Sequence[BaseMessage]) -> int:
+    """数历史里有几条 AI 消息 —— 它就是已完成的轮次数。
 
     Args:
-        request: 模型调用请求
-        handler: 真正的模型调用
+        messages: 消息历史
 
     Returns:
-        模型调用响应（原样透传）
+        AI 消息条数
     """
-    round_no = 1 + sum(1 for message in request.messages if isinstance(message, AIMessage))
+    return sum(1 for message in messages if isinstance(message, AIMessage))
 
-    logger.info("──── LLM 请求 #%d ────\n%s", round_no, _describe_request(request))
-    response = handler(request)
-    logger.info("──── LLM 响应 #%d ────\n%s", round_no, _describe_response(response))
 
-    return response
+class ReviewTrace(AgentMiddleware[Any, Any, Any]):
+    """一次审查的轨迹中间件。
+
+    状态是**按实例**的：`build_review_agent` 每组审查造一个，所以多个组之间
+    不会串。
+    """
+
+    def __init__(self) -> None:
+        """初始化。"""
+        super().__init__()
+        self._logged = 0
+        # 首轮没有「上一轮」，环比增量从第二轮开始
+        self._prev_input_tokens: int | None = None
+        self._config_logged = False
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], ModelResponse[Any]],
+    ) -> ModelResponse[Any]:
+        """打本轮新增的上下文，然后调用模型并打响应。
+
+        Args:
+            request: 模型调用请求
+            handler: 真正的模型调用
+
+        Returns:
+            模型调用响应（原样透传）
+        """
+        self._log_request(request)
+
+        started = time.monotonic()
+        response = handler(request)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        round_no = _ai_count(request.messages) + 1
+        for message in response.result:
+            if isinstance(message, AIMessage):
+                self._log_response(message, round_no=round_no, elapsed_ms=elapsed_ms)
+                usage = message.usage_metadata
+                # 记下来给下一轮算环比增量
+                self._prev_input_tokens = usage.get("input_tokens") if usage else None
+        return response
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        """执行工具，并把结果与其耗时打出来。
+
+        Args:
+            request: 工具调用请求
+            handler: 真正的工具调用
+
+        Returns:
+            工具的返回（原样透传）
+        """
+        started = time.monotonic()
+        result = handler(request)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        for message in _tool_messages(result):
+            logger.info(
+                "tool · 轮次=%d · %s · 执行 %dms · 结果 %d 字符\n%s",
+                _ai_count(request.state["messages"]),
+                # name 是 ToolCall 的必填键，直接取下标
+                request.tool_call["name"],
+                elapsed_ms,
+                len(str(message.content)),
+                fields(("message", str(message.content))),
+            )
+        return result
+
+    def _log_request(self, request: ModelRequest[Any]) -> None:
+        """打本轮相对上次新增的上下文。
+
+        **只打请求侧的消息**（user / 注入的提醒）。AI 响应由 `wrap_model_call`
+        的响应路径打、工具结果由 `wrap_tool_call` 打（那里才有耗时）——
+        不跳过的话它们会在下一次请求里被当成「新增消息」再打一遍。
+
+        Args:
+            request: 模型调用请求
+        """
+        if not self._config_logged:
+            self._config_logged = True
+            self._log_config(request)
+            system_message = request.system_message
+            if system_message is not None:
+                logger.info("system\n%s", fields(("message", str(system_message.content))))
+
+        for index, message in enumerate(request.messages[self._logged :], start=self._logged):
+            if isinstance(message, (AIMessage, ToolMessage)):
+                continue
+            is_new = index == len(request.messages) - 1
+            role = "user" if message.type == "human" else message.type
+            # 轮次 = 这条消息属于第几次请求。数**它前面**的 AI 消息，
+            # 不包含它自己 —— 否则首轮 user 会算成第 0 轮
+            logger.info(
+                "%s · 轮次=%d%s\n%s",
+                role,
+                _ai_count(request.messages[:index]) + 1,
+                " · 本轮新增" if is_new else "",
+                fields(("message", str(message.content))),
+            )
+        self._logged = len(request.messages)
+
+    def _log_config(self, request: ModelRequest[Any]) -> None:
+        """打一次模型配置。
+
+        一次审查只打一次，成本极低，但排查「是不是档位开高了」时最先要看的就是它。
+
+        Args:
+            request: 模型调用请求
+        """
+        model = request.model
+        logger.info(
+            "模型配置\n%s",
+            fields(
+                (
+                    "config",
+                    "\n".join(
+                        [
+                            f"model={getattr(model, 'model_name', type(model).__name__)}"
+                            f" · effort={getattr(model, 'reasoning_effort', '?')}"
+                            f" · temperature={getattr(model, 'temperature', '?')}",
+                            f"max_retries={getattr(model, 'max_retries', '?')}"
+                            f" · timeout={getattr(model, 'request_timeout', '?')}",
+                            f"tools({len(request.tools)})="
+                            + ", ".join(str(getattr(tool, "name", tool)) for tool in request.tools),
+                        ]
+                    ),
+                )
+            ),
+        )
+
+    def _log_response(self, message: AIMessage, *, round_no: int, elapsed_ms: int) -> None:
+        """打一次模型响应。
+
+        Args:
+            message: 模型返回的 AI 消息
+            round_no: 轮次
+            elapsed_ms: 本次调用耗时
+        """
+        reasoning = message.additional_kwargs.get("reasoning_content")
+        logger.info(
+            "ai · 轮次=%d · 耗时 %dms\n%s",
+            round_no,
+            elapsed_ms,
+            fields(
+                ("content", str(message.content)),
+                ("reasoning_content", reasoning if isinstance(reasoning, str) else ""),
+                ("tool_calls", _format_tool_calls(message)),
+                ("usage", _format_usage(message, self._prev_input_tokens)),
+            ),
+        )
+
+
+def _tool_messages(result: ToolMessage | Command[Any]) -> list[ToolMessage]:
+    """从工具返回里取出要打的消息。
+
+    写状态的工具返回 `Command`，ToolMessage 藏在 `update["messages"]` 里。
+
+    Args:
+        result: 工具的原始返回
+
+    Returns:
+        ToolMessage 列表；取不到时为空
+    """
+    if isinstance(result, ToolMessage):
+        return [result]
+    update = getattr(result, "update", None) or {}
+    messages = update.get("messages") if isinstance(update, dict) else None
+    return [item for item in messages or [] if isinstance(item, ToolMessage)]
