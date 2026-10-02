@@ -15,31 +15,38 @@
 
 跑法（真实调用 DeepSeek，会花钱）：
 
-    PRISM_LOG_LEVEL=DEBUG uv run pytest tests/e2e/test_min_walkthrough.py -s
+    PRISM_LOG_LEVEL=INFO uv run pytest tests/e2e/test_min_walkthrough.py -s
 
 想只看审查前流程、不花钱：在 `[4/4]` 那行打个断点，跑到就停。
 
-## 日志怎么看
+## 日志怎么看：两个开关都要给
 
-**必须设 `PRISM_LOG_LEVEL`** —— conftest 里那个 autouse 夹具看到它才会把 rich
-的 handler 挂到 `prism` logger 上。不设的话只有 `print` 能看到，`logger.info(...)`
-一条都不会出现。
+    环境变量 PRISM_LOG_LEVEL=INFO     ← 开日志（conftest 夹具看到它才挂 handler）
+    命令行   -s                       ← 关 pytest 捕获（否则日志被吞）
 
-原因是 pytest 的 logging 插件会把**根 logger** 的 handler 换成自己的捕获 handler，
-`setup_logging()` 用 `basicConfig` 装的 StreamHandler 被摘掉，日志只进缓冲区、
-只在用例失败时以「Captured log call」打出来。**`-s` 救不了** —— 它关的是
-stdout/stderr 捕获，跟 logging 插件是两回事。夹具绕过这一点的办法是把 handler
-挂在 `prism` logger 上，那个不在 pytest 的替换范围内。
+少任何一个都**看不到**，而且都是静默的。conftest 的
+`pytest_collection_finish` 会在收集阶段自诊断这两种错配，直接告诉你差哪一步。
 
-PyCharm：Run/Debug Configurations → 选中该用例的配置 →
-**Environment variables** 填 `PRISM_LOG_LEVEL=DEBUG`。
+两个都被需要的原因不同：
 
-## 另两个顺手的旋钮
+- 不给 `PRISM_LOG_LEVEL`：pytest 的 logging 插件会把**根 logger** 的 handler
+  换成自己的捕获 handler，我们装的那个被摘掉
+- 不给 `-s`：pytest 的捕获是 **fd 级**的（`dup2` 重定向 fd 2），连
+  `sys.__stderr__` 都一起吞 —— 绕不过去，只能关掉捕获
 
-- **`COLUMNS`**：rich 在非终端环境下按 80 列折行（PyCharm 的控制台就被判成非终端）。
-  嫌折得难看就在同一处设 `COLUMNS=160`。
-- **`--log-cli-level=INFO`**：只对**第三方库**（httpx / openai）的日志有用。
-  我们自己的日志走上一条路，不需要它。
+PyCharm：Run/Debug Configurations → 选中该用例的配置 → **Environment variables**
+填 `PRISM_LOG_LEVEL=INFO`，**Additional Arguments** 加上 `-s`。
+
+## 别用 `--log-cli-level`
+
+它走的是 **pytest 自己的格式**（`级别 logger名:文件:行号`），和项目约定的
+`时间 级别 [短路径:行号]` 完全是两回事 —— 而且它不需要 `-s`，所以很容易
+「看起来有日志」但格式全错。conftest 检测到它会直接提示。
+
+## 一个顺手的旋钮
+
+**`COLUMNS`**：rich 在非终端环境下按 80 列折行（PyCharm 的控制台就被判成非终端）。
+嫌折得难看就在同一处设 `COLUMNS=120`。
 """
 
 import os
