@@ -21,12 +21,19 @@ from prism.core.agent.state import ReviewState, end_done_verdict, pending_ids
 logger = logging.getLogger(__name__)
 
 
-@tool
+# 工具装饰器的形态约定与「为什么不能用 args_schema」，见 file_read.py
+@tool(
+    parse_docstring=True,
+    description=(
+        "结束审查。只有所有 hunk 都标记为 complete 时才能结束；"
+        "有未完成的 hunk 时会返回拒绝消息并提示剩余 hunk。"
+    ),
+)
 def end_done(runtime: ToolRuntime[ReviewContext, ReviewState]) -> Command[Any]:
     """结束审查。
 
-    只有所有 hunk 都标记为 complete 时才能结束。
-    如果有未完成的 hunk，返回拒绝消息，提示剩余 hunk。
+    描述走上面的 `description=` —— 以前它把本 docstring 整段（含 `Args:` /
+    `Returns:`）发给了模型，是纯噪声。本工具没有模型可见的参数。
 
     Args:
         runtime: 运行时（框架注入，模型看不到）

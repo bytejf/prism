@@ -44,7 +44,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from typing import Any, cast
+from typing import Any
 
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -54,6 +54,7 @@ from langchain.agents.middleware import (
 )
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
@@ -130,33 +131,36 @@ def _format_usage(message: AIMessage, prev_input_tokens: int | None) -> str:
     return "\n".join(lines)
 
 
-def _tool_schema(tool: BaseTool) -> dict[str, Any]:
-    """取工具的参数 schema。
+def _wire_definition(tool: BaseTool | dict[str, Any]) -> dict[str, Any]:
+    """取工具**真正发给模型**的那份定义。
 
-    `tool_call_schema` 的类型是 pydantic v1/v2 模型或 dict 的联合，框架没写窄，
-    所以这里运行时按能力取。
+    不能拿 `tool_call_schema.model_json_schema()` 来对账 —— 那是 Pydantic 转成
+    OpenAI 格式**之前**的形态。框架的出站转换还会做三件事：
+
+    - 剥掉所有 `title`
+    - 剥掉 `parameters` 顶层的 `description`
+    - 把嵌套模型的 `$defs` + `$ref` **内联展开**
+
+    实测 `report_hunks` 两份差 2000 vs 1279 字节，`end_done` 差 236 vs 36 ——
+    拿转换前的视图核「模型看到了什么」，结论会是错的。
 
     Args:
-        tool: 工具
+        tool: 工具，或已经是字典形式的工具定义
 
     Returns:
-        JSON Schema 字典；取不到时为空字典
+        `{"type": "function", "function": {...}}` 形式的定义
     """
-    schema = getattr(tool, "tool_call_schema", None)
-    if isinstance(schema, dict):
-        return schema
-    build = getattr(schema, "model_json_schema", None)
-    if callable(build):
-        return cast("dict[str, Any]", build())
-    return {}
+    if isinstance(tool, dict):
+        return tool
+    return convert_to_openai_tool(tool)
 
 
 def _describe_tool(tool: BaseTool | dict[str, Any]) -> str:
     """渲染一个工具的完整定义。
 
-    **参数打原始 JSON 而不是转成表格**：`report_hunks` 的参数里有嵌套的
-    `$defs`，拍平成「名字 / 类型 / 必填」会把嵌套结构丢掉 —— 而模型看到的是
-    完整的 schema，日志要跟着它走。
+    **参数打原始 JSON 而不是转成表格**：`report_hunks` 的参数是嵌套结构
+    （`reports` → `items` → `comments` → `items`），拍平成「名字 / 类型 / 必填」
+    会把层次丢掉 —— 而模型看到的是完整 schema，日志要跟着它走。
 
     Args:
         tool: 工具，或已经是字典形式的工具定义
@@ -164,13 +168,13 @@ def _describe_tool(tool: BaseTool | dict[str, Any]) -> str:
     Returns:
         多行文本
     """
-    if not isinstance(tool, BaseTool):
-        # 框架也允许直接给 dict 形式的工具定义，原样打
-        return json.dumps(tool, ensure_ascii=False, indent=2)
-
-    lines = [f"name: {tool.name}", f"description: {tool.description or EMPTY}"]
-    if schema := _tool_schema(tool):
-        lines += ["", "parameters:", json.dumps(schema, ensure_ascii=False, indent=2)]
+    function = _wire_definition(tool).get("function", {})
+    lines = [
+        f"name: {function.get('name') or EMPTY}",
+        f"description: {function.get('description') or EMPTY}",
+    ]
+    if parameters := function.get("parameters"):
+        lines += ["", "parameters:", json.dumps(parameters, ensure_ascii=False, indent=2)]
     return "\n".join(lines)
 
 

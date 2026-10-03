@@ -96,10 +96,18 @@ bug 藏了很久。**丢弃日志说错原因，比丢东西本身更难发现�
 | `create_agent` 的 `middleware` 参数只填了 `AgentMiddleware` 三个类型参数中的两个（漏 `ResponseT`），连它自带的 `ModelCallLimitMiddleware` 都过不了 mypy | `cast`，注释写明是框架签名问题 |
 | 四个 overload 都不把 `state_schema` / `context_schema` 串进返回类型，推出来是 `AgentState[Any]` / `Any` —— `invoke` 的 `context=` 传错也不报错 | `agent.py` 手写 `Agent` 别名（**比框架推出来的更精确**）+ 出参 `cast` |
 | `@wrap_model_call` / `@wrap_tool_call` 装饰**模块级函数**时，返回的中间件实例是**全局共享**的 | 用**类式中间件**，每组审查由 `build_review_agent` 造一个实例，跨轮次状态才不会串到下一组 |
-| `@tool` 的 **`parse_docstring` 默认 False** —— docstring 里 `Args:` 的参数说明**一个字都到不了模型** | 要参数描述就显式开；但开了会剥掉 `Notes:` 段，先确认那段的规则能挪走（`report_hunks` 就是为此没开） |
+| `@tool` 的 **`parse_docstring` 默认 False** —— docstring 里 `Args:` 的参数说明**一个字都到不了模型** | 四个工具统一 `@tool(parse_docstring=True, description="…")`：描述走 `description=`、参数说明走 docstring 的 `Args:` |
+| **`@tool(args_schema=...)` 会让 `runtime: ToolRuntime[...]` 注入失效** —— 显式给了 args_schema，框架就不再从函数签名推导，`runtime` 从 `get_input_schema()` 里消失，调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。**四个工具全吃 runtime，所以全都不能用 `args_schema`** | 一律不给 `args_schema`。嵌套结构（`report_hunks` 的 `reports`）靠**类型注解**表达，一样能出嵌套 schema |
+| `parse_docstring=True` + `args_schema=` 一起给时，工具描述会**静默变成参数模型的 docstring** | 同上：不给 `args_schema`。另注意**参数模型的 docstring 本身也会进 schema**，所以要写成给模型看的话，设计理由用 `#` 注释 |
+| 工具定义**入站**还要过一道转换：`convert_to_openai_tool` 会剥掉所有 `title`、剥掉参数顶层的 `description`、把 `$defs` + `$ref` **内联展开** | 日志与对账一律用 `convert_to_openai_tool(tool)["function"]`，别拿 `tool_call_schema.model_json_schema()`（那是转换前的，`report_hunks` 两份差 2000 vs 1279 字节） |
 | `recursion_limit` 按 **super-step** 算，`create_agent` 实测每轮约 **6.1** 步 | `max_rounds * 7 + 20` |
 
 **不使用已废弃的 API**（尤其 `langchain-classic` 包）；其余尽量用框架，别自己重造。
+
+**工具定义的形态约定**：四个工具一律 `@tool(parse_docstring=True, description="…")`。
+`description=` 是**给模型看的**那一段；docstring 的 `Args:` 是**参数说明的来源**；
+`Returns:` / `Notes:` 之类给开发者看的内容不会发出去（`Notes:` 要发就把内容并进 `description=`）。
+不要为了「都用 Pydantic」改用 `args_schema=` —— 见上表，它会让 `runtime` 注入失效。
 
 v1 的「框架味」在 **`langchain` 包**（agents / middleware），不在 `langchain-core`
 ——后者只是底座。反方向也要警惕：`langchain` 已把 chains 移到 `langchain-classic`，

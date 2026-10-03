@@ -25,8 +25,8 @@ TIMEOUT_SECONDS = 30
 RC_NO_MATCH = 1
 
 
-# parse_docstring=True 的理由同 file_read：不开的话参数说明传不到模型
-@tool(parse_docstring=True)
+# 工具装饰器的形态约定与「为什么不能用 args_schema」，见 file_read.py
+@tool(parse_docstring=True, description="按内容搜索代码。")
 def code_search(
     pattern: str,
     runtime: ToolRuntime[ReviewContext, ReviewState],
@@ -34,6 +34,9 @@ def code_search(
     max_results: int = 50,
 ) -> str:
     """按内容搜索代码。
+
+    下面 `Args:` 里的说明**就是模型看到的参数说明**；`runtime` 由框架注入、
+    模型看不到，会被自动排除。
 
     Args:
         pattern: 搜索模式（支持正则）

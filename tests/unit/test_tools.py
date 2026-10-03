@@ -11,10 +11,12 @@ from typing import Any, cast
 
 import pytest
 from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
 from pydantic import BaseModel, ValidationError
 
+from prism.core.agent.agent import build_tools
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
     STATUS_DONE,
@@ -31,8 +33,62 @@ from prism.core.tools.code_search import MAX_RESULTS, code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import MAX_LINES, file_read
 from prism.core.tools.report_hunks import report_hunks
+from prism.observability.llm_trace import _describe_tool
 
 CONTEXT_WITHOUT_ROOT = ReviewContext(project_root="")
+
+
+def test_tools_keep_runtime_injectable() -> None:
+    """测试四个工具都还能拿到 `runtime` 注入，且它不出现在模型看到的 schema 里。
+
+    回归用例：**不能改用 `args_schema=`**。显式给了它，框架就不再从函数签名
+    推导，`runtime` 会从 `get_input_schema()` 里消失 —— 注入断掉，调用时报
+    `TypeError: missing 1 required positional argument: 'runtime'`。
+    """
+    for item in build_tools():
+        # get_input_schema 的返回类型是 pydantic v1/v2 模型的联合，框架没写窄
+        input_schema = cast(type[BaseModel], item.get_input_schema())
+        assert "runtime" in input_schema.model_fields, item.name
+        parameters = convert_to_openai_tool(item)["function"]["parameters"]
+        assert "runtime" not in parameters.get("properties", {}), item.name
+
+
+def test_tool_descriptions_are_only_for_the_model() -> None:
+    """测试描述里没有 `Args:` / `Returns:` / `Notes:` 段。
+
+    回归用例：那三段是**写给开发者看**的，整段发给模型是纯噪声 ——
+    实测 `end_done` 的描述 175 字符里有 110 个是它们。
+    """
+    for item in build_tools():
+        description = convert_to_openai_tool(item)["function"]["description"]
+        assert description, item.name
+        for section in ("Args:", "Returns:", "Notes:"):
+            assert section not in description, f"{item.name} 的描述里混进了 {section}"
+
+
+def test_tool_parameters_are_all_described() -> None:
+    """测试每个模型可见的参数都有说明 —— 参数摆到模型面前，它才不用猜。"""
+    for item in build_tools():
+        properties = convert_to_openai_tool(item)["function"]["parameters"].get("properties", {})
+        for name, spec in properties.items():
+            assert spec.get("description"), f"{item.name}.{name} 缺说明"
+
+
+def test_describe_tool_logs_what_the_model_actually_gets() -> None:
+    """测试日志打的是**转换之后**的 schema，与线上逐字节一致。
+
+    回归用例：以前打 `tool_call_schema.model_json_schema()`，那是 Pydantic 转成
+    OpenAI 格式**之前**的形态 —— 带 `title`、带参数顶层的 `description`、
+    嵌套模型还是 `$defs` + `$ref`。而框架出去前会剥掉前两个、内联后两个，
+    拿它核「模型看到了什么」会得出错的结论。
+    """
+    for item in build_tools():
+        text = _describe_tool(item)
+        assert "$defs" not in text, item.name
+        assert "$ref" not in text, item.name
+        assert '"title"' not in text, item.name
+        # 描述整段在，且与线上一致
+        assert item.description in text, item.name
 
 
 def make_state(*hunk_ids: str) -> ReviewState:

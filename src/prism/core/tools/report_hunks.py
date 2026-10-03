@@ -31,12 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 class CommentArg(BaseModel):
-    """LLM 报告的单条评论。
+    """LLM 报告的单条评论。"""
 
-    字段说明就是模型看到的 schema —— 用 `list[dict]` 时模型只能靠 docstring 猜，
-    实测 55% 的评论漏填 severity，渲染成 `[类别 · ]`。
-    """
-
+    # 类 docstring 会成为 schema 里的 description，**是模型看得到的**，所以只写
+    # 一句给模型看的话；下面这条设计理由用注释写，别写进 docstring。
+    #
+    # 为什么把字段做成显式模型而不是 list[dict]：前者把字段说明摆到模型面前，
+    # 实测 severity 漏填率 55% → 0（渲染成 `[类别 · ]` 的那批评论没有了）。
     severity: Literal["high", "medium", "low"] = Field(
         description=(
             "严重程度，必填。high=会导致错误/崩溃/数据损坏；"
@@ -61,18 +62,27 @@ class HunkReportArg(BaseModel):
     comments: list[CommentArg] = Field(default_factory=list, description="评论列表，可为空")
 
 
-# 这里**故意不加** `parse_docstring=True`：它会把 `Notes:` 段从工具描述里剥掉，
-# 而那段正是「已完成的 hunk 会被拒绝重复报告、没审完要用 complete=false」的规则，
-# 模型必须看到。参数说明由 `HunkReportArg` / `CommentArg` 的 Field 提供，
-# 嵌套字段的 9 条描述一条不少 —— 不开也已经够用。
-@tool
+# 工具装饰器的形态约定与「为什么不能用 args_schema」，见 file_read.py。
+#
+# 描述里第 2 句是从 docstring 的 `Notes:` 段搬过来的：那条规则模型必须看到，
+# 而 `parse_docstring=True` 会把 `Notes:` 剥掉，所以改成显式 `description=`。
+@tool(
+    parse_docstring=True,
+    description=(
+        "报告 hunk 的审查结论。\n"
+        "已标记 complete 的 hunk 会被拒绝重复报告（本次报告整体忽略）；"
+        "一个 hunk 只想补充评论、还没审完时，用 complete=false 报告。"
+    ),
+)
 def report_hunks(
     reports: list[HunkReportArg],
     runtime: ToolRuntime[ReviewContext, ReviewState],
 ) -> Command[Any]:
     """报告 hunk 的审查结论。
 
-    参数结构由 `HunkReportArg` / `CommentArg` 定义，模型直接看到那份 schema。
+    `reports` 的说明走下面的 `Args:`，**嵌套字段的说明走 `HunkReportArg` /
+    `CommentArg` 的 `Field`** —— 嵌套结构只能由 Pydantic 模型表达。
+    `runtime` 由框架注入、模型看不到，会被自动排除。
 
     Args:
         reports: hunk 报告列表
@@ -80,10 +90,6 @@ def report_hunks(
 
     Returns:
         状态更新（新 hunk 状态表 + 新评论 + 进度文本的 ToolMessage）
-
-    Notes:
-        已标记 complete 的 hunk 会被拒绝重复报告（本次报告整体忽略）。
-        一个 hunk 只想补充评论、还没审完时，请用 complete=false 报告。
     """
     state = runtime.state
     hunk_status = dict(state["hunk_status"])

@@ -22,11 +22,14 @@ MAX_LINES = 500
 TRUNCATED_HINT = "（已截断：单次最多读取 {max_lines} 行）"
 
 
-# parse_docstring=True：把 docstring 里 `Args:` 的逐条说明填进参数 schema。
-# 默认是 False —— 不开的话**模型看不到任何参数说明**，我们写在 docstring 里的
-# 「文件相对路径」「1-based」一个字都传不出去（实测：3 个参数有描述的 0 个）。
-# 顺带把 `Args:` / `Returns:` 段从工具描述里剥掉，模型只看到摘要那一段。
-@tool(parse_docstring=True)
+# 工具装饰器四个统一成这个形态：**描述走 `description=`、参数说明走 docstring 的
+# `Args:`**（`parse_docstring=True` 把它填进参数 schema）。
+#
+# **别改用 `args_schema=`**：显式给了 args_schema，框架就不再从函数签名推导，
+# `runtime: ToolRuntime[...]` 会从 `get_input_schema()` 里消失、注入断掉，
+# 调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。
+# 详见 CLAUDE.md 的「框架缺口」。
+@tool(parse_docstring=True, description="读取文件指定行范围的内容。")
 def file_read(
     path: str,
     start_line: int,
@@ -34,6 +37,9 @@ def file_read(
     runtime: ToolRuntime[ReviewContext, ReviewState],
 ) -> str:
     """读取文件指定行范围的内容。
+
+    下面 `Args:` 里的说明**就是模型看到的参数说明**；`runtime` 由框架注入、
+    模型看不到，会被自动排除。
 
     Args:
         path: 文件相对路径
