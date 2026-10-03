@@ -349,8 +349,10 @@ def test_initial_state_builds_user_message_and_round_budget(project_root: str) -
     assert pending_ids(state["hunk_status"]) == ["H-01", "H-02"]
 
     user_text = str(state["messages"][0].content)
-    assert "审查范围" in user_text
-    assert "### 本组 diff" in user_text
+    assert "### 审查范围" in user_text
+    assert "<diff>" in user_text
+    # diff 块在前、要求块在后 —— 模型决策前最后读到的是一段短要求
+    assert user_text.index("<diff>") < user_text.index("### 审查要求")
 
 
 def test_build_tools_exposes_four_tools() -> None:

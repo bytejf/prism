@@ -1,7 +1,12 @@
 """静态指导组装。
 
-把审查单元（Group）渲染成一段静态指导文本，放在 user 消息的开头（diff 之前）。
-V1 不注入调用图、静态分析发现与规则；这四段全部是静态内容 + 本组 hunk 清单。
+把审查单元（Group）渲染成 user 消息的两块：**diff 块**（审查范围 + `<diff>`）
+与**要求块**（审查维度 + 工作方式 + 结束审查）。V1 不注入调用图、静态分析发现
+与规则。
+
+两块的分工按「数据 / 流程」来分：待审代码是有字段的数据，用 XML；要求是流程
+描述，用 markdown。**数据在前、要求在后** —— 模型决策前最后读到的是一段短要求，
+而不是还要翻过一整段 diff 才知道要审什么。
 
 **文本本身整块写在 `templates.py` 里**，这里只负责填变量 —— 这样一眼能看出
 LLM 收到的整体结构，而不是 `"\\n".join((...))` 一行一行拼。
@@ -10,57 +15,51 @@ LLM 收到的整体结构，而不是 `"\\n".join((...))` 一行一行拼。
 import logging
 from itertools import groupby
 
-from prism.core.ast.mapper import format_location, format_symbol
 from prism.core.guidance import templates as tpl
+from prism.models.ast import HunkWithSymbol
 from prism.models.grouping import Group
 
 logger = logging.getLogger(__name__)
 
 
-def build_guidance(group: Group) -> str:
-    """组装静态指导文本。
+def build_diff_block(group: Group) -> str:
+    """组装 diff 块：hunk 清单摘要 + 本组待审代码。
 
     Args:
         group: 审查单元
 
     Returns:
-        静态指导文本，包含审查范围、审查要求、报告节奏、结束审查
-    """
-    text = "\n\n".join(
-        (
-            _render_scope(group),
-            _render_dimensions(),
-            _render_pace(),
-            _render_finish(),
-        )
-    )
-    logger.debug(
-        "组装静态指导：%s（%d 个 hunk，%d 字符）", group.group_id, len(group.hunks), len(text)
-    )
-    return text
-
-
-def _render_scope(group: Group) -> str:
-    """渲染审查范围：hunk 编号区间 + 逐个 hunk 的位置与归属。
-
-    Args:
-        group: 审查单元
-
-    Returns:
-        审查范围段落
+        diff 块文本；本组没有 hunk 时只给一句说明
     """
     if not group.hunks:
         return tpl.SCOPE_EMPTY
 
-    listing = "\n\n".join(
-        f"{format_location(item)}\n  归属：{format_symbol(item.symbol)}" for item in group.hunks
-    )
     first, last = group.hunks[0].hunk_id, group.hunks[-1].hunk_id
-    return tpl.SCOPE.format(
+    text = tpl.SCOPE.format(
         span=first if first == last else f"{first} ~ {last}",
         count=len(group.hunks),
-        listing=listing,
+        files=len(group.files),
+        diff=_render_diff(group),
     )
+    logger.debug(
+        "组装 diff 块：%s（%d 个 hunk / %d 个文件，%d 字符）",
+        group.group_id,
+        len(group.hunks),
+        len(group.files),
+        len(text),
+    )
+    return text
+
+
+def build_requirements() -> str:
+    """组装要求块：审查维度 + 工作方式 + 结束审查。
+
+    三小段都是静态的，不随审查单元变化 —— 随组变化的东西全在 diff 块里。
+
+    Returns:
+        要求块文本
+    """
+    return "\n\n".join((_render_dimensions(), _render_workflow(), tpl.FINISH))
 
 
 def _render_dimensions() -> str:
@@ -75,51 +74,88 @@ def _render_dimensions() -> str:
     return tpl.DIMENSIONS.format(items=items)
 
 
-def _render_pace() -> str:
-    """渲染报告节奏段落。
+def _render_workflow() -> str:
+    """渲染工作方式段落（含报告节奏）。
 
     Returns:
-        报告节奏段落
+        工作方式段落
     """
-    return tpl.PACE.format(items="\n".join(tpl.REPORT_PACE))
+    return tpl.WORKFLOW_SECTION.format(items="\n".join(f"- {text}" for text in tpl.WORKFLOW))
 
 
-def _render_finish() -> str:
-    """渲染结束审查段落。
+def _render_diff(group: Group) -> str:
+    """把本组 hunk 渲染成 `<diff>` 块。
 
-    Returns:
-        结束审查段落
-    """
-    return tpl.FINISH
+    一个文件一个 `<file>`，文件内的 hunk 各自一个 `<hunk>`。**hunk 的位置、归属、
+    可读范围全部挂在标签属性上，正文里不再重复标一遍** —— 旧版在「审查范围」里
+    列一遍清单、又在 diff 正文里标一遍编号，模型得在两处之间来回对编号。
 
-
-def build_diff_text(group: Group) -> str:
-    """把本组 hunk 渲染成 diff 文本。
-
-    hunk 正文只有内容行（见 Hunk.content），这里为每个 hunk 补两样东西：
-
-    - 文件分隔行 `--- path ---`，按文件分组
-    - hunk 标记 `@@ H-01 path:6 @@`，既做边界分隔，又把 hunk 编号和位置直接
-      摆在正文旁边，模型调 report_hunks 时不用回头翻指导文本
-
-    标记内容全部来自我们自己的字段（改动行算出来的），不用 git 那段
-    「最近的前一个声明」—— 实测它 18~35% 的 hunk 会指错（见 parser._make_hunk）。
+    `group.hunks` 已按 (文件路径, 行号) 排序，同一文件的 hunk 是连续的，
+    一次 groupby 就够 —— 不必按文件反复过滤整个列表。
 
     Args:
         group: 审查单元
 
     Returns:
-        diff 文本，按文件分组
+        `<diff>` 块文本
     """
-    # group.hunks 已按 (文件路径, 行号) 排序，同一文件的 hunk 是连续的，
-    # 一次 groupby 就够 —— 不必按文件反复过滤整个列表
-    files = [
-        tpl.DIFF_FILE.format(
-            path=path,
-            hunks="\n".join(
-                f"@@ {format_location(item)} @@\n{item.part.content}" for item in hunks
-            ),
+    blocks: list[str] = ["<diff>"]
+    for path, grouped in groupby(group.hunks, key=lambda item: item.file_path):
+        hunks = list(grouped)
+        blocks.append(
+            tpl.DIFF_FILE.format(
+                path=path,
+                extra=_file_extra(hunks[0]),
+                hunks="\n".join(_render_hunk(item) for item in hunks),
+            )
         )
-        for path, hunks in groupby(group.hunks, key=lambda item: item.file_path)
-    ]
-    return "\n".join(files)
+    blocks.append("</diff>")
+    return "\n".join(blocks)
+
+
+def _file_extra(first: HunkWithSymbol) -> str:
+    """渲染 `<file>` 上的可选属性。
+
+    两个都只在特定形态下出现，所以做成可选属性而不是空值属性：出现即意味着
+    「这个文件改名了 / 被删了」，模型不用去比对属性值。
+
+    Args:
+        first: 该文件的第一个 hunk（文件级信息在同一个文件的每个 hunk 上都一样）
+
+    Returns:
+        ` deleted="true"` / ` renamed-from="..."` / 空串
+    """
+    if first.deleted:
+        return ' deleted="true"'
+    if first.renamed_from is not None:
+        return f' renamed-from="{first.renamed_from}"'
+    return ""
+
+
+def _render_hunk(item: HunkWithSymbol) -> str:
+    """渲染单个 `<hunk>`。
+
+    位置用 git 的 `起始行,行数` 写法而不是「起始行-结束行」：纯删除在新文件侧
+    是**空区间**（`6,0`），区间写法表达不了空区间，文件头纯删除更会退化成
+    「第 0 行」这种废坐标。`0` 在这个写法里天然就是「该侧没有内容」。
+
+    Args:
+        item: 带符号的 hunk
+
+    Returns:
+        `<hunk>` 标签文本
+    """
+    part = item.part
+    extra = ""
+    if item.head_lines is not None:
+        start, end = item.head_lines
+        extra = f' lines="{start}-{end}"'
+    return tpl.HUNK.format(
+        hunk_id=item.hunk_id,
+        old=f"{part.old_start},{part.old_lines}",
+        new=f"{part.new_start},{part.new_lines}",
+        symbol=item.symbol.name,
+        kind=item.symbol.kind,
+        extra=extra,
+        content=part.content,
+    )

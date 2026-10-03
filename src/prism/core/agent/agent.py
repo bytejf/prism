@@ -33,7 +33,7 @@ from prism.core.agent.state import (
     pending_ids,
 )
 from prism.core.guidance import templates as tpl
-from prism.core.guidance.builder import build_diff_text, build_guidance
+from prism.core.guidance.builder import build_diff_block, build_requirements
 from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
@@ -114,7 +114,7 @@ def initial_state(group: Group, max_rounds: int) -> ReviewState:
 
     提示词文本在 `guidance/templates.py` 里整块书写：
     system 段交给 `create_agent(system_prompt=...)`，
-    user 段（指导 + diff）作为首条用户消息。
+    user 段（diff 块 + 要求块）作为首条用户消息 —— **diff 在前、要求在后**。
 
     Args:
         group: 审查单元
@@ -124,8 +124,8 @@ def initial_state(group: Group, max_rounds: int) -> ReviewState:
         初始 ReviewState
     """
     user_text = tpl.USER.format(
-        guidance=build_guidance(group),
-        diff_text=build_diff_text(group),
+        diff_block=build_diff_block(group),
+        requirements=build_requirements(),
     )
     return ReviewState(
         messages=[HumanMessage(content=user_text)],
