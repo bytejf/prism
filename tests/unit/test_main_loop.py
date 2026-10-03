@@ -194,6 +194,9 @@ def make_group(hunk_ids: list[str], group_id: str = "group-001") -> Group:
             file_path="a.go",
             symbol=Symbol(name="Run", kind="function", start_line=1, end_line=9),
             hunk_id=hunk_id,
+            head_lines=(1, 9),
+            renamed_from=None,
+            deleted=False,
         )
         for hunk_id in hunk_ids
     ]

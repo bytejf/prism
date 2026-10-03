@@ -11,6 +11,7 @@ diff 用 `-U0` 生成（见 `loader.CONTEXT_LINES`），hunk 里只有改动行�
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 import pygit2
 
@@ -50,6 +51,23 @@ KIND_LABELS: dict[str, str] = {
 }
 
 
+class _AttributionSide(NamedTuple):
+    """一次归属该看哪一侧的符号表。
+
+    Attributes:
+        changed: 该侧的改动行号（1-based）
+        path: 该侧的路径。**改名时两侧不同** —— 被审查版本里是新名字，
+            基准版本里还是旧名字，查旧版符号表必须用旧路径
+        commit: 该侧的 commit
+        is_old: 是否为旧版侧
+    """
+
+    changed: list[int]
+    path: str
+    commit: pygit2.Commit
+    is_old: bool
+
+
 def map_hunks_to_symbols(
     repo_path: str | Path,
     base: str,
@@ -84,19 +102,47 @@ def map_hunks_to_symbols(
     cache: dict[tuple[str, bool], list[Symbol]] = {}
     results: list[HunkWithSymbol] = []
     counter = 0
-    dropped = 0
+    # 丢弃分两类记，**别合成一个数**：一类是正常噪声，另一类是路径对不上
+    # 的信号（文件改名后仍拿新路径去查旧版符号表就属于这类，曾导致
+    # 「重命名 + 纯删除」的 hunk 被静默丢掉）。合成一个数时，
+    # 后者的日志会写成前者的理由，排障直接跑偏。
+    outside_entity = 0
+    no_symbol_table = 0
 
     for diff in sorted(diffs, key=lambda item: item.path):
+        # 改名：两侧路径不同且既非新增也非删除。提示词里要告诉模型，
+        # 好让它去查调用方 / 文档里还写着旧名字的残留
+        renamed_from = (
+            diff.old_path
+            if not diff.is_new and not diff.is_deleted and diff.old_path != diff.new_path
+            else None
+        )
+
         for hunk in diff.hunks:
-            for part in _split_hunk(hunk, cache, repo, diff_base, head_commit, diff.path):
-                symbol = _symbol_of(cache, repo, diff_base, head_commit, diff.path, part)
-                # 没有符号的切片丢弃：改动只涉及 license 头这类「与声明隔了空行的
-                # 独立注释」或只涉及空行 —— 没有可审的实体，送进 LLM 只是噪音。
-                # 实测 8 个 OCR 分支 333 个 hunk 里 0 次命中，属于防御性过滤；
-                # 命中时打日志，避免静默丢改动。
-                if symbol is None:
-                    dropped += 1
+            for part in _split_hunk(hunk, diff, cache, repo, diff_base, head_commit):
+                side = _attribution_side(part, diff, diff_base, head_commit)
+                if side is None:
+                    no_symbol_table += 1
+                    logger.warning("hunk 两侧都没有改动行，无法归属：%s", diff.path)
                     continue
+                symbols = _file_symbols(cache, repo, side.commit, side.path, side.is_old)
+                if not symbols:
+                    no_symbol_table += 1
+                    logger.warning(
+                        "未归类 hunk：%s 在%s版里没有符号表（路径对不上？）",
+                        side.path,
+                        "旧" if side.is_old else "新",
+                    )
+                    continue
+
+                symbol = _first_owner(symbols, side.changed)
+                # 改动只涉及 license 头这类「与声明隔了空行的独立注释」或只涉及
+                # 空行 —— 没有可审的实体，送进 LLM 只是噪音。实测 8 个 OCR
+                # 分支 333 个 hunk 里 0 次命中，属于防御性过滤。
+                if symbol is None:
+                    outside_entity += 1
+                    continue
+
                 counter += 1
                 results.append(
                     HunkWithSymbol(
@@ -104,42 +150,108 @@ def map_hunks_to_symbols(
                         file_path=diff.path,
                         symbol=symbol,
                         hunk_id=f"{HUNK_ID_PREFIX}{counter:0{HUNK_ID_WIDTH}d}",
+                        head_lines=_head_lines(cache, repo, head_commit, diff.path, symbol),
+                        renamed_from=renamed_from,
+                        deleted=diff.is_deleted,
                     )
                 )
 
-    if dropped:
-        logger.info("丢弃 %d 个无归属 hunk（改动只涉及独立注释或空行）", dropped)
+    if outside_entity:
+        logger.info("丢弃 %d 个 hunk：改动落在所有实体之外（独立注释或空行）", outside_entity)
+    if no_symbol_table:
+        logger.warning("丢弃 %d 个 hunk：该侧查不到符号表，请检查路径", no_symbol_table)
+    dropped = outside_entity + no_symbol_table
     logger.info("映射完成：%d 个 hunk（原始 %d 个）", len(results), len(results) + dropped)
     return results
 
 
+def _head_lines(
+    cache: dict[tuple[str, bool], list[Symbol]],
+    repo: pygit2.Repository,
+    head_commit: pygit2.Commit,
+    path: str,
+    symbol: Symbol,
+) -> tuple[int, int] | None:
+    """按名字在被审查版本的符号表里重查归属符号的行号范围。
+
+    不能直接用 `symbol.start_line/end_line`：纯删除的 hunk 归属取自**旧版**
+    符号表，行号与被审查版本对不上（实测差值正好等于删除行数），而
+    `file_read` 读的是被审查版本 —— 拿旧坐标去读就是读到隔壁代码。
+
+    Args:
+        cache: 文件符号表缓存
+        repo: pygit2 仓库
+        head_commit: 被审查版本的 commit
+        path: 文件在被审查版本中的路径
+        symbol: 归属的符号（可能来自旧版符号表）
+
+    Returns:
+        (起始行, 结束行)；同名符号不在被审查版本里（被整体删除或改名）时返回 None
+    """
+    for candidate in _file_symbols(cache, repo, head_commit, path, side=False):
+        if candidate.name == symbol.name:
+            return candidate.start_line, candidate.end_line
+    logger.debug("符号 %s 不在被审查版本 %s 中，不给行号范围", symbol.name, path)
+    return None
+
+
+def _attribution_side(
+    part: Hunk,
+    diff: Diff,
+    base_commit: pygit2.Commit,
+    head_commit: pygit2.Commit,
+) -> _AttributionSide | None:
+    """挑出该 hunk 片归属要看哪一侧。
+
+    有新增行 → 新版侧；纯删除 → 旧版侧。**旧版侧必须用 `diff.old_path`**：
+    文件改过名时它在旧版树里还叫原来的名字，用新名字去查会得到空符号表，
+    整个 hunk 被当成「无归属」丢掉。
+
+    Args:
+        part: 待归属的 hunk 片
+        diff: 该文件在两侧的路径与状态
+        base_commit: 基准版本的 commit
+        head_commit: 被审查版本的 commit
+
+    Returns:
+        该看哪一侧；两侧都没有改动行时返回 None
+    """
+    added, removed = changed_lines(part)
+    if added:
+        return _AttributionSide(added, diff.path, head_commit, False)
+    if removed:
+        return _AttributionSide(removed, diff.old_path, base_commit, True)
+    return None
+
+
 def _split_hunk(
     hunk: Hunk,
+    diff: Diff,
     cache: dict[tuple[str, bool], list[Symbol]],
     repo: pygit2.Repository,
     base_commit: pygit2.Commit,
     head_commit: pygit2.Commit,
-    path: str,
 ) -> list[Hunk]:
     """按实体边界拆分单个 hunk。
 
     两侧符号表都给：`+` 行按新文件行号、`-` 行按旧文件行号各自查自己的表。
+    两侧的路径从 `diff` 分别取 —— 改名时它们不是同一个路径。
 
     Args:
         hunk: 待拆分的 hunk
+        diff: 该文件的 diff（提供两侧路径）
         cache: 文件符号表缓存
         repo: pygit2 仓库
         base_commit: merge-base 侧的 commit
         head_commit: head 侧的 commit
-        path: 文件路径
 
     Returns:
         子 hunk 列表
     """
     return split_by_symbol(
         hunk,
-        new_symbols=_file_symbols(cache, repo, head_commit, path, side=False),
-        old_symbols=_file_symbols(cache, repo, base_commit, path, side=True),
+        new_symbols=_file_symbols(cache, repo, head_commit, diff.path, side=False),
+        old_symbols=_file_symbols(cache, repo, base_commit, diff.old_path, side=True),
     )
 
 
@@ -306,44 +418,22 @@ def _owner_at(symbols: list[Symbol], line_no: int) -> Symbol | None:
     return None
 
 
-def _symbol_of(
-    cache: dict[tuple[str, bool], list[Symbol]],
-    repo: pygit2.Repository,
-    base_commit: pygit2.Commit,
-    head_commit: pygit2.Commit,
-    path: str,
-    part: Hunk,
-) -> Symbol | None:
-    """取 hunk 切片归属的符号。
+def _first_owner(symbols: list[Symbol], changed: list[int]) -> Symbol | None:
+    """取第一处落在实体里的改动行所属的符号。
 
-    有新增行 → 查新文件侧；纯删除 → 查旧文件侧；两侧都没有改动行 → 无归属。
-    同一片内所有改动行（同一侧）必然落在同一个实体里（见 split_by_symbol），
-    所以取**第一个有归属的**改动行即可 —— 不能只看第一个改动行：切片开头
-    可能先是空隙行（空行、独立注释），后面才是有归属的改动。
+    同一片内所有改动行必然落在同一个实体里（见 split_by_symbol），所以取
+    **第一个有归属的**改动行即可 —— 不能只看第一个改动行：切片开头可能
+    先是空隙行（空行、独立注释），后面才是有归属的改动。
     文档注释已经并进实体的行号范围（见 extractor._attach_comment_blocks），
     所以注释行直接就能命中，不需要额外落位。
 
     Args:
-        cache: 文件符号表缓存
-        repo: pygit2 仓库
-        base_commit: merge-base 侧的 commit
-        head_commit: head 侧的 commit
-        path: 文件路径
-        part: 待归属的 hunk 切片
+        symbols: 该侧的符号表
+        changed: 该侧的改动行号
 
     Returns:
-        归属的符号；切片无改动行或落不到实体上时返回 None
+        归属的符号；所有改动行都落在实体之外时返回 None
     """
-    added, removed = changed_lines(part)
-    if added:
-        symbols = _file_symbols(cache, repo, head_commit, path, side=False)
-        changed = added
-    elif removed:
-        symbols = _file_symbols(cache, repo, base_commit, path, side=True)
-        changed = removed
-    else:
-        return None
-
     for line_no in changed:
         if (symbol := _owner_at(symbols, line_no)) is not None:
             return symbol

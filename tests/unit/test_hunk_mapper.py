@@ -57,7 +57,15 @@ def make_item(hunk: Hunk, symbol: Symbol = DUMMY, hunk_id: str = "H-01") -> Hunk
     Returns:
         HunkWithSymbol 对象
     """
-    return HunkWithSymbol(part=hunk, file_path="a.go", symbol=symbol, hunk_id=hunk_id)
+    return HunkWithSymbol(
+        part=hunk,
+        file_path="a.go",
+        symbol=symbol,
+        hunk_id=hunk_id,
+        head_lines=(symbol.start_line, symbol.end_line),
+        renamed_from=None,
+        deleted=False,
+    )
 
 
 def test_display_range_prefers_new_side() -> None:
@@ -304,6 +312,106 @@ def test_map_hunks_deleted_file_uses_old_source(go_repo: Path, git: Callable[...
     assert mapped
     names = {item.symbol.name for item in mapped}
     assert {"Run", "Helper"} <= names
+
+
+# svc.go 去掉 `import "fmt"`(第 3 行)与它后面的空行，用来制造纯删除
+NO_IMPORT_GO = """package main
+
+func Run() {
+\tfmt.Println("start")
+}
+
+func Helper() {
+\tfmt.Println("help")
+}
+"""
+
+# svc.go 去掉 Run 的函数体（第 6 行），Run 本身保留
+EMPTY_RUN_GO = """package main
+
+import "fmt"
+
+func Run() {
+}
+
+func Helper() {
+\tfmt.Println("help")
+}
+"""
+
+
+def test_map_hunks_rename_plus_pure_deletion_uses_old_path(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """测试「重命名 + 纯删除」的 hunk 不会被丢掉。
+
+    回归用例：纯删除的 hunk 要查**旧版**符号表，而文件改过名之后它在旧版树里
+    还叫旧名字。此前旧版侧也拿新路径去查 → 符号表为空 → hunk 被当成「无归属」
+    静默丢弃（旧日志还会误报成「改动只涉及独立注释或空行」）。
+    """
+    git(go_repo, "checkout", "-q", "-b", "rn", "main")
+    git(go_repo, "mv", "svc.go", "moved.go")
+    (go_repo / "moved.go").write_text(NO_IMPORT_GO, encoding="utf-8")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "rename and delete")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "rn")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "rn", diffs)
+
+    assert [item.file_path for item in mapped] == ["moved.go"]
+    item = mapped[0]
+    # 删掉的是 import 那一行，归属只能取自旧版符号表（新版里它已经没了）
+    assert item.symbol.name == "import"
+    assert item.head_lines is None
+    # 文件级事实：新路径 + 旧路径都带上，模型才知道去查旧名字的残留
+    assert item.renamed_from == "svc.go"
+    assert item.deleted is False
+
+
+def test_map_hunks_records_file_level_facts(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试普通文件的 renamed_from / deleted 都是空。"""
+    diffs = filter_files(load_diffs(go_repo, "main", "feature")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "feature", diffs)
+
+    assert mapped
+    assert all(item.renamed_from is None for item in mapped)
+    assert all(item.deleted is False for item in mapped)
+
+
+def test_map_hunks_head_lines_track_the_reviewed_version(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """测试 head_lines 取自被审查版本，与 file_read 同坐标。
+
+    纯删除的 hunk 归属取自旧版符号表，行号与被审查版本对不上（差值正好等于
+    删除行数），所以必须按名字重查。这里 Run 旧版占 5~7 行、新版只占 5~6 行。
+    """
+    git(go_repo, "checkout", "-q", "-b", "shrink", "main")
+    (go_repo / "svc.go").write_text(EMPTY_RUN_GO, encoding="utf-8")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "shrink")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "shrink")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "shrink", diffs)
+
+    run = next(item for item in mapped if item.symbol.name == "Run")
+    assert (run.symbol.start_line, run.symbol.end_line) == (5, 7)
+    assert run.head_lines == (5, 6)
+
+
+def test_map_hunks_marks_deleted_file(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试整文件删除时每个 hunk 都带 deleted 标记。"""
+    git(go_repo, "checkout", "-q", "-b", "del", "feature")
+    git(go_repo, "rm", "-q", "svc.go")
+    git(go_repo, "commit", "-q", "-m", "del")
+
+    diffs = filter_files(load_diffs(go_repo, "feature", "del")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "feature", "del", diffs)
+
+    assert mapped
+    assert all(item.deleted for item in mapped)
+    # 整个文件都没了，所有符号在新版里都查不到
+    assert all(item.head_lines is None for item in mapped)
 
 
 def test_map_hunks_empty_diffs(go_repo: Path) -> None:

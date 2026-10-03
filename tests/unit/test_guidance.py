@@ -35,6 +35,9 @@ def make_hunk_with_symbol(
         file_path=file_path,
         symbol=symbol,
         hunk_id=hunk_id,
+        head_lines=(symbol.start_line, symbol.end_line),
+        renamed_from=None,
+        deleted=False,
     )
 
 

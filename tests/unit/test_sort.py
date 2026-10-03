@@ -62,6 +62,9 @@ def make_group(hunk_paths: dict[str, str]) -> Group:
             file_path=path,
             symbol=DUMMY_SYMBOL,
             hunk_id=hunk_id,
+            head_lines=(DUMMY_SYMBOL.start_line, DUMMY_SYMBOL.end_line),
+            renamed_from=None,
+            deleted=False,
         )
         for hunk_id, path in hunk_paths.items()
     ]

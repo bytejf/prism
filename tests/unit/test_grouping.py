@@ -38,6 +38,9 @@ def make_hunk_with_symbol(
         file_path=file_path,
         symbol=Symbol(name="Run", kind="function", start_line=1, end_line=9),
         hunk_id=hunk_id,
+        head_lines=(1, 9),
+        renamed_from=None,
+        deleted=False,
     )
 
 
