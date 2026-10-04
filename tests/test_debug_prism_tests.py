@@ -110,7 +110,7 @@ class ScriptedChatModel(BaseChatModel):
         """返回下一个脚本响应。
 
         Args:
-            messages: 本轮收到的完整消息历史（含指导文本、工具结果、agent_status）
+            messages: 本轮收到的完整消息历史（含指导文本、工具结果、review_status）
             stop: 停止词（忽略）
             run_manager: 回调管理器（忽略）
             **kwargs: 其余参数（忽略）
@@ -261,7 +261,7 @@ def test_debug_full_pipeline() -> None:
     result = run_review_agent(first_group, llm, str(PRISM_TESTS), HEAD_BRANCH)
     print(f"\n[6] 循环结束: exit_reason={result.exit_reason} 轮次={result.round_count}")
     print(f"    评论 {len(result.comments)} 条，未审 {result.pending_hunk_ids}")
-    print(f"    第二轮 LLM 收到的消息数: {len(llm.calls[1])}（含工具结果与 agent_status）")
+    print(f"    第二轮 LLM 收到的消息数: {len(llm.calls[1])}（含工具结果与 review_status）")
     assert result.exit_reason == "end_done"
     assert result.pending_hunk_ids == []
 

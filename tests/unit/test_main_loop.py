@@ -33,7 +33,7 @@ from prism.core.agent.state import (
     max_rounds_for,
     pending_ids,
 )
-from prism.core.agent.status import build_agent_status
+from prism.core.agent.status import build_review_status
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
@@ -361,10 +361,10 @@ def test_build_tools_exposes_four_tools() -> None:
     assert names == ["code_search", "end_done", "file_read", "report_hunks"]
 
 
-# ---------- agent_status ----------
+# ---------- review_status ----------
 
 
-def test_build_agent_status_reports_progress() -> None:
+def test_build_review_status_reports_progress() -> None:
     """测试进度快照的内容与格式。"""
     hunk_status = {
         "H-01": HunkStatus("H-01", STATUS_DONE),
@@ -372,15 +372,15 @@ def test_build_agent_status_reports_progress() -> None:
         "H-03": HunkStatus("H-03", STATUS_PENDING),
     }
 
-    status = build_agent_status(hunk_status)
-    assert "<agent_status>" in status
+    status = build_review_status(hunk_status)
+    assert "<review_status>" in status
     assert "### Hunk 审查进度（2/3 完成）" in status
     assert "H-01 — 无问题" in status
     assert "⏳ 待审查（1）：" in status
     assert "H-03" in status
 
 
-def test_build_agent_status_counts_severity() -> None:
+def test_build_review_status_counts_severity() -> None:
     """测试有问题的 hunk 按 severity 汇总。"""
     hunk_status = {
         "H-01": HunkStatus(
@@ -392,7 +392,7 @@ def test_build_agent_status_counts_severity() -> None:
             ],
         )
     }
-    status = build_agent_status(hunk_status)
+    status = build_review_status(hunk_status)
     assert "H-01 — 2 issues（high:1, medium:1）" in status
 
 
@@ -540,14 +540,14 @@ def test_main_loop_collects_comments(project_root: str) -> None:
     assert result.comments[0].category == "concurrency"
 
 
-def test_main_loop_injects_agent_status_after_report(project_root: str) -> None:
+def test_main_loop_injects_review_status_after_report(project_root: str) -> None:
     """测试 report_hunks 之后追加了进度快照消息。"""
     llm = ScriptedChatModel(responses=[report_call(["H-01"]), done_call()])
     run_review_agent(make_group(["H-01"]), llm, project_root)
 
-    # 第二轮调用 LLM 时，消息里应已含 agent_status
+    # 第二轮调用 LLM 时，消息里应已含 review_status
     second_round = llm.calls[1]
-    assert any("<agent_status>" in str(message.content) for message in second_round)
+    assert any("<review_status>" in str(message.content) for message in second_round)
 
 
 def test_main_loop_injects_reminder_on_plain_text(project_root: str) -> None:

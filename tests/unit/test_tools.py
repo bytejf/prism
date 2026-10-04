@@ -597,7 +597,7 @@ def test_report_hunks_ignores_unknown_hunk_id() -> None:
 def test_report_hunks_marks_incomplete_hunk_in_progress() -> None:
     """测试 complete=False 时置为「审查中」而不是 done。
 
-    这给了 STATUS_IN_PROGRESS 一条真实的产生路径，<agent_status> 的
+    这给了 STATUS_IN_PROGRESS 一条真实的产生路径，<review_status> 的
     「🔄 审查中」分组才有意义（否则永远是 0）。
     """
     tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))

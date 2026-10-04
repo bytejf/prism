@@ -30,7 +30,7 @@ from prism.core.agent.state import (
     end_done_verdict,
     pending_ids,
 )
-from prism.core.agent.status import build_agent_status
+from prism.core.agent.status import build_review_status
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +167,7 @@ def review_progress(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
 
     calls = _last_tool_calls(state["messages"])
     if any(str(call.get("name", "")) == "report_hunks" for call in calls):
-        updates["messages"] = [HumanMessage(content=build_agent_status(state["hunk_status"]))]
+        updates["messages"] = [HumanMessage(content=build_review_status(state["hunk_status"]))]
 
     reset = end_done_reset(state)
     if reset:

@@ -1,7 +1,11 @@
-"""`<agent_status>` 渲染。
+"""`<review_status>` 渲染。
 
 每次 report_hunks 调用后追加一条 user 消息，让 LLM 看到当前进度，
 避免重复报告已完成的 hunk 或漏审。
+
+hunk 进度的**唯一权威来源**就是本模块渲染的这条消息：它是代码确定性生成的，
+不会错。压缩摘要里的 `Completed Hunks` 段只是 LLM 写的历史快照，两者冲突时
+以本消息为准（见 `01-上下文压缩/9-上下文压缩.md` §3.2）。
 """
 
 from prism.core.agent.state import (
@@ -12,14 +16,14 @@ from prism.core.agent.state import (
 from prism.models.tool import CommentInput
 
 # 包住进度快照的标签
-STATUS_TAG_OPEN = "<agent_status>"
-STATUS_TAG_CLOSE = "</agent_status>"
+REVIEW_STATUS_TAG_OPEN = "<review_status>"
+REVIEW_STATUS_TAG_CLOSE = "</review_status>"
 
 # 进度提示语
 STATUS_FOOTER = "请确保所有 hunk 最终都标记为 complete。"
 
 
-def build_agent_status(hunk_status: dict[str, HunkStatus]) -> str:
+def build_review_status(hunk_status: dict[str, HunkStatus]) -> str:
     """渲染 hunk 审查进度快照。
 
     V1 只有 pending / done 两种状态流转，in_progress 分组固定为空，
@@ -29,7 +33,7 @@ def build_agent_status(hunk_status: dict[str, HunkStatus]) -> str:
         hunk_status: hunk 状态表
 
     Returns:
-        `<agent_status>...</agent_status>` 文本
+        `<review_status>...</review_status>` 文本
     """
     ordered = _sorted(hunk_status)
     done = [item for item in ordered if item.status == STATUS_DONE]
@@ -38,7 +42,7 @@ def build_agent_status(hunk_status: dict[str, HunkStatus]) -> str:
     pending = [item for item in ordered if item.status not in finished]
 
     lines = [
-        STATUS_TAG_OPEN,
+        REVIEW_STATUS_TAG_OPEN,
         f"### Hunk 审查进度（{len(done)}/{len(hunk_status)} 完成）",
         "",
         f"✅ 完成审查（{len(done)}）：",
@@ -54,7 +58,7 @@ def build_agent_status(hunk_status: dict[str, HunkStatus]) -> str:
     if pending:
         lines.append(f"  {', '.join(item.hunk_id for item in pending)}")
 
-    lines.extend(["", STATUS_FOOTER, STATUS_TAG_CLOSE])
+    lines.extend(["", STATUS_FOOTER, REVIEW_STATUS_TAG_CLOSE])
     return "\n".join(lines)
 
 
