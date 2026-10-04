@@ -152,12 +152,22 @@ def test_load_maps_every_value() -> None:
     assert settings.log.level == log_raw["level"]
 
 
-def test_context_window_comes_from_llm_section() -> None:
-    """测试：压缩的窗口取自 `[llm]`，不在 `[compression]` 里写第二遍。
+def test_context_window_comes_from_llm_section(tmp_path: Path) -> None:
+    """测试：压缩的窗口**跟着 `[llm]` 走**，不是一个独立的值。
 
-    写两遍就会有两份真相 —— 换模型时改了一处，压缩阈值还按旧窗口算。
+    注意不能只断言 `settings.compression.context_window == settings.llm.context_window`
+    —— 两边都等于默认的 1_000_000，把实现改成写死 `1_000_000` 它照样通过，
+    那就成了恒等式（**实测踩过**：按原来那种写法做变异测试不红）。
+
+    所以这里把 `[llm]` 的窗口改成一个**不可能被写死**的数，看压缩跟不跟。
     """
-    assert settings.compression.context_window == settings.llm.context_window
+    path = write_config(tmp_path, with_line("context_window = 1000000", "context_window = 123456"))
+
+    loaded = load(path)
+
+    assert loaded.llm.context_window == 123456
+    assert loaded.compression.context_window == 123456, "压缩的窗口应跟着 [llm] 走"
+    assert loaded.compression.usable_tokens == 123456 - loaded.compression.reserve_tokens
 
 
 def test_usable_tokens_is_sane() -> None:
