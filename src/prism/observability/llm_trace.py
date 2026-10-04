@@ -29,17 +29,22 @@
 | 消息 | 谁打 |
 |---|---|
 | system 提示词、模型配置 | `ReviewTrace.wrap_model_call`，首次调用时 |
-| 新增的 user / ai 消息 | `ReviewTrace.wrap_model_call`，逐条比对已打过的下标 |
+| 新增的 user / ai 消息 | `ReviewTrace.wrap_model_call`，逐条比对**已打过的消息编号** |
 | 工具结果 | `ReviewTrace.wrap_tool_call`（顺带测工具执行耗时） |
 | 中间件注入的 user（进度快照 / 提醒） | 也走 `wrap_model_call` —— 它们在下一次请求里才出现 |
 
-压缩（`core/agent/compression.py`）会让消息数**变小**，这是唯一一处「历史不在增长」
-的地方：`self._logged` 下标要跟着重置，轮次号则自己数（不能拿 AI 消息条数当轮次 ——
-压缩会把它们删掉）。
+**为什么按消息编号去重，而不是按「已打到第几条」的下标**：压缩
+（`core/agent/compression.py`）会把整段历史换掉，换完的消息数可能**恰好相等
+甚至更多**，下标比对判不出变化 —— 压缩后的摘要与进度快照会被静默跳过
+（实测踩到过）。按编号去重还顺带解决「压缩后要不要把 A 段重打一遍」：
+它编号没变，自然不重打。
+
+轮次号同理，自己数（`_round_no`），不数「历史里有几条 AI 消息」——
+压缩会把它们删掉，轮次号会从 12 掉回 1。
 
 ## 为什么是类式中间件
 
-`ReviewTrace` 持有跨轮次的状态（已打过的消息数、上一轮的输入 token）。
+`ReviewTrace` 持有跨轮次的状态（已打过的消息编号、上一轮的输入 token、轮次号）。
 用 `@wrap_model_call` 装饰模块级函数的话，**所有 agent 共用一个实例**，
 状态会串到下一组审查去。所以改成类，由 `build_review_agent` 每组造一个。
 """
@@ -47,7 +52,7 @@
 import json
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Any
 
 from langchain.agents.middleware import (
@@ -56,7 +61,7 @@ from langchain.agents.middleware import (
     ModelResponse,
     ToolCallRequest,
 )
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import Command
@@ -182,18 +187,6 @@ def _describe_tool(tool: BaseTool | dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _ai_count(messages: Sequence[BaseMessage]) -> int:
-    """数历史里有几条 AI 消息 —— 它就是已完成的轮次数。
-
-    Args:
-        messages: 消息历史
-
-    Returns:
-        AI 消息条数
-    """
-    return sum(1 for message in messages if isinstance(message, AIMessage))
-
-
 class ReviewTrace(AgentMiddleware[Any, Any, Any]):
     """一次审查的轨迹中间件。
 
@@ -204,7 +197,10 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
     def __init__(self) -> None:
         """初始化。"""
         super().__init__()
-        self._logged = 0
+        # 打过的消息编号。**不能用「已打到第几条」的下标** —— 压缩会把整段历史
+        # 换掉，换完的消息数可能**恰好相等甚至更多**，下标比对判不出变化，
+        # 压缩后的摘要与进度快照会被静默跳过（实测踩到过）
+        self._printed: set[str] = set()
         # 首轮没有「上一轮」，环比增量从第二轮开始
         self._prev_input_tokens: int | None = None
         self._config_logged = False
@@ -290,30 +286,27 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
             if system_message is not None:
                 logger.info("system\n%s", fields(("message", str(system_message.content))))
 
-        if len(request.messages) < self._logged:
-            # 压缩把历史换成了「摘要 + 新进度」，消息数会**变小**。
-            # 不重置的话 `self._logged` 永远超过长度，切片恒为空 ——
-            # 后面每一轮的上下文都不再打日志，而且是静默的
-            logger.info(
-                "上下文被压缩：消息数 %d → %d，重新开始记录", self._logged, len(request.messages)
-            )
-            self._logged = 0
-
-        for index, message in enumerate(request.messages[self._logged :], start=self._logged):
-            if isinstance(message, (AIMessage, ToolMessage)):
+        for index, message in enumerate(request.messages):
+            if message.id is not None and message.id in self._printed:
                 continue
-            is_new = index == len(request.messages) - 1
+            if message.id is not None:
+                self._printed.add(message.id)
+            if isinstance(message, (AIMessage, ToolMessage)):
+                # 这两类由各自的路径打：响应在 wrap_model_call 的返回侧、
+                # 工具结果在 wrap_tool_call 里（那里才有耗时）。标记成已打过，
+                # 免得它们在下一次请求里被当成「新增消息」再打一遍
+                continue
             role = "user" if message.type == "human" else message.type
-            # 轮次 = 这条消息属于第几次请求。数**它前面**的 AI 消息，
-            # 不包含它自己 —— 否则首轮 user 会算成第 0 轮
             logger.info(
                 "%s · 轮次=%d%s\n%s",
                 role,
-                _ai_count(request.messages[:index]) + 1,
-                " · 本轮新增" if is_new else "",
+                # 轮次 = 这条消息属于第几次请求。它一定是在**上一次响应之后**才出现的，
+                # 所以是本轮（`_round_no` 是已完成的轮数，加一即当前轮）。
+                # 不能数「它前面有几条 AI 消息」—— 压缩会把那些 AI 消息删掉，轮次号会跳
+                self._round_no + 1,
+                " · 本轮新增" if index == len(request.messages) - 1 else "",
                 fields(("message", str(message.content))),
             )
-        self._logged = len(request.messages)
 
     def _log_config(self, request: ModelRequest[Any]) -> None:
         """打一次模型配置。

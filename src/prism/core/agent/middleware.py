@@ -193,16 +193,6 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         """
         updates: dict[str, Any] = {}
 
-        if self._compressor is not None and self._compressor.should_compress(state["messages"]):
-            # 压缩会自己追加一份最新的 <review_status>，所以这里不再重复注入快照
-            updates["messages"] = self._compressor.compress(state["messages"], state["hunk_status"])
-        else:
-            calls = _last_tool_calls(state["messages"])
-            if any(str(call.get("name", "")) == "report_hunks" for call in calls):
-                updates["messages"] = [
-                    HumanMessage(content=build_review_status(state["hunk_status"]))
-                ]
-
         reset = end_done_reset(state)
         if reset:
             logger.debug("新审完 hunk，重置 end_done 纠正机会")
@@ -213,6 +203,18 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         if should_exit(state, end_done_count=end_done_count):
             logger.info("退出：end_done 或连续无产出已达阈值")
             return {**updates, "jump_to": "end"}
+
+        # **退出判定要在压缩之前**：这一轮就要收尾了还去压一遍历史，是白烧一次
+        # 完整的摘要请求（实测踩到过 —— end_done 已经调完的那一轮仍然压了一次）
+        if self._compressor is not None and self._compressor.should_compress(state["messages"]):
+            # 压缩会自己追加一份最新的 <review_status>，所以这里不再重复注入快照
+            updates["messages"] = self._compressor.compress(state["messages"], state["hunk_status"])
+        else:
+            calls = _last_tool_calls(state["messages"])
+            if any(str(call.get("name", "")) == "report_hunks" for call in calls):
+                updates["messages"] = [
+                    HumanMessage(content=build_review_status(state["hunk_status"]))
+                ]
 
         return updates or None
 

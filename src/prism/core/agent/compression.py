@@ -32,6 +32,7 @@ v1 自带那个（`langchain/agents/middleware/summarization.py`）覆盖了触�
 
 import json
 import logging
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -52,6 +53,7 @@ from prism.core.agent.state import HunkStatus
 from prism.core.agent.status import REVIEW_STATUS_TAG_OPEN, build_review_status
 from prism.core.guidance import templates as tpl
 from prism.models.compression import CompressionConfig
+from prism.observability.llm_trace import fields
 
 logger = logging.getLogger(__name__)
 
@@ -339,11 +341,17 @@ class Compressor:
             return False
 
         logger.info(
-            "触发压缩：上一轮已用 %d token，可用上限 %d（窗口 %d，固定预留 %d）",
-            used,
-            self._config.usable_tokens,
-            self._config.context_window,
-            self._config.reserve_tokens,
+            "压缩 · 触发 · 第 %d/%d 次\n%s",
+            self._compressions + 1,
+            self._config.max_compressions,
+            fields(
+                (
+                    "token",
+                    f"上一轮已用 {used} · 可用上限 {self._config.usable_tokens}"
+                    f" · 窗口 {self._config.context_window}"
+                    f" · 固定预留 {self._config.reserve_tokens}",
+                ),
+            ),
         )
         return True
 
@@ -377,13 +385,14 @@ class Compressor:
             self._record_failure()
             return self._degrade(head, messages, hunk_status, status)
 
-        self._record_success(history, summary)
-        return [
+        assembled = [
             RemoveMessage(id=REMOVE_ALL_MESSAGES),
             head,
             HumanMessage(content=f"{SUMMARY_TAG_OPEN}\n{summary}\n{SUMMARY_TAG_CLOSE}"),
             HumanMessage(content=status),
         ]
+        self._record_success(history, summary, assembled[1:])
+        return assembled
 
     def _prompt_tokens(self) -> int:
         """压缩提示词（system + user 骨架）自身的 token 开销。
@@ -433,10 +442,19 @@ class Compressor:
             dropped += 1
         if dropped:
             logger.warning(
-                "压缩请求装不下，丢弃最旧 %d 轮（历史预算 %d token）\n%s",
+                "压缩 · 截断 · 丢弃最旧 %d 轮\n%s",
                 dropped,
-                budget,
-                _alert("compression_truncated", reason="request_too_large", dropped_rounds=dropped),
+                fields(
+                    ("budget", f"历史预算 {budget} token"),
+                    (
+                        "alert",
+                        _alert(
+                            "compression_truncated",
+                            reason="request_too_large",
+                            dropped_rounds=dropped,
+                        ),
+                    ),
+                ),
             )
         return history
 
@@ -461,25 +479,49 @@ class Compressor:
             status=status,
         )
         request = [SystemMessage(content=tpl.COMPRESSION_SYSTEM), HumanMessage(content=prompt)]
-        # 压缩请求走的是**裸模型调用**，不经过 `ReviewTrace`（它包的是图里的模型节点），
-        # 所以这里不自己打就完全看不见。只在 DEBUG 级别打 —— 正文可能有几十万字符
-        logger.debug("压缩请求\n<system>\n%s\n\n<user>\n%s", tpl.COMPRESSION_SYSTEM, prompt)
+        # 压缩走的是**裸模型调用**，不经过 `ReviewTrace`（它包的是图里的模型节点），
+        # 所以这里不自己打就完全看不见 —— 调压缩提示词时只能靠猜。
+        # 级别与审查请求一致取 INFO：`ReviewTrace` 在 INFO 下本来就把 system 与
+        # 每条消息的**全文**打出来了，压缩请求没有理由比它更藏
+        logger.info(
+            "压缩 · 请求 · 历史 %d 条\n%s",
+            len(history),
+            fields(("system", tpl.COMPRESSION_SYSTEM), ("user", prompt)),
+        )
 
         for attempt in (1, 2):
+            started = time.monotonic()
             try:
                 text = str(self._model.invoke(request).text).strip()
             # 宽捕是**故意的**：压缩失败必须降级，不能让整组审查崩掉
             except Exception as exc:
-                logger.warning("压缩请求失败（第 %d 次）：%s", attempt, exc)
+                logger.warning(
+                    "压缩 · 请求失败 · 第 %d 次\n%s",
+                    attempt,
+                    fields(("error", f"{type(exc).__name__}: {exc}")),
+                )
                 continue
-            logger.debug("压缩响应（第 %d 次）\n%s", attempt, text)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.info(
+                "压缩 · 响应 · 第 %d 次 · 耗时 %dms\n%s",
+                attempt,
+                elapsed_ms,
+                fields(("content", text)),
+            )
             if _is_summary_shaped(text):
                 return text
-            logger.warning("压缩返回不含段标题（第 %d 次），视为格式错误", attempt)
+            logger.warning(
+                "压缩 · 响应不合格 · 第 %d 次\n%s",
+                attempt,
+                fields(
+                    ("content", text),
+                    ("reason", f"7 段标题只命中 {_section_hits(text)} 个，少于 {MIN_SECTIONS}"),
+                ),
+            )
 
         logger.error(
-            "压缩连续两次未得到合格摘要\n%s",
-            _alert("compression_failed", reason="bad_response"),
+            "压缩 · 放弃 · 两次都未得到合格摘要\n%s",
+            fields(("alert", _alert("compression_failed", reason="bad_response"))),
         )
         return None
 
@@ -509,9 +551,14 @@ class Compressor:
         fixed = self._tokens([head, note, HumanMessage(content=status)])
         history = self._fit(history, fixed=fixed)
         logger.warning(
-            "压缩降级为截断，保留最近 %d 条消息\n%s",
+            "压缩 · 降级为截断 · 保留最近 %d 条\n%s",
             len(history),
-            _alert("compression_failed", reason="degraded", kept_messages=len(history)),
+            fields(
+                (
+                    "alert",
+                    _alert("compression_failed", reason="degraded", kept_messages=len(history)),
+                ),
+            ),
         )
         return [
             RemoveMessage(id=REMOVE_ALL_MESSAGES),
@@ -527,26 +574,36 @@ class Compressor:
         if self._failures >= self._config.max_consecutive_failures:
             self._breaker_open = True
             logger.error(
-                "压缩连续失败 %d 次，熔断：本组不再尝试压缩\n%s",
+                "压缩 · 熔断 · 连续失败 %d 次，本组不再尝试\n%s",
                 self._failures,
-                _alert("compression_circuit_open", failures=self._failures),
+                fields(
+                    ("alert", _alert("compression_circuit_open", failures=self._failures)),
+                ),
             )
         else:
             logger.warning(
-                "压缩失败（连续 %d 次）\n%s",
+                "压缩 · 失败 · 连续第 %d 次\n%s",
                 self._failures,
-                _alert("compression_failed", reason="error", failures=self._failures),
+                fields(
+                    (
+                        "alert",
+                        _alert("compression_failed", reason="error", failures=self._failures),
+                    ),
+                ),
             )
 
-    def _record_success(self, history: list[BaseMessage], summary: str) -> None:
+    def _record_success(
+        self, history: list[BaseMessage], summary: str, assembled: Sequence[BaseMessage]
+    ) -> None:
         """记一次成功。
 
-        记下此刻的 AI 消息条数给 `should_compress` 用，并把压缩比打出来 ——
+        记下此刻最近的 AI 消息编号给 `should_compress` 用，并把压缩比打出来 ——
         §4.2 的校准要靠它：攒够 20 次后取「实际 E / B」的 P50。
 
         Args:
             history: 压缩前的历史（清理后）
             summary: 生成的摘要
+            assembled: 重组之后的上下文（A 段 + 摘要 + 进度）
         """
         self._compressions += 1
         self._failures = 0
@@ -554,17 +611,32 @@ class Compressor:
         after = self._tokens([HumanMessage(content=summary)])
         ratio = after / before if before else 0.0
         logger.info(
-            "压缩完成：历史 %d → 摘要 %d token（压缩率 %.2f），第 %d/%d 次",
-            before,
-            after,
-            ratio,
+            "压缩 · 完成 · 第 %d/%d 次\n%s",
             self._compressions,
             self._config.max_compressions,
+            fields(
+                ("size", f"历史 {before} token → 摘要 {after} token"),
+                ("ratio", f"{ratio:.2f}"),
+                # 「压缩后还能撑几轮」是校准问题，得先有「压缩后多大」这个数
+                ("context", f"压缩后上下文 {self._tokens(assembled)} token"),
+            ),
         )
 
 
+def _section_hits(text: str) -> int:
+    """数摘要命中了几个约定的段标题。
+
+    Args:
+        text: 模型返回的正文
+
+    Returns:
+        命中的段标题数
+    """
+    return sum(1 for section in tpl.SUMMARY_SECTIONS if section in text)
+
+
 def _is_summary_shaped(text: str) -> bool:
-    """摘要至少命中了几个约定的段标题。
+    """摘要的段标题命中数够不够。
 
     Args:
         text: 模型返回的正文
@@ -572,4 +644,4 @@ def _is_summary_shaped(text: str) -> bool:
     Returns:
         命中数达到 `MIN_SECTIONS` 返回 True
     """
-    return sum(1 for section in tpl.SUMMARY_SECTIONS if section in text) >= MIN_SECTIONS
+    return _section_hits(text) >= MIN_SECTIONS
