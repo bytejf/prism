@@ -461,6 +461,9 @@ class Compressor:
             status=status,
         )
         request = [SystemMessage(content=tpl.COMPRESSION_SYSTEM), HumanMessage(content=prompt)]
+        # 压缩请求走的是**裸模型调用**，不经过 `ReviewTrace`（它包的是图里的模型节点），
+        # 所以这里不自己打就完全看不见。只在 DEBUG 级别打 —— 正文可能有几十万字符
+        logger.debug("压缩请求\n<system>\n%s\n\n<user>\n%s", tpl.COMPRESSION_SYSTEM, prompt)
 
         for attempt in (1, 2):
             try:
@@ -469,6 +472,7 @@ class Compressor:
             except Exception as exc:
                 logger.warning("压缩请求失败（第 %d 次）：%s", attempt, exc)
                 continue
+            logger.debug("压缩响应（第 %d 次）\n%s", attempt, text)
             if _is_summary_shaped(text):
                 return text
             logger.warning("压缩返回不含段标题（第 %d 次），视为格式错误", attempt)
