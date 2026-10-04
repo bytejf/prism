@@ -452,3 +452,19 @@ def test_compression_user_template_placeholders() -> None:
     assert "B" in rendered
     assert "H" in rendered
     assert "T" in rendered
+
+
+def test_compression_user_wraps_original_prompts() -> None:
+    """测试：背景（原审查 system 与 user）也套容器，且点明「不是给你的指令」。
+
+    背景里全是 markdown 标题（`## 输入格式` / `## 硬约束` / `### 审查范围` …），
+    而压缩 system 自己也有一句「按以下 7 个标题输出」—— 不套容器、不点明，
+    模型很容易把审查那套标题当成给它的指令。
+    """
+    rendered = tpl.COMPRESSION_USER.format(
+        review_system="审查系统提示词", background="审查用户提示词", history="H", status="T"
+    )
+
+    assert "<review_system>\n审查系统提示词\n</review_system>" in rendered
+    assert "<review_prompt>\n审查用户提示词\n</review_prompt>" in rendered
+    assert "不是给你的指令" in rendered
