@@ -10,16 +10,13 @@ import subprocess
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
+from prism.config.settings import settings
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import ReviewState
 
 logger = logging.getLogger(__name__)
 
-# 单次最多返回的结果数，LLM 传入更大的值也会被压到这个上限
-MAX_RESULTS = 50
-
-# git grep 子进程超时（秒）
-TIMEOUT_SECONDS = 30
+# 结果数上限与 git grep 超时见 default.toml 的 [tools.code_search]
 
 # git grep 的退出码：0 有匹配，1 无匹配，其余为错误
 RC_NO_MATCH = 1
@@ -31,7 +28,9 @@ def code_search(
     pattern: str,
     runtime: ToolRuntime[ReviewContext, ReviewState],
     file_pattern: str = "*.go",
-    max_results: int = 50,
+    # 默认值取自配置，让工具 schema 里挂的 default 与配置一致 ——
+    # 写死一个 50，改了配置之后模型看到的默认值就与实际行为对不上了
+    max_results: int = settings.tools.code_search.max_results,
 ) -> str:
     """按内容搜索代码。
 
@@ -42,7 +41,7 @@ def code_search(
         pattern: 搜索模式（支持正则）
         runtime: 运行时（框架注入，模型看不到）
         file_pattern: 文件过滤，默认 "*.go"
-        max_results: 最大结果数，默认 50
+        max_results: 最大结果数，传超过配置上限的值会被压到上限
 
     Returns:
         匹配行列表（含文件路径、行号、内容）；无匹配或出错时返回说明文本
@@ -50,8 +49,12 @@ def code_search(
     Notes:
         ReviewContext.head_rev 已设置时搜索该版本，否则搜索工作区。
     """
+    # 参数是「模型要多少」，配置是「最多给多少」—— 取两者的小值，
+    # 别把配置值赋回参数名，那样模型传的值就失效了
+    cap = settings.tools.code_search.max_results
+    timeout_seconds = settings.tools.code_search.timeout_seconds
     ctx = runtime.context
-    limit = max(1, min(max_results, MAX_RESULTS))
+    limit = max(1, min(max_results, cap))
     logger.debug(
         "code_search 调用：pattern=%s file_pattern=%s max_results=%d",
         pattern,
@@ -87,12 +90,12 @@ def code_search(
             cwd=ctx.project_root,
             capture_output=True,
             text=True,
-            timeout=TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             check=False,
         )
     except subprocess.TimeoutExpired:
         logger.warning("code_search 超时：%s", pattern)
-        return f"错误：搜索超时（超过 {TIMEOUT_SECONDS} 秒）"
+        return f"错误：搜索超时（超过 {timeout_seconds} 秒）"
     except OSError as exc:
         logger.warning("code_search 无法执行 git：%s", exc)
         return f"错误：无法执行 git grep：{exc}"

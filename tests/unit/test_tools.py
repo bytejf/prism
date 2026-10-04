@@ -16,6 +16,7 @@ from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
 from pydantic import BaseModel, ValidationError
 
+from prism.config.settings import settings
 from prism.core.agent.agent import build_tools
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
@@ -29,9 +30,9 @@ from prism.core.agent.state import (
     merge_hunk_status,
     pending_ids,
 )
-from prism.core.tools.code_search import MAX_RESULTS, code_search
+from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
-from prism.core.tools.file_read import MAX_LINES, file_read
+from prism.core.tools.file_read import file_read
 from prism.core.tools.report_hunks import report_hunks
 from prism.observability.llm_trace import _describe_tool
 
@@ -257,12 +258,13 @@ def test_file_read_returns_lines_with_numbers(ctx: ReviewContext, tmp_path: Path
 
 def test_file_read_truncates_at_limit(ctx: ReviewContext, tmp_path: Path) -> None:
     """测试超过 500 行时截断并提示。"""
-    (tmp_path / "big.go").write_text("x\n" * (MAX_LINES + 100), encoding="utf-8")
+    limit = settings.tools.file_read.max_lines
+    (tmp_path / "big.go").write_text("x\n" * (limit + 100), encoding="utf-8")
     tool = ToolUnderTest(file_read, ctx)
 
-    result = tool.text({"path": "big.go", "start_line": 1, "end_line": MAX_LINES + 100})
+    result = tool.text({"path": "big.go", "start_line": 1, "end_line": limit + 100})
     assert "截断" in result
-    assert result.count("\n") <= MAX_LINES + 1
+    assert result.count("\n") <= limit + 1
 
 
 def test_file_read_rejects_path_traversal(ctx: ReviewContext, tmp_path: Path) -> None:
@@ -493,7 +495,7 @@ def test_code_search_keeps_non_ascii_paths_readable(
 def test_code_search_caps_result_count(go_repo: Path) -> None:
     """测试结果数被压到上限并提示截断。"""
     tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
-    result = tool.text({"pattern": "func", "max_results": MAX_RESULTS})
+    result = tool.text({"pattern": "func", "max_results": settings.tools.code_search.max_results})
     assert "func" in result
 
 

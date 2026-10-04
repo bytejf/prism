@@ -1,0 +1,103 @@
+# Prism 的配置。**默认值只有这一份** —— 代码里不再写第二份，改值只改这里。
+#
+# 读取见 `settings.py`，用法：
+#
+#     from prism.config.settings import settings
+#     max_rounds = settings.review.min_rounds
+#
+# 优先级：环境变量 > 本文件。唯一走环境变量的是 DEEPSEEK_API_KEY（密钥不进文件，
+# 缺了不会在导入期报错，而是在构造 LLM 客户端时明确报出来）。
+
+# ---------------------------------------------------------------------------
+# 什么**不**在这里 —— 判据：改它会不会改变我对 LLM / git / 框架的契约
+# ---------------------------------------------------------------------------
+#
+# 会，所以留在代码里。这些值配错了**不会报错，只会静默失效**，因此不给它配的
+# 机会：
+#
+#   标签名          <diff> / <review_status> / <compression_summary> / <review_history>
+#                   —— 提示词、工具、压缩器三方共用的协议，改一处就得同时改三处
+#   编号格式        H-01 / group-001（core/ast/mapper.py、core/grouping/packages.py）
+#   退出原因码      end_done / end_done_with_gaps / max_rounds / no_progress
+#   严重程度        high / medium / low 的取值与排序
+#   提示词全文      core/guidance/templates.py
+#   过滤白名单      .go / *_test.go / *.pb.go（文档定的是 V1 只审 Go）
+#   符号种类        tree-sitter 的节点名与 kind 标签
+#
+# 另有两个值刻意不做成旋钮：
+#   temperature —— 思考模式下被 API 忽略（`models/llm.py` 的字段默认 0.0）
+#   recursion_limit 的倍数 —— 由框架实测「每轮约 6.1 个 super-step」推出来
+# ---------------------------------------------------------------------------
+
+
+[llm]
+# 模型名与 API 端点。换 provider / 换模型改这两行
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com"
+
+# 上下文窗口（token）。压缩的触发阈值由它算出来（见 [compression]），
+# 所以换模型时只改这一处，不要在压缩逻辑里另写一个数
+context_window = 1000000
+
+# 思考强度。取值 minimal / low / medium / high / xhigh / max / ultra。
+# DeepSeek 的思考模式**默认开启且默认档位是 high**（不传参数也会有 reasoning
+# token），所以这里显式降到 low：审查的绝大多数轮次只是「读文件 → 报告结论」，
+# 不需要深推理，而思考 token 计费、且会让 prompt 一起变长
+reasoning_effort = "low"
+
+# 重试次数与超时（秒），由 OpenAI SDK 内置实现
+max_retries = 3
+timeout = 60
+
+
+[compression]
+# 固定预留（token）。已用达到 (context_window - reserve_tokens) 就压缩，
+# 等价于「剩余不足预留」。它是**估算出来的粗值**，里面已经含了压缩提示词
+# （system + user）的开销与摘要输出 —— 摘要长度是唯一算不准的量，靠这个余量兜住。
+#
+# 1M 窗口下它只占 2%，压缩因此几乎不触发，**这是有意的**：
+# V1 的压缩是保险机制，不是常规操作
+reserve_tokens = 20000
+
+# 单组最多压缩几次。第一次是常规操作，第二次是「历史反复膨胀」的兜底，
+# 第三次的信息损失不可接受
+max_compressions = 2
+
+# 连续失败几次熔断。熔断后本组不再尝试压缩，直接走截断
+max_consecutive_failures = 3
+
+
+[review]
+# 单组最大轮次 = max(min_rounds, hunk 数 × rounds_per_hunk)
+min_rounds = 30
+rounds_per_hunk = 5
+
+# 连续无产出（只探查、不 report_hunks）的控制：
+#   到 remind_rounds 里的轮次注入提醒（文档要求提醒两次），
+#   到 exit_rounds 强制退出 —— 给它改标签
+no_progress_remind_rounds = [5, 7]
+no_progress_exit_rounds = 8
+
+# hunk 没审完时，end_done 最多被拒绝几次；超过就接受并带缺口退出
+# （end_done 是模型唯一能表达「我审完了」的方式，一直拒绝会让它空转到轮次耗尽）
+max_rejections = 1
+
+
+[tools.file_read]
+# 单次最多读取的行数。超出部分截断，并在返回值里提示「已截断」
+max_lines = 500
+
+
+[tools.code_search]
+# 单次最多返回的匹配条数。模型传入更大的值也会被压到这个上限
+max_results = 50
+
+# git grep 子进程的超时（秒）
+timeout_seconds = 30
+
+
+[log]
+# 日志级别，只作用于 prism 命名空间（第三方库固定在 WARNING，否则 DEBUG 下
+# httpx / openai 的内部日志会淹没我们自己的关键节点）。
+# 环境变量 PRISM_LOG_LEVEL 优先于这里 —— 临时看一次轨迹不必改文件
+level = "INFO"

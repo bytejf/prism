@@ -80,6 +80,7 @@ from typing import Annotated
 
 import typer
 
+from prism.config.settings import settings
 from prism.core.agent.agent import run_review_agent
 from prism.core.agent.state import MainLoopResult
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
@@ -91,10 +92,8 @@ from prism.core.output.renderer import TerminalRenderer
 from prism.core.output.sort import sort_comments, to_comments
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import ReviewStats
-from prism.models.compression import CompressionConfig
 from prism.models.diff import Diff
 from prism.models.grouping import Group
-from prism.models.llm import LLMConfig
 from prism.observability.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -342,13 +341,14 @@ def group(
 def _llm_or_exit() -> LLMClient:
     """构造 LLM 客户端，失败时打印错误并终止进程。
 
-    model / base_url 固定在 `models/llm.py`，这里只从环境变量取 api_key。
+    全部配置来自 `config/default.toml` + 环境变量里的 api_key，
+    本函数不再自己拼 LLMConfig。
 
     Returns:
         LLMClient 实例
     """
     try:
-        return LLMClient(LLMConfig.from_env())
+        return LLMClient(settings.llm)
     except ValueError as exc:
         logger.error("LLM 初始化失败: %s", exc)
         typer.echo(f"错误：{exc}", err=True)
@@ -377,14 +377,14 @@ def _run_groups(
             f"Processing Group {index}: {item.package_path} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
-        # 窗口大小从 LLMConfig 来：换模型 / DeepSeek 升级窗口时只改配置，
-        # 压缩的触发阈值跟着走
+        # 压缩配置直接用 settings 里那一份：它的 context_window 已经是从
+        # [llm] 拼过来的，这里不再自己算一遍
         result = run_review_agent(
             item,
             llm.model,
             str(project_root),
             head_rev,
-            CompressionConfig(context_window=llm.config.context_window),
+            settings.compression,
         )
         results.append(result)
         typer.echo(

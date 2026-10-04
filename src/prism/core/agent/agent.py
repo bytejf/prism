@@ -21,6 +21,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
+from prism.config.settings import settings
 from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.middleware import ReviewProgress, review_pacing
@@ -165,8 +166,9 @@ def run_review_agent(
         model: LangChain ChatModel
         project_root: 项目根目录
         head_rev: 被审查的版本，工具据此读取源码而不是读工作区
-        compression: 压缩配置。**默认开启**（用默认阈值）；1M 窗口下几乎不会触发，
-            它是保险不是常规操作。传 ``CompressionConfig(context_window=...)``
+        compression: 压缩配置。**默认开启**，用配置文件的 [compression]；
+            1M 窗口下几乎不会触发，它是保险不是常规操作。传
+            ``dataclasses.replace(settings.compression, context_window=...)``
             收小窗口就能在测试里逼出压缩
 
     Returns:
@@ -185,7 +187,7 @@ def run_review_agent(
         max_rounds,
     )
 
-    agent = build_review_agent(model, max_rounds, compression or CompressionConfig())
+    agent = build_review_agent(model, max_rounds, compression or settings.compression)
     # 出参 cast：不传 version 时框架走 `version="v1"` 那个 overload，
     # 返回类型是 `dict[str, Any] | Any`，不认识 state_schema 里的自定义键。
     # 不 cast，下面 `final["hunk_status"]` 就退化成 Any，这一层的检查等于没加。

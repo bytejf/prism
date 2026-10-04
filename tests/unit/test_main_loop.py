@@ -7,6 +7,7 @@
 Protocol 已经接不上了。
 """
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast, override
 
@@ -18,6 +19,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
 from pydantic import Field
 
+from prism.config.settings import settings
 from prism.core.agent.agent import build_tools, initial_state, run_review_agent
 from prism.core.agent.middleware import end_done_reset, should_exit, update_no_report_rounds
 from prism.core.agent.state import (
@@ -35,7 +37,6 @@ from prism.core.agent.state import (
 )
 from prism.core.agent.status import build_review_status
 from prism.models.ast import HunkWithSymbol, Symbol
-from prism.models.compression import CompressionConfig
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
@@ -592,7 +593,7 @@ def test_main_loop_compresses_when_window_is_tight(project_root: str) -> None:
         make_group(["H-01"]),
         llm,
         project_root,
-        compression=CompressionConfig(context_window=1_000, reserve_tokens=100),
+        compression=replace(settings.compression, context_window=1_000, reserve_tokens=100),
     )
 
     assert len(llm.calls) == 3, "审查 → 压缩 → 继续审查"

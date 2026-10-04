@@ -54,6 +54,7 @@ from pathlib import Path
 
 import pytest
 
+from prism.config.settings import settings
 from prism.core.agent.agent import run_review_agent
 from prism.core.agent.state import EXIT_END_DONE, EXIT_END_DONE_WITH_GAPS
 from prism.core.ast.mapper import map_hunks_to_symbols
@@ -61,7 +62,7 @@ from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import group_by_package
 from prism.core.llm.client import LLMClient
-from prism.models.llm import API_KEY_ENV, LLMConfig
+from prism.models.llm import API_KEY_ENV
 
 # 默认待审查项目；换个项目就设 PRISM_MIN_TEST_REPO
 DEFAULT_REPO = Path.home() / "Projects" / "python" / "prism-min-test"
@@ -99,7 +100,7 @@ def llm() -> LLMClient:
     """
     if not os.getenv(API_KEY_ENV):
         pytest.skip(f"未设置 {API_KEY_ENV}")
-    return LLMClient(LLMConfig.from_env())
+    return LLMClient(settings.llm)
 
 
 def test_min_loop_walkthrough(demo_repo: Path, llm: LLMClient) -> None:

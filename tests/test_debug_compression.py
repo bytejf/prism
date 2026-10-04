@@ -81,12 +81,14 @@ ai · 轮次=3 · 耗时 1347ms
 import logging
 import os
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
 from langchain_core.messages import BaseMessage
 
+from prism.config.settings import settings
 from prism.core.agent.agent import build_review_agent, initial_state
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import ReviewState, max_rounds_for, pending_ids
@@ -95,8 +97,7 @@ from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import group_by_package
 from prism.core.llm.client import LLMClient
-from prism.models.compression import CompressionConfig
-from prism.models.llm import API_KEY_ENV, LLMConfig
+from prism.models.llm import API_KEY_ENV
 from prism.observability.logging import PRISM_LOGGER, PrismHandler
 
 # 挂在 `prism` 命名空间**下面**，不挂 `__name__`：
@@ -240,7 +241,9 @@ def test_debug_compression(one_file_repo: Path) -> None:
     logger.info("首条消息（指导 + diff）共 %d 字符", len(str(state["messages"][0].content)))
 
     # ── 真实模型 + 极端压缩配置 ──────────────────────────────────────
-    config = CompressionConfig(context_window=CONTEXT_WINDOW, reserve_tokens=RESERVE_TOKENS)
+    config = replace(
+        settings.compression, context_window=CONTEXT_WINDOW, reserve_tokens=RESERVE_TOKENS
+    )
     logger.info(
         "压缩配置：窗口 %d，预留 %d → 可用上限 %d token"
         "（第 1 轮的真实 usage 一旦达到它，第 2 轮就压缩）",
@@ -249,7 +252,7 @@ def test_debug_compression(one_file_repo: Path) -> None:
         config.usable_tokens,
     )
 
-    model = LLMClient(LLMConfig.from_env()).model
+    model = LLMClient(settings.llm).model
     agent = build_review_agent(model, max_rounds, config)
 
     # ── 循环：断在这里可以 step into 中间件与工具 ─────────────────────

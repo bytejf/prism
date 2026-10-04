@@ -5,6 +5,7 @@
 那边有 `ScriptedChatModel` 可复用。
 """
 
+from dataclasses import replace
 from typing import Any, override
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -13,6 +14,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
+from prism.config.settings import settings
 from prism.core.agent.compression import (
     PLACEHOLDER,
     SUMMARY_TAG_OPEN,
@@ -26,7 +28,6 @@ from prism.core.agent.compression import (
 )
 from prism.core.agent.state import STATUS_DONE, HunkStatus
 from prism.core.guidance import templates as tpl
-from prism.models.compression import CompressionConfig
 
 # 一段「像样的」摘要：命中 7 段里的几段，过得了格式校验
 GOOD_SUMMARY = "\n".join(
@@ -266,7 +267,7 @@ def make_compressor(replies: list[str], *, window: int = 1_000, reserve: int = 1
     """
     return Compressor(
         FakeSummaryModel(replies=replies),
-        CompressionConfig(context_window=window, reserve_tokens=reserve),
+        replace(settings.compression, context_window=window, reserve_tokens=reserve),
     )
 
 
@@ -369,7 +370,8 @@ def test_compress_prefixes_notice_before_summary() -> None:
 def test_compress_request_carries_background_and_cleaned_history() -> None:
     """测试：压缩请求里既有背景（审查 system + 指导 + diff），也有清理过的历史。"""
     model = FakeSummaryModel(replies=[GOOD_SUMMARY])
-    compressor = Compressor(model, CompressionConfig(context_window=1_000_000))
+    # 窗口给足：这里测的是「请求里装了什么」，不是触发判定
+    compressor = Compressor(model, replace(settings.compression, context_window=1_000_000))
 
     compressor.compress(sample_history(), {"H-01": HunkStatus("H-01", STATUS_DONE)})
 

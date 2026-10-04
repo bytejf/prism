@@ -115,18 +115,53 @@ v1 的「框架味」在 **`langchain` 包**（agents / middleware），不在 `
 
 ## 代码约定
 
-注释、docstring、提交信息、设计文档**一律用中文**；`models/` 下**一个模型一个文件**。
+注释、docstring、提交信息、设计文档**一律用中文**；`models/` 下**一个模型一个文件**
+（同一个域的多张表可以同文件，见 `models/ast.py`）。
 `ruff check .` + `mypy src tests` 是硬门槛，改完必须全绿（配置见 `pyproject.toml`）。
+
+## 配置
+
+**默认值只有一份：`src/prism/config/default.toml`。** 代码里不写第二份。
+
+```python
+from prism.config.settings import settings
+
+max_rounds = max(settings.review.min_rounds, n * settings.review.rounds_per_hunk)
+```
+
+优先级 `环境变量 > default.toml`；唯一走环境变量的是 `DEEPSEEK_API_KEY`（密钥不落盘）。
+读取见 `config/settings.py`，它只做三件事：读 toml、按键记进 dataclass、拦下配错的键。
+
+**什么进文件、什么不进**，判据是「改它会不会改变我对 LLM / git / 框架的契约」：
+
+| | 例子 |
+|---|---|
+| **进**（旋钮，配错了看得见） | 窗口、思考档位、压缩阈值、轮次公式、工具上限、日志级别 |
+| **不进**（契约，配错了*看不见*） | 标签名 `<diff>` / `<review_status>`、`H-01` 编号格式、退出原因码、severity 排序、提示词全文、过滤白名单、`REFETCHABLE_TOOLS` |
+
+把契约写进文件等于让它变成「可以配错的东西」，而配错的后果是静默失效。
+完整清单与理由写在 `default.toml` 开头的注释里。
+
+三个**刻意不做成旋钮**的值：`api_key`（环境变量）、`temperature`（思考模式下被 API
+忽略）、`recursion_limit` 的倍数（由框架实测「每轮约 6.1 个 super-step」推出来）。
+
+读取是**硬报错**的：未知键、缺键、类型不符都在**读的那一刻**拦下并报出文件与键路径。
+`max_lines = "500"` 这种 tomllib 照收不误，混到工具里才炸就离原因太远了。
+**进一层先查未知键、再读值** —— 顺序反了的话，把 `reserve_tokens` 拼成
+`reserve_token` 会报成「缺少 reserve_tokens」，那是个指向错误方向的提示。
+
+`SCHEMA`（段 → dataclass + 排除字段）是读取与校验**共用**的那份映射，期望的键由
+dataclass 字段推出来，不另写键名清单 —— 否则又多一处会漂移的东西。
 
 ## 模型与成本（DeepSeek）
 
 - **思考模式默认开启、默认档位 `high`** —— 不显式配就是一直在按最贵档付费。
-  `LLMConfig.reasoning_effort` 默认 `low`
+  `default.toml` 里显式写了 `reasoning_effort = "low"`
 - **思考模式下 `temperature` 被 API 忽略**
 - `ChatOpenAI` **不提取** `reasoning_content`（思考正文）；`ChatDeepSeek` 入站捕获、
   出站序列化却丢弃 —— `core/llm/client.py` 的子类补回。**实测 `deepseek-flash`
   不强制回传**，所以那是防御性的，不是修一个正在发生的 bug
-- model / base_url 固定在 `models/llm.py`，只有 api_key 从环境变量读
+- model / base_url 在 `config/default.toml` 的 `[llm]`，只有 api_key 从环境变量读
 
 ## 日志
 
@@ -144,6 +179,10 @@ v1 的「框架味」在 **`langchain` 包**（agents / middleware），不在 `
 pytest 的捕获是 **fd 级**的，绕不过）。**别用 `--log-cli-level`** —— 它走 pytest
 自己的格式，不是项目约定的格式。conftest 的 `pytest_collection_finish` 会自诊断。
 PyCharm：Environment variables 填 `PRISM_LOG_LEVEL=INFO`，Additional Arguments 加 `-s`。
+
+`PRISM_LOG_LEVEL` **优先于**配置文件的 `[log].level` —— 临时看一次轨迹不该要求改文件。
+传了非法值（如 `VERBOSE`）时退回 `INFO`，不回落到配置值：那是用户明确的一次覆盖意图，
+静默换成另一个数反而难查。
 
 ## 验证怎么做
 

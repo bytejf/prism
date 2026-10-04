@@ -11,6 +11,7 @@ from typing import Annotated
 
 from langchain.agents.middleware import AgentState
 
+from prism.config.settings import settings
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
 
@@ -19,18 +20,8 @@ STATUS_PENDING = "pending"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_DONE = "done"
 
-# 最大轮次：max(MIN_ROUNDS, hunk 数 × ROUNDS_PER_HUNK)
-MIN_ROUNDS = 30
-ROUNDS_PER_HUNK = 5
-
-# 连续无产出到这些轮次时注入提醒（文档要求提醒两次后退出）
-NO_PROGRESS_REMIND_ROUNDS: tuple[int, ...] = (5, 7)
-
-# 连续无产出达到该轮次则强制退出
-NO_PROGRESS_EXIT_ROUNDS = 8
-
-# 允许强制接受 end_done 前最多拒绝几次
-MAX_REJECTIONS = 1
+# 轮次公式、无产出提醒/退出阈值、end_done 拒绝上限**都是配置项**，
+# 见 default.toml 的 [review]。这里不写第二份默认值。
 
 # 退出原因取值
 EXIT_END_DONE = "end_done"
@@ -152,19 +143,24 @@ def end_done_verdict(end_done_count: int, pending: list[str]) -> tuple[bool, lis
     """
     if not pending:
         return True, []
-    return end_done_count > MAX_REJECTIONS, pending
+    return end_done_count > settings.review.max_rejections, pending
 
 
 def max_rounds_for(hunk_count: int) -> int:
     """按 hunk 数计算最大轮次。
 
+    两个数都来自配置的 `[review]`。
+
     Args:
         hunk_count: 本组 hunk 数
 
     Returns:
-        max(MIN_ROUNDS, hunk 数 × ROUNDS_PER_HUNK)
+        max(min_rounds, hunk 数 × rounds_per_hunk)
     """
-    return max(MIN_ROUNDS, hunk_count * ROUNDS_PER_HUNK)
+    return max(
+        settings.review.min_rounds,
+        hunk_count * settings.review.rounds_per_hunk,
+    )
 
 
 def exit_reason_of(state: ReviewState) -> str | None:
@@ -186,7 +182,7 @@ def exit_reason_of(state: ReviewState) -> str | None:
     if state["round_count"] >= state["max_rounds"]:
         return EXIT_MAX_ROUNDS
 
-    if state["no_report_rounds"] >= NO_PROGRESS_EXIT_ROUNDS:
+    if state["no_report_rounds"] >= settings.review.no_progress_exit_rounds:
         return EXIT_NO_PROGRESS
 
     return None

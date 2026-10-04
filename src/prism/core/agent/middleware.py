@@ -23,11 +23,10 @@ from langchain.agents.middleware import AgentMiddleware, after_model
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.runtime import Runtime
 
+from prism.config.settings import settings
 from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
-    NO_PROGRESS_EXIT_ROUNDS,
-    NO_PROGRESS_REMIND_ROUNDS,
     ReviewState,
     done_count,
     end_done_verdict,
@@ -124,7 +123,7 @@ def should_exit(state: ReviewState, *, end_done_count: int | None = None) -> boo
     count = state["end_done_count"] if end_done_count is None else end_done_count
     if count > 0 and end_done_verdict(count, pending)[0]:
         return True
-    return state["no_report_rounds"] >= NO_PROGRESS_EXIT_ROUNDS
+    return state["no_report_rounds"] >= settings.review.no_progress_exit_rounds
 
 
 def _last_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
@@ -251,7 +250,7 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
         # 有工具调用 → 交给框架执行工具，不干预路由
         return updates
 
-    if no_report in NO_PROGRESS_REMIND_ROUNDS:
+    if no_report in settings.review.no_progress_remind_rounds:
         logger.warning("连续 %d 轮无产出，注入提醒", no_report)
         content = NO_PROGRESS_REMINDER.format(rounds=no_report)
     else:
@@ -260,5 +259,5 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
 
     updates["messages"] = [HumanMessage(content=content)]
     # 与旧实现一致：提醒照样追加，到阈值才结束
-    updates["jump_to"] = "end" if no_report >= NO_PROGRESS_EXIT_ROUNDS else "model"
+    updates["jump_to"] = "end" if no_report >= settings.review.no_progress_exit_rounds else "model"
     return updates

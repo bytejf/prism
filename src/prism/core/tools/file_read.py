@@ -10,13 +10,13 @@ from pathlib import Path, PurePosixPath
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
+from prism.config.settings import settings
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import ReviewState
 
 logger = logging.getLogger(__name__)
 
-# 单次最多读取的行数
-MAX_LINES = 500
+# 单次最多读取的行数见 default.toml 的 [tools.file_read].max_lines
 
 # 超出上限时的提示（文档要求提示里含「截断」）
 TRUNCATED_HINT = "（已截断：单次最多读取 {max_lines} 行）"
@@ -50,6 +50,7 @@ def file_read(
     Returns:
         文件内容（每行前缀行号），超出 500 行时截断并提示
     """
+    max_lines = settings.tools.file_read.max_lines
     ctx = runtime.context
     logger.debug("file_read 调用：path=%s start_line=%d end_line=%d", path, start_line, end_line)
     if not ctx.project_root:
@@ -76,14 +77,14 @@ def file_read(
 
     start = max(start_line, 1)
     end = min(max(end_line, start), total)
-    truncated = end - start + 1 > MAX_LINES
+    truncated = end - start + 1 > max_lines
     if truncated:
-        end = start + MAX_LINES - 1
+        end = start + max_lines - 1
 
     body = "\n".join(f"{number:>6}: {lines[number - 1]}" for number in range(start, end + 1))
     logger.debug("file_read 完成：%d 行（总 %d 行，截断=%s）", end - start + 1, total, truncated)
     if truncated:
-        return f"{body}\n{TRUNCATED_HINT.format(max_lines=MAX_LINES)}"
+        return f"{body}\n{TRUNCATED_HINT.format(max_lines=max_lines)}"
     return body
 
 

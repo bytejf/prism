@@ -38,8 +38,10 @@ from pathlib import Path
 from rich.console import Console
 from rich.text import Text
 
-# 默认日志级别，PRISM_LOG_LEVEL 未设置或取值非法时使用
-DEFAULT_LEVEL = "INFO"
+from prism.config.settings import settings
+
+# 日志级别：环境变量 PRISM_LOG_LEVEL 优先于配置文件的 [log].level ——
+# 临时看一次轨迹不该要求改文件
 
 # 本项目自己的 logger 走这个命名空间，第三方库不受 PRISM_LOG_LEVEL 影响
 PRISM_LOGGER = "prism"
@@ -129,22 +131,25 @@ def resolve_level(name: str | None) -> int:
     """把日志级别名解析为 logging 级别常量。
 
     Args:
-        name: 级别名，如 "DEBUG"；为 None 或非法值时使用 DEFAULT_LEVEL
+        name: 级别名，如 "DEBUG"；为 None 或非法值时使用配置里的 [log].level
 
     Returns:
         logging 级别常量，如 logging.DEBUG
     """
-    level = getattr(logging, (name or DEFAULT_LEVEL).upper(), None)
+    level = getattr(logging, (name or settings.log.level).upper(), None)
     return level if isinstance(level, int) else logging.INFO
 
 
 def setup_logging() -> None:
     """初始化日志配置。
 
-    从环境变量 PRISM_LOG_LEVEL 读取日志级别，默认 INFO。
+    从环境变量 PRISM_LOG_LEVEL 读取日志级别，未设置时用配置文件的 [log].level。
     级别只作用于 ``prism`` 命名空间：根 logger 固定在 WARNING，
     否则 PRISM_LOG_LEVEL=DEBUG 会把 httpx / openai 等第三方库的
     内部 DEBUG 日志一并打开，淹没我们自己要定位问题的关键节点日志。
+
+    PRISM_LOG_LEVEL 传了非法值（如 ``VERBOSE``）时退回 INFO，**不回落到配置值**
+    —— 那是用户明确表达的一次覆盖意图，静默改成另一个数反而难查。
 
     重复调用无副作用（basicConfig 在已有 handler 时为空操作）。
     """

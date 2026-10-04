@@ -7,20 +7,16 @@
 调用与工具绑定已经交给框架（`create_agent`），这里不再测 invoke。
 """
 
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import SecretStr
 
+from prism.config.settings import load, settings
 from prism.core.llm.client import LLMClient, ReasoningEchoChatDeepSeek
-from prism.models.llm import (
-    API_KEY_ENV,
-    DEFAULT_BASE_URL,
-    DEFAULT_MODEL,
-    DEFAULT_REASONING_EFFORT,
-    LLMConfig,
-)
+from prism.models.llm import API_KEY_ENV, LLMConfig
 
 
 class FakeChatModel:
@@ -56,13 +52,16 @@ def fake_model(monkeypatch: pytest.MonkeyPatch) -> list[FakeChatModel]:
 def make_config(**overrides: Any) -> LLMConfig:
     """构造测试用 LLMConfig。
 
+    以配置里的那份为底再覆盖 —— 默认值只有 `default.toml` 一份，测试里也不再
+    抄一遍，否则配置一改这里就对不上了。
+
     Args:
         overrides: 需要覆盖的字段
 
     Returns:
         LLMConfig 对象
     """
-    return LLMConfig(api_key="test-key", **overrides)
+    return replace(settings.llm, api_key="test-key", **overrides)
 
 
 def test_config_is_passed_to_chatdeepseek(fake_model: list[FakeChatModel]) -> None:
@@ -70,8 +69,8 @@ def test_config_is_passed_to_chatdeepseek(fake_model: list[FakeChatModel]) -> No
     LLMClient(make_config(temperature=0.3, max_retries=5, timeout=30, reasoning_effort="medium"))
     kwargs = fake_model[0].kwargs
 
-    assert kwargs["model"] == DEFAULT_MODEL
-    assert kwargs["base_url"] == DEFAULT_BASE_URL
+    assert kwargs["model"] == settings.llm.model
+    assert kwargs["base_url"] == settings.llm.base_url
     assert kwargs["temperature"] == 0.3
     assert kwargs["max_retries"] == 5
     assert kwargs["timeout"] == 30
@@ -91,30 +90,35 @@ def test_model_property_exposes_configured_model(fake_model: list[FakeChatModel]
 
 
 def test_empty_api_key_is_rejected() -> None:
-    """测试缺少 api_key 时构造即失败。"""
+    """测试缺少 api_key 时构造即失败。
+
+    这是**唯一**会因缺密钥而报错的地方 —— 读取配置本身不校验（见下一个用例）。
+    """
     with pytest.raises(ValueError, match="api_key 为空"):
-        LLMClient(LLMConfig(api_key=""))
+        LLMClient(replace(settings.llm, api_key=""))
 
 
-def test_from_env_reads_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """测试从环境变量读取 api_key 并使用默认 model / base_url。"""
+def test_load_reads_api_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试 api_key 只从环境变量读，且剔除首尾空白。"""
     monkeypatch.setenv(API_KEY_ENV, "  env-key  ")
-    config = LLMConfig.from_env()
 
-    assert config.api_key == "env-key"
-    assert config.model == DEFAULT_MODEL
-    assert config.base_url == DEFAULT_BASE_URL
-    assert config.reasoning_effort == DEFAULT_REASONING_EFFORT
-    assert config.temperature == 0.0
-    assert config.max_retries == 3
-    assert config.timeout == 60
+    loaded = load()
+
+    assert loaded.llm.api_key == "env-key"
+    # 其余字段来自配置文件，不是代码里的第二份默认值
+    assert loaded.llm.model == settings.llm.model
+    assert loaded.llm.base_url == settings.llm.base_url
 
 
-def test_from_env_missing_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """测试未设置环境变量时抛 ValueError。"""
+def test_load_tolerates_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试没有密钥时读取配置**不抛异常**。
+
+    否则 `prism --help` / `prism diff` 这些根本不需要密钥的命令，会在导入配置
+    阶段就崩掉。校验时机交给 LLMClient（上一个用例）。
+    """
     monkeypatch.delenv(API_KEY_ENV, raising=False)
-    with pytest.raises(ValueError, match=API_KEY_ENV):
-        LLMConfig.from_env()
+
+    assert load().llm.api_key == ""
 
 
 # ---------- 思考内容回传 ----------
@@ -127,7 +131,9 @@ def make_echo_model() -> ReasoningEchoChatDeepSeek:
         ReasoningEchoChatDeepSeek 实例
     """
     return ReasoningEchoChatDeepSeek(
-        model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL, api_key=SecretStr("test-key")
+        model=settings.llm.model,
+        base_url=settings.llm.base_url,
+        api_key=SecretStr("test-key"),
     )
 
 

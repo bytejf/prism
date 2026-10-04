@@ -72,7 +72,35 @@ high: 4 | medium: 1 | low: 0
 | 变量 | 说明 |
 |------|------|
 | `DEEPSEEK_API_KEY` | **必填**（仅 `review` 需要）。缺失时 `review` 以退出码 1 明确报错 |
-| `PRISM_LOG_LEVEL` | 日志级别，默认 `INFO`。只作用于 `prism` 命名空间，不影响第三方库。想看完整轨迹设 `DEBUG`，想只看结果设 `WARNING` |
+| `PRISM_LOG_LEVEL` | 日志级别，覆盖配置文件里的 `[log].level`。只作用于 `prism` 命名空间，不影响第三方库。想看完整轨迹设 `DEBUG`，想只看结果设 `WARNING` |
+
+## 配置文件
+
+**默认值只有一份**，在 `src/prism/config/default.toml`：模型与窗口、压缩阈值、
+审查轮次、工具上限、日志级别。改值改那个文件即可，代码里没有第二份。
+
+```toml
+[llm]
+model = "deepseek-flash"
+context_window = 1000000     # 压缩的触发阈值由它算出来
+reasoning_effort = "low"     # API 默认是 high（最贵档）
+
+[compression]
+reserve_tokens = 20000       # 已用达到 (窗口 - 预留) 就压缩
+
+[review]
+min_rounds = 30
+rounds_per_hunk = 5
+
+[tools.file_read]
+max_lines = 500
+```
+
+文件里每个键都带注释说明它控制什么，开头还列了**哪些值故意不在这里**（标签名、
+`H-01` 编号格式、退出原因码、提示词全文……）——那些是对 LLM / git / 框架的契约，
+写进配置等于把它们变成「可以配错的东西」，而配错的后果是静默失效。
+
+配置读错时**直接报错**并指出是哪个文件、哪一段、哪个键，不静默回落到默认值。
 
 ## 设计要点
 
