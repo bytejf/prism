@@ -46,8 +46,9 @@ from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import group_by_package
 from prism.core.guidance import templates as tpl
+from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
-from prism.core.output.sort import sort_comments, to_comments
+from prism.core.output.sort import sort_comments
 from prism.models.comment import ReviewStats
 from prism.models.grouping import Group
 
@@ -265,12 +266,17 @@ def test_debug_full_pipeline() -> None:
     assert result.exit_reason == "end_done"
     assert result.pending_hunk_ids == []
 
-    # ── 阶段 7：整理 + 排序 ──────────────────────────────────────────
-    # 断在这里看排序前后的顺序差异
-    comments = sort_comments(to_comments([result], groups))
-    print(f"\n[7] 整理排序: {len(comments)} 条评论")
+    # ── 阶段 7：定位 + 排序 ──────────────────────────────────────────
+    # 断在这里看定位出来的行号，以及排序前后的顺序差异
+    located = locate_group(first_group, result.hunk_comments)
+    comments = sort_comments(located)
+    print(f"\n[7] 定位排序: {len(comments)} 条评论")
     for comment in comments:
-        print(f"    [{comment.severity:<7}] {comment.path:<20} {comment.content[:56]}")
+        span = f"{comment.path}:{comment.start_line}"
+        print(
+            f"    [{comment.severity:<7}] {comment.locate_level:<7} {span:<24} "
+            f"{comment.content[:48]}"
+        )
 
     # ── 阶段 8：终端渲染 ─────────────────────────────────────────────
     stats = ReviewStats(

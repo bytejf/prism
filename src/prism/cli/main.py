@@ -45,7 +45,8 @@
 ## 完整审查（调用 LLM，产生 token 成本）
 
     prism review    --path <repo> [--base main] [--head HEAD]
-        串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。
+        串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 定位 → 排序
+        → 终端渲染。
 
         审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
         想看完整轨迹设 `PRISM_LOG_LEVEL=DEBUG`，想只看结果设 `PRISM_LOG_LEVEL=WARNING`。
@@ -82,16 +83,16 @@ import typer
 
 from prism.config.settings import settings
 from prism.core.agent.agent import run_review_agent
-from prism.core.agent.state import MainLoopResult
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import group_by_package
 from prism.core.llm.client import LLMClient
+from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
-from prism.core.output.sort import sort_comments, to_comments
+from prism.core.output.sort import sort_comments
 from prism.models.ast import HunkWithSymbol
-from prism.models.comment import ReviewStats
+from prism.models.comment import LOCATE_FAILED, Comment, ReviewStats
 from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.observability.logging import setup_logging
@@ -359,8 +360,13 @@ def _run_groups(
     groups: list[Group],
     project_root: Path,
     head_rev: str,
-) -> list[MainLoopResult]:
-    """串行跑完所有审查单元（V1 不做并发）。
+) -> list[Comment]:
+    """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位。
+
+    定位放在循环体里而不是等所有组跑完，有两个原因：一是与设计文档的
+    「每组审查完成 → 定位」一致，二是后续的反思阶段是**每组一次 LLM 调用**，
+    它要的素材（本组 hunk + 本组评论 + 定位元数据）正好都在这里，不必等到
+    全局再按组拆回来。
 
     Args:
         groups: 审查单元列表
@@ -368,10 +374,10 @@ def _run_groups(
         head_rev: 被审查的版本，传给工具读源码用
 
     Returns:
-        各组的循环产出
+        全部已定位的评论（未定位的也在其中，带 locate_level 标记）
     """
     llm = _llm_or_exit()
-    results: list[MainLoopResult] = []
+    comments: list[Comment] = []
     for index, item in enumerate(groups, start=1):
         typer.echo(
             f"Processing Group {index}: {item.package_path} "
@@ -386,12 +392,15 @@ def _run_groups(
             head_rev,
             settings.compression,
         )
-        results.append(result)
+        located = locate_group(item, result.hunk_comments)
+        comments.extend(located)
+        unlocated = sum(1 for comment in located if comment.locate_level == LOCATE_FAILED)
         typer.echo(
-            f"  {result.group_id} completed: {_plural(len(result.comments), 'comment')} "
-            f"(exit_reason={result.exit_reason}, 轮次={result.round_count})"
+            f"  {result.group_id} completed: {_plural(len(located), 'comment')} "
+            f"(exit_reason={result.exit_reason}, 轮次={result.round_count}, "
+            f"未定位={unlocated})"
         )
-    return results
+    return comments
 
 
 @app.command()
@@ -422,8 +431,7 @@ def review(
     if not groups:
         typer.echo("没有可审查的 hunk。")
 
-    results = _run_groups(groups, root, head) if groups else []
-    comments = sort_comments(to_comments(results, groups))
+    comments = sort_comments(_run_groups(groups, root, head) if groups else [])
 
     stats = ReviewStats(
         base_branch=base,
