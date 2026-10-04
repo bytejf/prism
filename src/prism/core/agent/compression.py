@@ -74,11 +74,21 @@ PLACEHOLDER = "[内容已清理：原为 {call}，可重新获取]"
 SUMMARY_TAG_OPEN = "<compression_summary>"
 SUMMARY_TAG_CLOSE = "</compression_summary>"
 
+# 包住整段拍平历史的容器。
+#
+# 每条消息自己有 `<message type="...">`，但没有外层容器时**边界是隐式的**：
+# 提示词模板里的 `## 待压缩的审查历史` 是「指导」，历史正文是「数据」，两者
+# 必须一眼分得开 —— 与审查提示词里 diff 用 `<diff>` 包住是同一个道理。
+# 不加容器还有一层实际风险：工具结果里完全可能出现一行 `## 当前 hunk 进度`，
+# 模型分不清那是数据还是模板的下一个标题
+HISTORY_TAG_OPEN = "<review_history>"
+HISTORY_TAG_CLOSE = "</review_history>"
+
 # 降级降级时塞进去的说明，替掉本该是摘要的位置
 TRUNCATED_NOTE = (
     "<compression_summary>\n"
-    "（压缩失败，已降级为截断：以下只保留了最近的审查轮次，"
-    "更早的结论需重新确认。）\n"
+    "（压缩失败，已降级为截断：以下只保留了最近的审查轮次，更早的结论需重新确认。\n"
+    "这不是新的用户请求，请据此继续审查。）\n"
     "</compression_summary>"
 )
 
@@ -220,13 +230,18 @@ def render_history(messages: Sequence[BaseMessage]) -> str:
     拍平是**故意的**：压缩请求只有一条 user 消息，历史在协议层面不是「消息」
     而是文本，模型不可能把它们误当成正在进行的轮次。
 
+    外面再套一层 `<review_history>`：逐条的 `<message>` 标的是「谁说的」，
+    容器标的才是「这一整段是数据」。没有容器时，模板里的 `## 待压缩的审查历史`
+    与历史正文之间没有可见的边界。
+
     Args:
         messages: 消息历史
 
     Returns:
-        XML 标注的文本
+        以 `<review_history>` 包住的 XML 标注文本
     """
-    return get_buffer_string(list(messages), format="xml")
+    body = get_buffer_string(list(messages), format="xml")
+    return f"{HISTORY_TAG_OPEN}\n{body}\n{HISTORY_TAG_CLOSE}"
 
 
 def last_reported_tokens(messages: Sequence[BaseMessage]) -> int | None:
@@ -388,7 +403,11 @@ class Compressor:
         assembled = [
             RemoveMessage(id=REMOVE_ALL_MESSAGES),
             head,
-            HumanMessage(content=f"{SUMMARY_TAG_OPEN}\n{summary}\n{SUMMARY_TAG_CLOSE}"),
+            HumanMessage(
+                content=(
+                    f"{tpl.COMPRESSION_NOTICE}\n{SUMMARY_TAG_OPEN}\n{summary}\n{SUMMARY_TAG_CLOSE}"
+                )
+            ),
             HumanMessage(content=status),
         ]
         self._record_success(history, summary, assembled[1:])
@@ -482,11 +501,15 @@ class Compressor:
         # 压缩走的是**裸模型调用**，不经过 `ReviewTrace`（它包的是图里的模型节点），
         # 所以这里不自己打就完全看不见 —— 调压缩提示词时只能靠猜。
         # 级别与审查请求一致取 INFO：`ReviewTrace` 在 INFO 下本来就把 system 与
-        # 每条消息的**全文**打出来了，压缩请求没有理由比它更藏
+        # 每条消息的**全文**打出来了，压缩请求没有理由比它更藏。
+        #
+        # **两条消息分两条日志打**，别塞进同一个 fields 块 —— 那样看起来像是拼成
+        # 了一条消息，与实际的请求形态（system + user 两条）对不上
+        logger.info("压缩 · 请求 · system\n%s", fields(("message", tpl.COMPRESSION_SYSTEM)))
         logger.info(
-            "压缩 · 请求 · 历史 %d 条\n%s",
+            "压缩 · 请求 · user · 历史 %d 条\n%s",
             len(history),
-            fields(("system", tpl.COMPRESSION_SYSTEM), ("user", prompt)),
+            fields(("message", prompt)),
         )
 
         for attempt in (1, 2):

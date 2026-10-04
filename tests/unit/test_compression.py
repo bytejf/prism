@@ -202,10 +202,17 @@ def test_clean_leaves_message_count_and_ids_alone() -> None:
 # ---------- 拍平与计量 ----------
 
 
-def test_render_history_inlines_tool_call() -> None:
-    """测试：历史拍平成带角色标注的 XML 文本。"""
+def test_render_history_wraps_in_container() -> None:
+    """测试：历史拍平成带角色标注的 XML，外面再套一层容器。
+
+    逐条的 `<message>` 标的是「谁说的」，容器标的才是「这一整段是数据」。
+    没有容器时，模板里的 `## 待压缩的审查历史` 与历史正文之间没有可见边界 ——
+    工具结果里出现一行 `## 当前 hunk 进度` 就分不清是数据还是模板标题。
+    """
     text = render_history(sample_history()[:3])
 
+    assert text.startswith("<review_history>")
+    assert text.endswith("</review_history>")
     assert '<message type="human">指导 + diff</message>' in text
     assert '<tool_call id="c1" name="file_read">' in text
     assert '<message type="tool">500 行代码</message>' in text
@@ -336,10 +343,27 @@ def test_compress_assembles_summary_and_fresh_status() -> None:
     # 首条是「清空全部」哨兵，其余是可读消息
     assert result[0].__class__.__name__ == "RemoveMessage"
     assert result[1].content == "指导 + diff"
-    assert str(result[2].content).startswith(SUMMARY_TAG_OPEN)
+    assert SUMMARY_TAG_OPEN in str(result[2].content)
     assert "## Current Work" in str(result[2].content)
     assert "<review_status>" in str(result[3].content)
     assert "H-01" in str(result[3].content)
+
+
+def test_compress_prefixes_notice_before_summary() -> None:
+    """测试：摘要前面要有来路说明，并落在 `<compression_summary>` **外面**。
+
+    模型看到一段没头没尾的结构化文本，最省事的解释是「这是新的用户请求」——
+    于是可能去回应它、或者当成新任务重头再来。标签内保持是纯粹的摘要，
+    以后要做「摘要与 `<review_status>` 对账」时正文里不该混进我们自己的话。
+    """
+    compressor = make_compressor([GOOD_SUMMARY])
+
+    result = compressor.compress(sample_history(), {})
+    content = str(result[2].content)
+
+    assert tpl.COMPRESSION_NOTICE in content
+    assert content.index(tpl.COMPRESSION_NOTICE) < content.index(SUMMARY_TAG_OPEN)
+    assert "不是新的用户请求" in content
 
 
 def test_compress_request_carries_background_and_cleaned_history() -> None:
