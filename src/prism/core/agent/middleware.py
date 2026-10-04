@@ -19,9 +19,12 @@ import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from langchain.agents.middleware import after_model, before_model
+from langchain.agents.middleware import AgentMiddleware, after_model
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.runtime import Runtime
 
+from prism.core.agent.compression import Compressor
+from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
     NO_PROGRESS_EXIT_ROUNDS,
     NO_PROGRESS_REMIND_ROUNDS,
@@ -148,39 +151,76 @@ def _last_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
     return []
 
 
-@before_model(state_schema=ReviewState, can_jump_to=["end"], name="ReviewProgress")
-def review_progress(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
-    """模型调用前：追加进度快照，并判定语义退出。
+class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
+    """模型调用前：追加进度快照、必要时压缩历史，并判定语义退出。
 
     进度快照挂在这里而不是工具里，是为了**保持与旧实现完全相同的时序**：
     旧实现是「工具跑完 → 追加快照 → 判定退出 → 调模型」，这里一一对应。
+    压缩也挂这里，理由相同 —— `before_model` 是唯一能同时看到「工具跑完的状态」
+    与「还没发出去的请求」的位置。
 
-    Args:
-        state: 当前状态
-        _runtime: 运行时。框架按位置传参（`func(state, runtime)`），位置必须留着，
-            但本钩子用不到，故加下划线前缀表明「占位而非遗漏」
-
-    Returns:
-        状态更新；需要退出时带 ``jump_to="end"``
+    写成**类式**而不是 `@before_model` 装饰模块级函数：装饰器产出的中间件实例是
+    **全局共享**的（框架缺口，见 CLAUDE.md），而压缩持有跨轮次状态（压缩次数、
+    连续失败数、熔断标记），共用会把上一组的熔断带到下一组。
     """
-    updates: dict[str, Any] = {}
 
-    calls = _last_tool_calls(state["messages"])
-    if any(str(call.get("name", "")) == "report_hunks" for call in calls):
-        updates["messages"] = [HumanMessage(content=build_review_status(state["hunk_status"]))]
+    state_schema = ReviewState
 
-    reset = end_done_reset(state)
-    if reset:
-        logger.debug("新审完 hunk，重置 end_done 纠正机会")
-        updates.update(reset)
+    def __init__(self, compressor: Compressor | None = None) -> None:
+        """初始化。
 
-    # 退出判定要看重置之后的值
-    end_done_count = 0 if reset else state["end_done_count"]
-    if should_exit(state, end_done_count=end_done_count):
-        logger.info("退出：end_done 或连续无产出已达阈值")
-        return {**updates, "jump_to": "end"}
+        Args:
+            compressor: 压缩器；传 None 表示本组不做压缩（测试里常用）
+        """
+        super().__init__()
+        self._compressor = compressor
 
-    return updates or None
+    def before_model(
+        self, state: ReviewState, runtime: Runtime[ReviewContext]
+    ) -> dict[str, Any] | None:
+        """压缩 → 追加快照 → 判定退出。
+
+        Args:
+            state: 当前状态
+            runtime: 运行时。本钩子用不到，但**参数名不能改成 `_runtime`** ——
+                手写类时框架靠签名自省决定注入哪些参数（`func_accepts`），
+                认不出 `_runtime` 这个键就不注入，直接报
+                「missing 1 required positional argument」。装饰器写法没这问题，
+                它按位置转发。同理不能删掉这个参数，留着是对齐基类签名
+
+        Returns:
+            状态更新；需要退出时带 ``jump_to="end"``
+        """
+        updates: dict[str, Any] = {}
+
+        if self._compressor is not None and self._compressor.should_compress(state["messages"]):
+            # 压缩会自己追加一份最新的 <review_status>，所以这里不再重复注入快照
+            updates["messages"] = self._compressor.compress(state["messages"], state["hunk_status"])
+        else:
+            calls = _last_tool_calls(state["messages"])
+            if any(str(call.get("name", "")) == "report_hunks" for call in calls):
+                updates["messages"] = [
+                    HumanMessage(content=build_review_status(state["hunk_status"]))
+                ]
+
+        reset = end_done_reset(state)
+        if reset:
+            logger.debug("新审完 hunk，重置 end_done 纠正机会")
+            updates.update(reset)
+
+        # 退出判定要看重置之后的值
+        end_done_count = 0 if reset else state["end_done_count"]
+        if should_exit(state, end_done_count=end_done_count):
+            logger.info("退出：end_done 或连续无产出已达阈值")
+            return {**updates, "jump_to": "end"}
+
+        return updates or None
+
+
+# `can_jump_to` 的读取路径是 `getattr(middleware.__class__, "before_model").__can_jump_to__`
+# （见 `langchain/agents/factory.py` 的 `_get_can_jump_to`）。装饰器写法会把这个属性
+# 挂到包装出来的函数上，手写类就得自己挂一次 —— 框架缺口，不是我们的取舍。
+ReviewProgress.before_model.__can_jump_to__ = ["end"]  # type: ignore[attr-defined]
 
 
 @after_model(state_schema=ReviewState, can_jump_to=["model", "end"], name="ReviewPacing")

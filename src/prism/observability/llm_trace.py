@@ -33,6 +33,10 @@
 | 工具结果 | `ReviewTrace.wrap_tool_call`（顺带测工具执行耗时） |
 | 中间件注入的 user（进度快照 / 提醒） | 也走 `wrap_model_call` —— 它们在下一次请求里才出现 |
 
+压缩（`core/agent/compression.py`）会让消息数**变小**，这是唯一一处「历史不在增长」
+的地方：`self._logged` 下标要跟着重置，轮次号则自己数（不能拿 AI 消息条数当轮次 ——
+压缩会把它们删掉）。
+
 ## 为什么是类式中间件
 
 `ReviewTrace` 持有跨轮次的状态（已打过的消息数、上一轮的输入 token）。
@@ -204,6 +208,9 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
         # 首轮没有「上一轮」，环比增量从第二轮开始
         self._prev_input_tokens: int | None = None
         self._config_logged = False
+        # 自己数轮次，不用「历史里有几条 AI 消息」—— 压缩会把 AI 消息删掉，
+        # 那样轮次会从 12 掉回 1，日志里的轮次号就没法对账了
+        self._round_no = 0
 
     def wrap_model_call(
         self,
@@ -225,10 +232,11 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
         response = handler(request)
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
-        round_no = _ai_count(request.messages) + 1
+        round_no = self._round_no + 1
         for message in response.result:
             if isinstance(message, AIMessage):
                 self._log_response(message, round_no=round_no, elapsed_ms=elapsed_ms)
+                self._round_no = round_no
                 usage = message.usage_metadata
                 # 记下来给下一轮算环比增量
                 self._prev_input_tokens = usage.get("input_tokens") if usage else None
@@ -255,7 +263,7 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
         for message in _tool_messages(result):
             logger.info(
                 "tool · 轮次=%d · %s · 执行 %dms · 结果 %d 字符\n%s",
-                _ai_count(request.state["messages"]),
+                self._round_no,
                 # name 是 ToolCall 的必填键，直接取下标
                 request.tool_call["name"],
                 elapsed_ms,
@@ -281,6 +289,15 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
             system_message = request.system_message
             if system_message is not None:
                 logger.info("system\n%s", fields(("message", str(system_message.content))))
+
+        if len(request.messages) < self._logged:
+            # 压缩把历史换成了「摘要 + 新进度」，消息数会**变小**。
+            # 不重置的话 `self._logged` 永远超过长度，切片恒为空 ——
+            # 后面每一轮的上下文都不再打日志，而且是静默的
+            logger.info(
+                "上下文被压缩：消息数 %d → %d，重新开始记录", self._logged, len(request.messages)
+            )
+            self._logged = 0
 
         for index, message in enumerate(request.messages[self._logged :], start=self._logged):
             if isinstance(message, (AIMessage, ToolMessage)):

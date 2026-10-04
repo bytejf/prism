@@ -35,6 +35,7 @@ from prism.core.agent.state import (
 )
 from prism.core.agent.status import build_review_status
 from prism.models.ast import HunkWithSymbol, Symbol
+from prism.models.compression import CompressionConfig
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
@@ -548,6 +549,64 @@ def test_main_loop_injects_review_status_after_report(project_root: str) -> None
     # 第二轮调用 LLM 时，消息里应已含 review_status
     second_round = llm.calls[1]
     assert any("<review_status>" in str(message.content) for message in second_round)
+
+
+def with_usage(message: AIMessage, tokens: int) -> AIMessage:
+    """给脚本响应挂上 `usage_metadata`。
+
+    压缩的触发只看 API 报告的 token 数，而假模型默认不带 usage —— 补上它也是
+    在测试里「逼出压缩」的唯一手段（真实场景下这个字段由 API 填）。
+
+    Args:
+        message: 原始响应
+        tokens: 报告的总 token 数
+
+    Returns:
+        带 usage 的响应副本
+    """
+    usage: Any = {"input_tokens": tokens - 1, "output_tokens": 1, "total_tokens": tokens}
+    return message.model_copy(update={"usage_metadata": usage})
+
+
+def test_main_loop_compresses_when_window_is_tight(project_root: str) -> None:
+    """测试：逼近窗口时压缩历史，且压缩后 A 段与权威进度都还在。
+
+    这一段脚本同时喂了两条路径：第 1 条是审查响应、第 2 条是**压缩请求**的响应
+    （压缩用的是同一个模型）、第 3 条是压缩后下一轮的审查响应。
+    """
+    # 至少命中 3 个段标题才算合格摘要（见 compression.MIN_SECTIONS）
+    summary = (
+        "## Primary Request\n审查 . 包的 1 个 hunk\n\n"
+        "## Completed Hunks\n- H-01：无问题\n\n"
+        "## Current Work\n正在审查 H-01。"
+    )
+    llm = ScriptedChatModel(
+        responses=[
+            with_usage(report_call(["H-01"]), 5_000),
+            AIMessage(content=summary),
+            done_call(),
+        ]
+    )
+
+    run_review_agent(
+        make_group(["H-01"]),
+        llm,
+        project_root,
+        compression=CompressionConfig(context_window=1_000, reserve_tokens=100),
+    )
+
+    assert len(llm.calls) == 3, "审查 → 压缩 → 继续审查"
+    # 压缩请求：system 是压缩专用那份，user 里带着背景与清理过的历史
+    request = llm.calls[1]
+    assert "压缩" in str(request[0].content)
+    assert "<hunk id=" in str(request[1].content), "背景里要有 diff"
+    # 压缩后的下一轮：A 段 + 摘要 + 权威进度，三者都在
+    after = llm.calls[2]
+    joined = "\n".join(str(message.content) for message in after)
+    assert "<hunk id=" in joined, "A 段（指导 + diff）必须原样保留"
+    assert "<compression_summary>" in joined
+    assert "<review_status>" in joined
+    assert "500 行代码" not in joined
 
 
 def test_main_loop_injects_reminder_on_plain_text(project_root: str) -> None:

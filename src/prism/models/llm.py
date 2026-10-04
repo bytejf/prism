@@ -11,6 +11,10 @@ DEFAULT_MODEL = "deepseek-flash"
 # API key 所在的环境变量名
 API_KEY_ENV = "DEEPSEEK_API_KEY"
 
+# 模型上下文窗口（token）。压缩的触发阈值由它算出来，所以**不硬编码在压缩逻辑里** ——
+# 换模型、DeepSeek 升级窗口时只改这一处。实测当前模型是 1M，不是 128K。
+DEFAULT_CONTEXT_WINDOW = 1_000_000
+
 # 思考强度默认值。API 的默认档位是 high，显式降到 low：
 # 审查任务里模型绝大多数轮次只是「读文件 → 报告结论」，不需要深推理，
 # 而思考 token 计费且会让 prompt 一起变长（实测 thinking 开/关：38 vs 12 tokens）
@@ -33,6 +37,7 @@ class LLMConfig:
             保留字段只为非思考模型
         max_retries: 重试次数，默认 3
         timeout: 超时秒数，默认 60
+        context_window: 上下文窗口（token），压缩据此判断何时触发
     """
 
     model: str = DEFAULT_MODEL
@@ -42,6 +47,7 @@ class LLMConfig:
     temperature: float = 0.0
     max_retries: int = 3
     timeout: int = 60
+    context_window: int = DEFAULT_CONTEXT_WINDOW
 
     @classmethod
     def from_env(cls) -> "LLMConfig":

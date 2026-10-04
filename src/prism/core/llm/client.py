@@ -140,6 +140,18 @@ class LLMClient:
         )
 
     @property
+    def config(self) -> LLMConfig:
+        """构造时用的配置。
+
+        调用方靠它取 `context_window` 之类**模型能力**的字段去配压缩阈值，
+        不必再各自读一遍环境变量。
+
+        Returns:
+            本次使用的 LLMConfig
+        """
+        return self._config
+
+    @property
     def model(self) -> BaseChatModel:
         """构造好的 LangChain ChatModel。
 

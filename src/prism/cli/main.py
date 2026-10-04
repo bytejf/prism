@@ -91,6 +91,7 @@ from prism.core.output.renderer import TerminalRenderer
 from prism.core.output.sort import sort_comments, to_comments
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import ReviewStats
+from prism.models.compression import CompressionConfig
 from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.models.llm import LLMConfig
@@ -376,7 +377,15 @@ def _run_groups(
             f"Processing Group {index}: {item.package_path} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
-        result = run_review_agent(item, llm.model, str(project_root), head_rev)
+        # 窗口大小从 LLMConfig 来：换模型 / DeepSeek 升级窗口时只改配置，
+        # 压缩的触发阈值跟着走
+        result = run_review_agent(
+            item,
+            llm.model,
+            str(project_root),
+            head_rev,
+            CompressionConfig(context_window=llm.config.context_window),
+        )
         results.append(result)
         typer.echo(
             f"  {result.group_id} completed: {_plural(len(result.comments), 'comment')} "

@@ -21,8 +21,9 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
+from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
-from prism.core.agent.middleware import review_pacing, review_progress
+from prism.core.agent.middleware import ReviewProgress, review_pacing
 from prism.core.agent.state import (
     STATUS_PENDING,
     HunkStatus,
@@ -38,6 +39,7 @@ from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
 from prism.core.tools.report_hunks import report_hunks
+from prism.models.compression import CompressionConfig
 from prism.models.grouping import Group
 from prism.observability.llm_trace import ReviewTrace
 
@@ -68,12 +70,15 @@ def build_tools() -> list[BaseTool]:
 Agent = CompiledStateGraph[ReviewState, ReviewContext, ReviewState, ReviewState]
 
 
-def build_review_agent(model: BaseChatModel, max_rounds: int) -> Agent:
+def build_review_agent(
+    model: BaseChatModel, max_rounds: int, compression: CompressionConfig | None = None
+) -> Agent:
     """组装审查 Agent。
 
     Args:
         model: LangChain ChatModel
         max_rounds: 单组最大模型调用次数（框架的 ModelCallLimitMiddleware 执行）
+        compression: 压缩配置；传 None 表示本组不压缩（测试里常用）
 
     Returns:
         编译好的 agent 图
@@ -97,7 +102,11 @@ def build_review_agent(model: BaseChatModel, max_rounds: int) -> Agent:
                     # 每组审查新建一个实例 —— 它持有跨轮次的状态（已打过的
                     # 消息数、上一轮输入 token），共用实例会串到下一组去
                     ReviewTrace(),
-                    review_progress,
+                    # 压缩器同理：压缩次数、连续失败数、熔断标记都是每组的，
+                    # 共用一个实例会把上一组的熔断带到下一组
+                    ReviewProgress(
+                        Compressor(model, compression) if compression is not None else None
+                    ),
                     review_pacing,
                     # 轮次上限：框架自带，不用自己数
                     ModelCallLimitMiddleware(run_limit=max_rounds, exit_behavior="end"),
@@ -143,7 +152,11 @@ def initial_state(group: Group, max_rounds: int) -> ReviewState:
 
 
 def run_review_agent(
-    group: Group, model: BaseChatModel, project_root: str, head_rev: str = ""
+    group: Group,
+    model: BaseChatModel,
+    project_root: str,
+    head_rev: str = "",
+    compression: CompressionConfig | None = None,
 ) -> MainLoopResult:
     """跑一个审查单元的循环。
 
@@ -152,6 +165,9 @@ def run_review_agent(
         model: LangChain ChatModel
         project_root: 项目根目录
         head_rev: 被审查的版本，工具据此读取源码而不是读工作区
+        compression: 压缩配置。**默认开启**（用默认阈值）；1M 窗口下几乎不会触发，
+            它是保险不是常规操作。传 ``CompressionConfig(context_window=...)``
+            收小窗口就能在测试里逼出压缩
 
     Returns:
         循环产出（退出原因、评论、未审 hunk 等）
@@ -169,7 +185,7 @@ def run_review_agent(
         max_rounds,
     )
 
-    agent = build_review_agent(model, max_rounds)
+    agent = build_review_agent(model, max_rounds, compression or CompressionConfig())
     # 出参 cast：不传 version 时框架走 `version="v1"` 那个 overload，
     # 返回类型是 `dict[str, Any] | Any`，不认识 state_schema 里的自定义键。
     # 不 cast，下面 `final["hunk_status"]` 就退化成 Any，这一层的检查等于没加。
