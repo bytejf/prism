@@ -7,6 +7,8 @@ from prism.models.comment import (
     REASON_EMPTY_EXISTING_CODE,
     REASON_MULTI_MATCH,
     REASON_NO_MATCH,
+    SIDE_LEFT,
+    SIDE_RIGHT,
     Comment,
     ReviewStats,
 )
@@ -22,6 +24,7 @@ def make_comment(
     start_line: int = 10,
     end_line: int = 10,
     locate_level: str = LOCATE_HUNK,
+    side: str | None = SIDE_RIGHT,
     locate_reason: str | None = None,
 ) -> Comment:
     """构造测试用 Comment。
@@ -35,6 +38,7 @@ def make_comment(
         start_line: 起始行号
         end_line: 结束行号
         locate_level: 定位层级
+        side: 行号属于哪一侧
         locate_reason: 未定位原因
 
     Returns:
@@ -48,6 +52,7 @@ def make_comment(
         existing_code="go func() {}()",
         hunk_id="H-01",
         locate_level=locate_level,
+        side=side,
         locate_reason=locate_reason,
         suggestion_code=suggestion_code,
         start_line=start_line,
@@ -75,6 +80,7 @@ def make_unlocated(
         path=path,
         content=content,
         locate_level=LOCATE_FAILED,
+        side=None,
         locate_reason=locate_reason,
         start_line=0,
         end_line=0,
@@ -122,6 +128,27 @@ def test_render_multiline_span() -> None:
     output = TerminalRenderer().render([make_comment(start_line=245, end_line=248)], make_stats())
 
     assert "─── agent.go:245-248 ───" in output
+
+
+def test_render_deleted_side_is_marked() -> None:
+    """测试删除侧的行号带标注。
+
+    LEFT 的行号是**基准版本**的坐标，拿到当前文件里找是找不到的。不标的话
+    读者会以为定位错了 —— 这类「看起来像 bug 的正确输出」最费时间。
+    """
+    output = TerminalRenderer().render(
+        [make_comment(start_line=7, end_line=9, side=SIDE_LEFT)], make_stats()
+    )
+
+    assert "─── agent.go:7-9（已删除） ───" in output
+
+
+def test_render_added_side_has_no_note() -> None:
+    """测试新增侧不加标注 —— 那是默认读法，标了只是噪音。"""
+    output = TerminalRenderer().render([make_comment(side=SIDE_RIGHT)], make_stats())
+
+    assert "─── agent.go:10 ───" in output
+    assert "已删除" not in output
 
 
 def test_render_empty_comments() -> None:

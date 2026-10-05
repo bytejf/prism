@@ -6,6 +6,9 @@
 会让人以为行号已经核实过。各条带上失败原因，用户一眼能看出是模型没给锚点、
 还是 diff 里找不到、还是歧义。
 
+已定位的评论里，挂在**删除行**上的会标 ``（已删除）``：它的行号是基准版本的
+坐标，不标的话读者会拿它去当前文件里找，找不到还以为定位错了。
+
 V1 简化：不渲染 suggestion_code 的 diff、不展示 rule_ref。
 """
 
@@ -18,6 +21,7 @@ from prism.models.comment import (
     REASON_EMPTY_EXISTING_CODE,
     REASON_MULTI_MATCH,
     REASON_NO_MATCH,
+    SIDE_LEFT,
     Comment,
     ReviewStats,
 )
@@ -31,7 +35,11 @@ HEADER_TITLE = "=== Prism Code Review ==="
 FOOTER_TITLE = "=== 统计 ==="
 
 # 已定位评论的分隔符，如 ─── internal/agent/agent.go:245-248 ───
-SEPARATOR_TEMPLATE = "─── {path}:{span} ───"
+SEPARATOR_TEMPLATE = "─── {path}:{span}{note} ───"
+
+# 删除侧行号的标注。**必须标**：LEFT 的行号是**基准版本**的坐标，拿去
+# 当前文件里找是找不到的 —— 不标的话读者会以为定位错了
+DELETED_NOTE = "（已删除）"
 
 # 徽章，如 [concurrency · high]
 BADGE_TEMPLATE = "[{category} · {severity}]"
@@ -114,7 +122,8 @@ class TerminalRenderer:
         [category · severity]
         评论正文
 
-        单行命中只显示一个行号，不写成 ``12-12``。
+        单行命中只显示一个行号，不写成 ``12-12``。挂在删除行上的额外标
+        ``（已删除）``，并在行号里保留**基准版本**的坐标。
 
         Args:
             comment: 已定位的评论
@@ -127,9 +136,10 @@ class TerminalRenderer:
             if comment.start_line == comment.end_line
             else f"{comment.start_line}-{comment.end_line}"
         )
+        note = DELETED_NOTE if comment.side == SIDE_LEFT else ""
         return "\n".join(
             (
-                SEPARATOR_TEMPLATE.format(path=comment.path, span=span),
+                SEPARATOR_TEMPLATE.format(path=comment.path, span=span, note=note),
                 BADGE_TEMPLATE.format(category=comment.category, severity=comment.severity),
                 comment.content,
             )

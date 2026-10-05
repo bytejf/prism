@@ -1,7 +1,12 @@
 """评论定位的单元测试。
 
-守的主要是「行号算对」与「不丢评论」。定位是纯确定性的：错了不会有任何信号
-—— 评论挂到隔壁几行，读起来和真的一样。所以这里逐条钉住行号的推进规则。
+守的主要是三件事，错了都**没有任何信号**：
+
+- **行号算对** —— 偏几行不影响运行，只是指向隔壁代码
+- **侧算对** —— 行号挂着正确的那一版；标错侧等于让读者去错误的文件版本里找
+- **不丢评论** —— 定位失败的也照样输出
+
+所以这里逐条钉住行号的推进规则与搜索优先级。
 """
 
 import logging
@@ -18,6 +23,8 @@ from prism.models.comment import (
     REASON_EMPTY_EXISTING_CODE,
     REASON_MULTI_MATCH,
     REASON_NO_MATCH,
+    SIDE_LEFT,
+    SIDE_RIGHT,
 )
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
@@ -36,17 +43,20 @@ def make_hunk(
     *,
     path: str = "a.go",
     new_start: int = 10,
+    old_start: int = 10,
 ) -> HunkWithSymbol:
     """构造带正文的 hunk 片。
 
-    正文按 diff 原文写（带 `+` / `-` 前缀）。**定位只看得上 `+` 行与
-    `new_start`**，所以这里让 `old_start` 与它相同 —— 不编一个用不上的数。
+    正文按 diff 原文写（带 `+` / `-` 前缀）。两侧起始行号分开给，因为它们在
+    真实 diff 里经常不同（前面有过删除时就会错开）—— 两侧的行号各自从自己的
+    起点数，测试里也照实分开。
 
     Args:
         hunk_id: hunk 编号
         content: hunk 正文（diff 原文）
         path: 文件路径
         new_start: 新增侧起始行号
+        old_start: 删除侧起始行号
 
     Returns:
         HunkWithSymbol
@@ -54,7 +64,7 @@ def make_hunk(
     body = content.splitlines()
     return HunkWithSymbol(
         part=Hunk(
-            old_start=new_start,
+            old_start=old_start,
             old_lines=sum(1 for line in body if line.startswith("-")),
             new_start=new_start,
             new_lines=sum(1 for line in body if line.startswith("+")),
@@ -121,24 +131,133 @@ def test_normalize_keeps_case() -> None:
     assert normalize("+Err") != normalize("+err")
 
 
-# ---------- 第一层：hunk 内 ----------
+# ---------- 行号：两侧各数各的 ----------
 
 
-def test_locate_counts_only_added_lines() -> None:
-    """测试：`-` 行不占行号。
+def test_added_lines_number_from_new_start() -> None:
+    """测试：新增侧的行号从 `new_start` 起，**删除行不占号**。
 
-    这是行号算错的头号原因：把删除行也推进计数器，行号会整体偏移，而偏移后
-    的值读起来完全正常 —— 不报错、不越界，只是指向隔壁几行。
+    这是行号算错的头号原因：把对面那侧的行也推进计数器，行号会整体偏移，
+    而偏移后的值读起来完全正常 —— 不报错、不越界，只是指向隔壁几行。
     """
     hunk = make_hunk(
         "H-01",
         "-\tif err != nil {\n+\tif err == nil {\n+\t\treturn nil\n+\t}",
         new_start=20,
+        old_start=7,
     )
 
     assert locate("H-01", "if err == nil {", [hunk]).start_line == 20
     assert locate("H-01", "return nil", [hunk]).start_line == 21
     assert locate("H-01", "}", [hunk]).start_line == 22
+
+
+def test_deleted_lines_number_from_old_start() -> None:
+    """测试：删除侧的行号从 `old_start` 起，**新增行不占号**。
+
+    与上一条对称。两侧起点在这条用例里特意错开（7 vs 20），用错一侧会得到
+    一个明显不对但看着很正常的数。
+    """
+    hunk = make_hunk(
+        "H-01",
+        "-\tif err != nil {\n-\t\treturn nil\n+\tif err == nil {",
+        new_start=20,
+        old_start=7,
+    )
+
+    assert locate("H-01", "-if err != nil {", [hunk]).start_line == 7
+    assert locate("H-01", "-return nil", [hunk]).start_line == 8
+
+
+def test_deleted_block_gives_the_whole_range() -> None:
+    """测试：整段删除给出旧版本的区间与 LEFT 侧。
+
+    纯删除的 hunk（`new_lines == 0`）在新版本里没有任何位置，这类评论以前
+    只能进聚合；现在挂到被删掉的那几行上，`side` 标明行号是旧版本的坐标。
+    """
+    hunk = make_hunk("H-01", '-\tif key == "" {\n-\t\treturn ""\n-\t}', new_start=6, old_start=7)
+
+    found = locate("H-01", 'if key == "" {\n\treturn ""\n}', [hunk])
+
+    assert found.side == SIDE_LEFT
+    assert (found.start_line, found.end_line) == (7, 9)
+    assert found.level == LOCATE_HUNK
+
+
+# ---------- 侧：命中哪一版 ----------
+
+
+def test_added_code_anchors_right() -> None:
+    """测试：新增的代码挂 RIGHT，行号是被审查版本的坐标。"""
+    hunk = make_hunk("H-01", "-\tfoo()\n+\tbar()", new_start=8, old_start=11)
+
+    found = locate("H-01", "bar()", [hunk])
+
+    assert (found.side, found.start_line) == (SIDE_RIGHT, 8)
+
+
+def test_deleted_code_anchors_left() -> None:
+    """测试：被删的代码挂 LEFT，行号是基准版本的坐标。"""
+    hunk = make_hunk("H-01", "-\tfoo()\n+\tbar()", new_start=8, old_start=11)
+
+    found = locate("H-01", "foo()", [hunk])
+
+    assert (found.side, found.start_line) == (SIDE_LEFT, 11)
+
+
+def test_plain_snippet_prefers_the_new_side() -> None:
+    """测试：没带记号的片段先试新增侧。
+
+    两侧都能匹配时（这份 diff 是特意造的：同一行既是删的也是加的），新增侧
+    胜出 —— 审查关心的是改动**之后**的状态，评论挂在那儿才对。
+    """
+    hunk = make_hunk("H-01", "-\tfoo()\n+\tfoo()", new_start=8, old_start=11)
+
+    found = locate("H-01", "foo()", [hunk])
+
+    assert (found.side, found.start_line) == (SIDE_RIGHT, 8)
+
+
+def test_plain_snippet_falls_back_to_the_old_side() -> None:
+    """测试：没带记号、新增侧又找不到时，落到删除侧。
+
+    模型从 diff 抄的时候可能顺手把 `-` 抹掉。抹掉了也照样该定位到被删的那行，
+    而不是进聚合。
+    """
+    hunk = make_hunk("H-01", "-\toldCall()\n+\tnewCall()", new_start=8, old_start=11)
+
+    found = locate("H-01", "oldCall()", [hunk])
+
+    assert (found.side, found.start_line) == (SIDE_LEFT, 11)
+
+
+def test_mixed_snippet_anchors_the_added_part() -> None:
+    """测试：一半 `-` 一半 `+` 的片段挂在新增侧。
+
+    模型想表达「把 A 换成了 B」时会连着抄两行。评论讲的是替换**之后**的代码，
+    所以按 `+` 那部分定位；`-` 那部分只当上下文，不参与定案。
+    """
+    hunk = make_hunk("H-01", "-\toldCall()\n+\tnewCall()", new_start=8, old_start=11)
+
+    found = locate("H-01", "-oldCall()\n+newCall()", [hunk])
+
+    assert (found.side, found.start_line) == (SIDE_RIGHT, 8)
+
+
+def test_deleted_needle_is_tried_before_plain_on_the_old_side() -> None:
+    """测试：删除侧内部，带 `-` 记号的片段比不带记号的先试。
+
+    两个 needle 在这份 diff 里都能命中删除侧（`first()` 在 old 11、`second()`
+    在 old 12），模型明确标了 `-` 的那个更可信，所以结果该是 12 而不是 11。
+    """
+    hunk = make_hunk("H-01", "-\tfirst()\n+\tadded()\n-\tsecond()", new_start=8, old_start=11)
+
+    found = locate("H-01", "-second()\nfirst()", [hunk])
+
+    assert (found.side, found.start_line) == (SIDE_LEFT, 12)
+
+
+# ---------- 匹配的其它细节 ----------
 
 
 def test_locate_multiline_range() -> None:
@@ -152,10 +271,7 @@ def test_locate_multiline_range() -> None:
 
 
 def test_locate_ignores_prefix_and_indent() -> None:
-    """测试：模型从源码抄（不带 `+`、缩进不同）也能命中。
-
-    它是从 file_read 读到的代码，抄回来时自然不带 diff 记号。
-    """
+    """测试：模型从源码抄（不带 `+`、缩进不同）也能命中。"""
     hunk = make_hunk("H-01", "+\t\tif err != nil {")
 
     found = locate("H-01", "if err != nil {", [hunk])
@@ -192,21 +308,6 @@ def test_multi_hit_in_hunk_takes_first() -> None:
     assert found.candidates == 2
 
 
-def test_deleted_line_is_not_a_match() -> None:
-    """测试：`-` 行不参与匹配，即使片段与它逐字相同。
-
-    删除行属于旧版侧，在被审查版本里没有坐标 —— 命中它也只能给出一个旧版
-    行号，那会让同一个字段里混进两套坐标。这类评论落到未定位聚合，它们本来
-    也挂不到新版本的任何一行上。
-    """
-    hunk = make_hunk("H-01", "-\toldCall()\n+\tnewCall()")
-
-    found = locate("H-01", "oldCall()", [hunk])
-
-    assert found.level == LOCATE_FAILED
-    assert found.reason == REASON_NO_MATCH
-
-
 # ---------- 第二层：组内 ----------
 
 
@@ -219,14 +320,38 @@ def test_group_hit_rewrites_hunk_id() -> None:
     """
     hunks = [
         make_hunk("H-01", "+\tfoo()", path="pkg/a.go"),
-        make_hunk("H-02", "+\tbar()", path="pkg/b.go"),
+        make_hunk("H-02", "+\tbar()", path="pkg/b.go", new_start=33),
     ]
 
     found = locate("H-01", "bar()", hunks)
 
     assert found.level == LOCATE_GROUP
     assert found.hunk_id == "H-02"
-    assert found.start_line == 10
+    assert found.start_line == 33
+
+
+def test_group_hit_keeps_its_side() -> None:
+    """测试：组内命中也要带上侧 —— 别组命中的可能是删除行。"""
+    hunks = [
+        make_hunk("H-01", "+\tfoo()", path="pkg/a.go"),
+        make_hunk("H-02", "-\tbar()", path="pkg/b.go", old_start=44),
+    ]
+
+    found = locate("H-01", "-bar()", hunks)
+
+    assert (found.level, found.side, found.start_line) == (LOCATE_GROUP, SIDE_LEFT, 44)
+
+
+def test_deleted_code_in_the_own_hunk_beats_a_group_hit() -> None:
+    """测试：**层优先于侧** —— 本 hunk 的删除行命中，胜过别组的删除行命中。"""
+    hunks = [
+        make_hunk("H-01", "-\tdup()", path="pkg/a.go", old_start=5),
+        make_hunk("H-02", "-\tdup()", path="pkg/b.go", old_start=44),
+    ]
+
+    found = locate("H-01", "-dup()", hunks)
+
+    assert (found.level, found.hunk_id, found.start_line) == (LOCATE_HUNK, "H-01", 5)
 
 
 def test_group_multi_hit_gives_up() -> None:
@@ -252,7 +377,7 @@ def test_no_match_fails() -> None:
 
     assert found.level == LOCATE_FAILED
     assert found.reason == REASON_NO_MATCH
-    assert (found.start_line, found.end_line) == (0, 0)
+    assert (found.start_line, found.end_line, found.side) == (0, 0, None)
 
 
 def test_empty_existing_code_fails_with_its_own_reason() -> None:
@@ -273,7 +398,7 @@ def test_empty_existing_code_fails_with_its_own_reason() -> None:
 
 def test_locate_group_keeps_every_comment() -> None:
     """测试：无论定位成不成功，评论一条都不丢。"""
-    group = make_group([make_hunk("H-01", "+\tfoo()")])
+    group = make_group([make_hunk("H-01", "+\tfoo()\n-\tgone()", old_start=3)])
     hunk_comments = {
         "H-01": [
             make_input("foo()", "能定位的"),
@@ -285,6 +410,32 @@ def test_locate_group_keeps_every_comment() -> None:
 
     assert [item.content for item in comments] == ["能定位的", "定位失败的"]
     assert [item.locate_level for item in comments] == [LOCATE_HUNK, LOCATE_FAILED]
+
+
+def test_locate_group_carries_side_and_coordinates() -> None:
+    """测试：侧与行号一起落到 Comment 上，且不变量成立。
+
+    不变量：**定位成功 ⇔ side 非空**。它没被写进类型，所以要有用例守着 ——
+    漏了 side 的评论会以「新版行号」的样子渲染出来，而它其实是旧版的。
+    """
+    group = make_group([make_hunk("H-01", "+\tbar()\n-\tgone()", new_start=8, old_start=3)])
+    hunk_comments = {
+        "H-01": [
+            make_input("bar()", "新增侧"),
+            make_input("-gone()", "删除侧"),
+            make_input("找不到的", "未定位"),
+        ]
+    }
+
+    comments = locate_group(group, hunk_comments)
+
+    assert [(item.side, item.start_line) for item in comments] == [
+        (SIDE_RIGHT, 8),
+        (SIDE_LEFT, 3),
+        (None, 0),
+    ]
+    for item in comments:
+        assert (item.locate_level == LOCATE_FAILED) == (item.side is None)
 
 
 def test_locate_group_path_follows_the_hit_hunk() -> None:
@@ -381,3 +532,17 @@ def test_ambiguous_count_is_logged(caplog: pytest.LogCaptureFixture) -> None:
         locate_group(group, {"H-01": [make_input("return nil")]})
 
     assert "同 hunk 多命中取首个 1 条" in caplog.text
+
+
+def test_deleted_side_count_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """测试：删除侧的条数要能看见。
+
+    这是「删除行也能挂」这条新能力的**使用率指标** —— 它同时说明聚合里少了
+    多少条，是判断这套侧模型值不值的依据。
+    """
+    group = make_group([make_hunk("H-01", "+\tfoo()\n-\tgone()", old_start=3)])
+
+    with caplog.at_level(logging.INFO, logger=LOCATE_LOGGER):
+        locate_group(group, {"H-01": [make_input("foo()"), make_input("-gone()")]})
+
+    assert "删除侧 1 条" in caplog.text

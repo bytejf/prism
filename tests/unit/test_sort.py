@@ -7,7 +7,7 @@ from prism.core.output.sort import (
     UNKNOWN_SEVERITY_RANK,
     sort_comments,
 )
-from prism.models.comment import LOCATE_HUNK, Comment
+from prism.models.comment import LOCATE_HUNK, SIDE_LEFT, SIDE_RIGHT, Comment
 
 
 def make_comment(
@@ -16,6 +16,7 @@ def make_comment(
     path: str = "a.go",
     start_line: int = 0,
     hunk_id: str = "H-01",
+    side: str | None = SIDE_RIGHT,
 ) -> Comment:
     """构造测试用 Comment。
 
@@ -24,6 +25,7 @@ def make_comment(
         path: 文件路径
         start_line: 起始行号
         hunk_id: hunk 编号
+        side: 行号属于哪一侧（None 表示未定位）
 
     Returns:
         Comment 对象
@@ -36,6 +38,7 @@ def make_comment(
         existing_code="existing",
         hunk_id=hunk_id,
         locate_level=LOCATE_HUNK,
+        side=side,
         start_line=start_line,
     )
 
@@ -78,6 +81,35 @@ def test_sort_unknown_severity_last() -> None:
 
     assert sorted_comments[-1].severity == "unknown"
     assert UNKNOWN_SEVERITY_RANK == 3
+
+
+def test_sort_does_not_interleave_the_two_sides() -> None:
+    """测试同文件内先新增侧、再删除侧。
+
+    两侧的行号是**两套坐标**（新增侧数新版本、删除侧数旧版本），混着比大小
+    排出来的先后纯属巧合。分组展示反而清楚：先看新版上的问题，再看删掉的。
+    """
+    comments = [
+        make_comment(severity="high", path="a.go", start_line=7, side=SIDE_LEFT),
+        make_comment(severity="high", path="a.go", start_line=10, side=SIDE_RIGHT),
+    ]
+
+    ordered = sort_comments(comments)
+
+    assert [c.side for c in ordered] == [SIDE_RIGHT, SIDE_LEFT]
+
+
+def test_sort_unlocated_comes_last() -> None:
+    """测试未定位的排在两侧之后（它会被渲染层挑出去单独展示）。"""
+    comments = [
+        make_comment(severity="high", path="a.go", start_line=0, side=None),
+        make_comment(severity="high", path="a.go", start_line=7, side=SIDE_LEFT),
+        make_comment(severity="high", path="a.go", start_line=10, side=SIDE_RIGHT),
+    ]
+
+    ordered = sort_comments(comments)
+
+    assert [c.side for c in ordered] == [SIDE_RIGHT, SIDE_LEFT, None]
 
 
 def test_sort_does_not_mutate_input() -> None:

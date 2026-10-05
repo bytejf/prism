@@ -1,31 +1,65 @@
 """评论定位：把 LLM 报的评论挂到具体行号上。
 
-**零 LLM** 的确定性步骤 —— 同一输入同一输出。三层回退：
+**零 LLM** 的确定性步骤 —— 同一输入同一输出。
 
-| 层 | 搜索范围 | locate_level | 多命中时 |
-|---|---|---|---|
-| 1 | 评论自己那个 hunk | ``hunk`` | **取第一个** |
-| 2 | 本组其它 hunk | ``group`` | 放弃 → ``failed`` |
-| 3 | 都不中 | ``failed`` | 收拢到未定位聚合 |
+## 两个维度：层 × 侧
 
-## 为什么匹配面是「新增行」，不是「整个文件」
+| 维度 | 取值 | 含义 |
+|---|---|---|
+| **层**（`locate_level`） | hunk / group / failed | 在哪个范围里找到的 |
+| **侧**（`side`） | RIGHT / LEFT | 命中的是**新版还是旧版**的行 |
 
-diff 由 ``-U0`` 生成（`loader.CONTEXT_LINES`），hunk 正文里只有改动行。
-定位只在 ``+`` 行上做，两条理由：
+层和侧**正交**，各有各的精度含义：层是「离这条评论自己那个 hunk 有多远」，
+侧是「行号该去哪一版里读」。
 
-1. **只有 ``+`` 行有被审查版本的坐标**。纯删除的 hunk ``new_lines == 0``，
-   整段在新版本里没有位置，命中它也给不出行号；拿旧版行号回填会让同一个
-   字段里混进两套坐标 —— 那正是本项目最怕的错法。
-2. **行内评论只能挂在改动行上**（GitHub / GitLab 的 PR 注释就是这个约束）。
-   挂在「文件里有、但不在 diff 里」的行上，消费方根本挂不出去。所以
-   搜索面取「本组的改动行」不只是省事，它是唯一有用的那个面。
+## 为什么删除行也要能挂
+
+`side` 照抄 GitHub 的 PR 行内评论模型（`side: LEFT | RIGHT`）。它的限制
+从来不是「只能评论新行」，而是**「行必须在 diff 里」** —— 删除行是一等公民，
+GitHub 对 hunk 之外的行才返回 422。
+
+所以「评论讲的是被删掉的代码」这类不该丢进聚合：它的结论其实落在新版上
+（守卫被删掉之后，那个位置上没有守卫了），但它引用的**证据**是被删的那几行，
+把它们挂回**旧版行号**才是精确的答案。
+
+实测依据：`prism-min-test` 上按「只搜新增行」跑，7 条评论有 2 条落聚合，
+**全部**是删除类（`13-评论定位实现反馈.md` §7.3）。
+
+## 一个片段可能对应两套坐标 —— 按行首记号拆
+
+`existing_code` 是模型从 diff 或 `file_read` 抄来的，行首的 `+` / `-` 记号
+**带不带都行**，而这个记号是关于「哪一侧」的唯一提示。于是先按记号拆成
+几个 needle，再按固定优先级依次搜：
+
+| 优先级 | needle | 搜哪侧 |
+|---|---|---|
+| 1 | `+` 行 | RIGHT |
+| 2 | 无记号的 | RIGHT |
+| 3 | `-` 行 | LEFT |
+| 4 | 无记号的 | LEFT |
+
+**层优先于侧**：本 hunk 内的 LEFT 命中比别组的 RIGHT 命中精确得多，所以把
+一层里的四个 needle 都比完，再进下一层。
+
+规则是「**第一个有命中的就定案**」：混着抄（`-旧` + `+新`）时落在 `+` 那侧
+—— 评论讲的是替换出来的新代码。同一侧多命中仍按层分：hunk 层取首个
+（两个候选都在同一段改动里，取首个比丢进聚合划算）、组内层放弃。
+
+因为「无记号」的 needle 在两侧都试，无记号的删除行引用（模型可能顺手把
+`-` 抹掉）也能落到 LEFT 上。
+
+## 匹配面只有 diff 里的改动行
+
+diff 由 `-U0` 生成（`loader.CONTEXT_LINES`），hunk 正文里只有改动行，能搜的
+只有它们。这不是将就：**行内评论只能挂在 diff 里的行上**，「文件里有、但这次
+没改」的行挂不出去。
 
 ## 为什么组内命中要改写 hunk_id
 
-第二层可能在**另一个文件**里命中，而 ``path`` 是从 ``hunk_id`` 查出来的。
-若保留原编号，评论的 ``path`` 与 ``start_line`` 会指向不同文件 —— 两个字段
-各说各话，还都不报错。所以命中哪个 hunk，``hunk_id`` 就改成哪个（``path``
-随之走），并记一条 INFO。
+第二层可能在**另一个文件**里命中，而 `path` 是从 `hunk_id` 查出来的。
+若保留原编号，评论的 `path` 与 `start_line` 会指向不同文件 —— 两个字段
+各说各话，还都不报错。所以命中哪个 hunk，`hunk_id` 就改成哪个（`path` 随之走），
+并记一条 INFO。
 """
 
 import logging
@@ -41,6 +75,8 @@ from prism.models.comment import (
     REASON_EMPTY_EXISTING_CODE,
     REASON_MULTI_MATCH,
     REASON_NO_MATCH,
+    SIDE_LEFT,
+    SIDE_RIGHT,
     Comment,
 )
 from prism.models.diff import Hunk
@@ -49,8 +85,9 @@ from prism.models.tool import CommentInput
 
 logger = logging.getLogger(__name__)
 
-# diff 正文的行首记号：`+` 新增、`-` 删除
-_PREFIXES = ("+", "-")
+# diff 正文的行首记号 → 该行属于哪一侧。空串表示模型抄来时把记号抹掉了，
+# 那就要两侧都试（见模块 docstring 的优先级表）
+MARKER_SIDE: dict[str, str] = {"+": SIDE_RIGHT, "-": SIDE_LEFT}
 
 
 class Location(NamedTuple):
@@ -58,28 +95,42 @@ class Location(NamedTuple):
 
     Attributes:
         hunk_id: 命中所在 hunk；未定位时仍是评论原报的那个
-        start_line: 命中范围的起始行（被审查版本的坐标）；未定位为 0
-        end_line: 命中范围的结束行（同上）；未定位为 0
-        level: 定位层级（hunk / group / failed）
+        start_line: 命中范围的起始行，按 ``side`` 解释；未定位为 0
+        end_line: 命中范围的结束行，按 ``side`` 解释；未定位为 0
+        level: 搜索层级（hunk / group / failed）
+        side: 行号属于哪一侧（LEFT / RIGHT）；未定位为 None
         reason: 未定位原因，仅 level 为 failed 时非空
-        candidates: 决定这次定位的候选位置数 —— 0 表示没找到，1 表示唯一命中，
-            >1 表示在**同一层**找到多处（hunk 层取首个、组内层放弃）
+        candidates: 决定这次定位的候选位置数 —— 0 没找到、1 唯一、>1 表示在
+            同一层同一侧找到多处（hunk 层取首个、组内层放弃）
     """
 
     hunk_id: str
     start_line: int
     end_line: int
     level: str
+    side: str | None
     reason: str | None
     candidates: int = 0
 
 
-def normalize(line: str) -> str:
-    """归一化一行：去掉 diff 行首的 ``+`` / ``-`` 记号与首尾空白。
+def _marker(line: str) -> str:
+    """取一行的 diff 记号。
 
-    **大小写不动** —— Go 是大小写敏感的语言，``Err`` 与 ``err`` 是两个东西。
+    Args:
+        line: 可能带 `+` / `-` 前缀的一行
+
+    Returns:
+        `+` / `-`；没有记号时为空串
+    """
+    return line[:1] if line[:1] in MARKER_SIDE else ""
+
+
+def normalize(line: str) -> str:
+    """归一化一行：去掉 diff 行首的 `+` / `-` 记号与首尾空白。
+
+    **大小写不动** —— Go 是大小写敏感的语言，`Err` 与 `err` 是两个东西。
     缩进不影响：Go 里缩进不承载语义，而且模型抄写时重新缩进过，也不该因此
-    定位失败。前缀去不去都行，模型从 diff 抄会带上、从源码抄不会带。
+    定位失败。
 
     Args:
         line: diff 正文的一行（可能带前缀），或模型给的原文
@@ -87,46 +138,91 @@ def normalize(line: str) -> str:
     Returns:
         归一化后的文本
     """
-    body = line[1:] if line[:1] in _PREFIXES else line
+    body = line[1:] if _marker(line) else line
     return body.strip()
 
 
-def _added_lines(part: Hunk) -> list[tuple[int, str]]:
-    """hunk 片里带行号的新增行。
+def _needles(existing_code: str) -> dict[str, list[str]]:
+    """按行首记号把片段拆成三组归一化后的行。
 
-    ``+`` 行按顺序占用被审查版本的行号，``-`` 行不占 —— 它属于旧版侧。
-    所以计数器只在遇到 ``+`` 时前进，这条是行号算对的关键：把 ``-`` 也算进去，
-    改一行删一行的那种 hunk 会整体偏移。
+    空行一律丢掉：diff 里新增/删除一个空行会渲染成孤零零一个 `+` / `-`，
+    归一化后是空串；让它参与比对只会把连续匹配打断。
+
+    Args:
+        existing_code: 评论给的代码片段
+
+    Returns:
+        `{"+": [...], "-": [...], "": [...]}`，空串那组是模型抹掉了记号的
+    """
+    groups: dict[str, list[str]] = {marker: [] for marker in (*MARKER_SIDE, "")}
+    for line in existing_code.splitlines():
+        text = normalize(line)
+        if text:
+            groups[_marker(line)].append(text)
+    return groups
+
+
+def _search_plan(groups: dict[str, list[str]]) -> list[tuple[str, list[str]]]:
+    """按优先级列出 (侧, needle)。
+
+    Args:
+        groups: `_needles` 拆出来的三组
+
+    Returns:
+        搜索计划；片段不可用时为空列表
+    """
+    plus, minus, plain = groups["+"], groups["-"], groups[""]
+    plan: list[tuple[str, list[str]]] = []
+    if plus:
+        plan.append((SIDE_RIGHT, plus))
+    if plain:
+        plan.append((SIDE_RIGHT, plain))
+    if minus:
+        plan.append((SIDE_LEFT, minus))
+    if plain:
+        plan.append((SIDE_LEFT, plain))
+    return plan
+
+
+def _side_lines(part: Hunk, side: str) -> list[tuple[int, str]]:
+    """hunk 片里**某一侧**的改动行，带该侧的行号。
+
+    RIGHT 取 `+` 行、行号从 ``new_start`` 起；LEFT 取 `-` 行、从 ``old_start``
+    起。计数器只在遇到**本侧**的记号时前进，这是行号算对的关键：把对面那侧的
+    行也算进去，改一行删一行的那种 hunk 会整体偏移，而偏移后的值读起来完全
+    正常 —— 不报错、不越界，只是指向隔壁几行。
 
     Args:
         part: hunk 片
+        side: LEFT / RIGHT
 
     Returns:
-        (行号, 归一化后的正文) 列表
+        (该侧行号, 归一化后的正文) 列表
     """
+    right = side == SIDE_RIGHT
+    marker = "+" if right else "-"
+    number = part.new_start if right else part.old_start
     lines: list[tuple[int, str]] = []
-    number = part.new_start
     for line in part.content.splitlines():
-        if line.startswith("+"):
+        if line.startswith(marker):
             lines.append((number, normalize(line)))
             number += 1
     return lines
 
 
-def _matches(needle: list[str], added: list[tuple[int, str]]) -> list[tuple[int, int]]:
-    """在新增行里找 needle，返回所有命中的 (起始行, 结束行)。
+def _matches(needle: list[str], lines: list[tuple[int, str]]) -> list[tuple[int, int]]:
+    """在一侧的行里找 needle，返回所有命中的 (起始行, 结束行)。
 
-    两边都先去掉空行再比：diff 里新增一个空行会渲染成孤零零一个 ``+``，
-    归一化后是空串。空行不承载定位信息，让它参与比对只会把连续匹配打断。
+    两边都先去掉空行再比（理由同 `_needles`）。
 
     Args:
-        needle: 归一化并去掉空行后的 existing_code（**非空**，调用方保证）
-        added: 带行号的新增行
+        needle: 归一化并去掉空行后的片段（**非空**，调用方保证）
+        lines: 带行号的一侧内容
 
     Returns:
         命中的行号区间列表，按位置升序
     """
-    surface = [(number, text) for number, text in added if text]
+    surface = [(number, text) for number, text in lines if text]
     width = len(needle)
     return [
         (surface[index][0], surface[index + width - 1][0])
@@ -138,41 +234,46 @@ def _matches(needle: list[str], added: list[tuple[int, str]]) -> list[tuple[int,
 def locate(hunk_id: str, existing_code: str, hunks: list[HunkWithSymbol]) -> Location:
     """把一条评论挂到行号上。
 
+    先试评论自己那个 hunk（层 1），再试本组其它 hunk（层 2）；**每层里都按
+    `_search_plan` 的顺序试完两侧**才算这层没命中。
+
     Args:
         hunk_id: 评论报告的 hunk 编号
         existing_code: 评论给的代码片段
-        hunks: **本组**的全部 hunk（第一、二层都在它里面找）
+        hunks: **本组**的全部 hunk
 
     Returns:
         定位结果
     """
-    needle = [text for text in (normalize(line) for line in existing_code.splitlines()) if text]
-    # schema 只保证「字段存在」，保证不了「内容有意义」：空串、纯空白都可能在
-    # 这里出现。它没有可定位的信息，但不丢评论 —— 后端收拢到聚合
-    if not needle:
-        return Location(hunk_id, 0, 0, LOCATE_FAILED, REASON_EMPTY_EXISTING_CODE)
+    plan = _search_plan(_needles(existing_code))
+    # schema 只保证「字段存在」，保证不了「内容有意义」：空串、纯空白、纯空行
+    # 都可能在这里出现。它没有可定位的信息，但不丢评论 —— 后端收拢到聚合
+    if not plan:
+        return Location(hunk_id, 0, 0, LOCATE_FAILED, None, REASON_EMPTY_EXISTING_CODE)
 
     own = next((item for item in hunks if item.hunk_id == hunk_id), None)
     if own is not None:
-        hits = _matches(needle, _added_lines(own.part))
-        if hits:
-            # 同一 hunk 内多命中**取第一个**，不放弃：两个候选都在同一段改动里，
-            # 取首个比把评论丢进聚合更划算（代价只是行号可能偏几行）。
-            # 决策的代价要靠数字盯住，所以 candidates 带出去给 locate_group 计数
-            return Location(hunk_id, hits[0][0], hits[0][1], LOCATE_HUNK, None, len(hits))
+        for side, needle in plan:
+            hits = _matches(needle, _side_lines(own.part, side))
+            if hits:
+                # 同一 hunk 内多命中**取第一个**，不放弃：两个候选都在同一段
+                # 改动里，取首个比把评论丢进聚合更划算（代价只是行号可能偏
+                # 几行）。代价要靠数字盯住，所以 candidates 带出去计数
+                return Location(hunk_id, hits[0][0], hits[0][1], LOCATE_HUNK, side, None, len(hits))
 
-    # 第一层没中才走第二层 —— 第一层中了就不必再找（它已在最精确的那层）
-    group_hits = [
-        (item.hunk_id, start, end)
-        for item in hunks
-        for start, end in _matches(needle, _added_lines(item.part))
-    ]
-    if len(group_hits) == 1:
-        hit_id, start, end = group_hits[0]
-        return Location(hit_id, start, end, LOCATE_GROUP, None, 1)
-    if len(group_hits) > 1:
-        return Location(hunk_id, 0, 0, LOCATE_FAILED, REASON_MULTI_MATCH, len(group_hits))
-    return Location(hunk_id, 0, 0, LOCATE_FAILED, REASON_NO_MATCH)
+    # 层 1 没中才走层 2 —— 它已在最精确的那层找过两侧了
+    for side, needle in plan:
+        group_hits = [
+            (item.hunk_id, start, end)
+            for item in hunks
+            for start, end in _matches(needle, _side_lines(item.part, side))
+        ]
+        if len(group_hits) == 1:
+            hit_id, start, end = group_hits[0]
+            return Location(hit_id, start, end, LOCATE_GROUP, side, None, 1)
+        if len(group_hits) > 1:
+            return Location(hunk_id, 0, 0, LOCATE_FAILED, None, REASON_MULTI_MATCH, len(group_hits))
+    return Location(hunk_id, 0, 0, LOCATE_FAILED, None, REASON_NO_MATCH)
 
 
 def locate_group(group: Group, hunk_comments: dict[str, list[CommentInput]]) -> list[Comment]:
@@ -228,6 +329,7 @@ def locate_group(group: Group, hunk_comments: dict[str, list[CommentInput]]) -> 
                     existing_code=raw.existing_code,
                     hunk_id=found.hunk_id,
                     locate_level=found.level,
+                    side=found.side,
                     locate_reason=found.reason,
                     suggestion_code=raw.suggestion_code,
                     start_line=found.start_line,
@@ -241,13 +343,14 @@ def locate_group(group: Group, hunk_comments: dict[str, list[CommentInput]]) -> 
         # 就够，两条日志之间没有可观测的间隔
         logger.info(
             "定位完成 %s：%d 条，hunk 内 %d / 组内 %d / 未定位 %d，成功率 %.0f%%"
-            "（其中同 hunk 多命中取首个 %d 条）",
+            "（删除侧 %d 条，同 hunk 多命中取首个 %d 条）",
             group.group_id,
             total,
             levels[LOCATE_HUNK],
             levels[LOCATE_GROUP],
             levels[LOCATE_FAILED],
             (total - levels[LOCATE_FAILED]) / total * 100,
+            sum(1 for item in comments if item.side == SIDE_LEFT),
             ambiguous,
         )
     if levels[LOCATE_FAILED]:

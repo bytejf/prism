@@ -13,6 +13,18 @@ REASON_NO_MATCH = "no_match"  # existing_code 在本组改动行里一次都没�
 REASON_MULTI_MATCH = "multi_match"  # 出现多处，放弃
 REASON_EMPTY_EXISTING_CODE = "empty_existing_code"  # 模型没给可用的片段
 
+# 评论锚在哪一侧的行上。**取值照抄 GitHub 的 PR 行内评论模型**（`side` 参数
+# 就是这两个值），将来对接时直接透传，不需要再翻译一层。
+#
+# 它同时决定行号怎么读 —— 这是本轮最容易读错的地方：
+#
+#   RIGHT = 新增行，行号是**被审查版本**（head）的坐标
+#   LEFT  = 删除行，行号是**基准版本**（base）的坐标
+#
+# 两套坐标永远由本字段标明，不靠读者猜。
+SIDE_RIGHT = "RIGHT"
+SIDE_LEFT = "LEFT"
+
 
 @dataclass
 class Comment:
@@ -30,10 +42,12 @@ class Comment:
         hunk_id: 所属 hunk 编号。**组内命中时是命中的那个**，不是模型报的那个
             —— path 由它查出，两者必须同源（见 core/output/locate.py）
         locate_level: 定位层级（hunk / group / failed）
+        side: 行号属于哪一侧（LEFT / RIGHT）。**未定位时为 None** ——
+            没有位置就没有侧可言。它与 locate_level 是正交的两个维度
         locate_reason: 未定位原因，仅 locate_level 为 failed 时非空
         suggestion_code: 建议的修改（可选）
-        start_line: 起始行号（**被审查版本的坐标**）；未定位为 0
-        end_line: 结束行号（同上）；未定位为 0
+        start_line: 起始行号，按 ``side`` 解释；未定位为 0
+        end_line: 结束行号，按 ``side`` 解释；未定位为 0
     """
 
     path: str
@@ -43,6 +57,7 @@ class Comment:
     existing_code: str
     hunk_id: str
     locate_level: str
+    side: str | None = None
     locate_reason: str | None = None
     suggestion_code: str | None = None
     start_line: int = 0
