@@ -27,7 +27,9 @@ diff → 过滤 → hunk 归属符号 → 按包分组        ← 确定性，�
                                   ↓
                    每个「审查单元」跑一次 ReAct 循环   ← core/agent/
                                   ↓
-                   按 hunk 定位评论 → 排序 → 终端渲染  ← core/output/
+              定位 → 反思（每组一次 LLM 调用）        ← core/output/ · core/reflection/
+                                  ↓
+                        排序 → 终端渲染             ← core/output/
 ```
 
 审查前四段各有一个 CLI 子命令（`diff` / `filter` / `hunk-map` / `group`），
@@ -126,6 +128,28 @@ bug 藏了很久。**丢弃日志说错原因，比丢东西本身更难发现�
 position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评论要哪一侧
 待核实。
 
+## 反思（改 `core/reflection/` 前必读）
+
+定位完成后，**每组一次 LLM 调用**做证伪：找出被 diff 直接推翻的评论，删掉。
+**只删不增**，失败一律 fail-open（原样保留全部评论 + WARNING）。
+
+- **删评论是本流程里唯一有破坏性的动作**，所以「绝不删错」靠三道**代码里**的
+  闸门，不是只写在提示词里：编号必须在候选清单内、理由不能为空、漏报的 hunk
+  编号必须存在。三处任一不过就保留该条
+- **保护性否决**（内存安全 / 并发 / 链接与声明一致性 / 行为兼容性变更）是
+  **提示词层**的，与 OCR 一致 —— 这几类主题即使被 diff 推翻也不许删。实测有效：
+  定标里那条「`Label` 加了 mutex 会死锁」明明被 diff 推翻，因为主题是并发被留下
+- **信息边界**：只给 diff + 评论 + 定位元数据，**不给**审查者的工具调用结果
+  —— 给了它会顺着那套逻辑「同意」，复核退化成自我背书
+- **输出形态**：`bind_tools(auto)` + 一个工具（`removals` 空 = 全保留），
+  不是 `with_structured_output`（思考模式用不了，见「框架缺口」）
+- 提示词改动要看 `guidance/templates.py` 的 `REFLECTION_SYSTEM`：它开头就是
+  「**默认答案是全部保留**」，「不算删除依据」那段是防过度删除的正面清单 ——
+  两段都别删
+
+验证这条链路用 `tests/calibrate_reflection.py`（手动跑，不在 pytest 收集范围内）：
+真实 diff + 混进去的假评论，量「该删的删没删、不该删的动没动」。**改提示词必跑。**
+
 ## 框架缺口（LangChain v1，都有实测依据）
 
 | 缺口 | 处置 |
@@ -138,6 +162,7 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 | `parse_docstring=True` + `args_schema=` 一起给时，工具描述会**静默变成参数模型的 docstring** | 同上：不给 `args_schema`。另注意**参数模型的 docstring 本身也会进 schema**，所以要写成给模型看的话，设计理由用 `#` 注释 |
 | 工具定义**入站**还要过一道转换：`convert_to_openai_tool` 会剥掉所有 `title`、剥掉参数顶层的 `description`、把 `$defs` + `$ref` **内联展开** | 日志与对账一律用 `convert_to_openai_tool(tool)["function"]`，别拿 `tool_call_schema.model_json_schema()`（那是转换前的，`report_hunks` 两份差 2000 vs 1279 字节） |
 | `recursion_limit` 按 **super-step** 算，`create_agent` 实测每轮约 **6.1** 步 | `max_rounds * 7 + 20` |
+| **思考模式下不能强制 `tool_choice`** —— `with_structured_output` 的 `function_calling` / `json_schema` 两条路都靠强制，实测直接 `400 Thinking mode does not support this tool_choice`；`json_mode` 另要提示词里出现 "json" 且只保证合法 JSON、不保证 schema | 单次结构化调用也走 `bind_tools(tool_choice="auto")`（审查循环本来就没强制过），回参自己用 Pydantic 校验 —— 见 `core/reflection/reflect.py` |
 
 **不使用已废弃的 API**（尤其 `langchain-classic` 包）；其余尽量用框架，别自己重造。
 
@@ -253,7 +278,7 @@ PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
 |---|---|---|
 | `00-最小闭环/` | 1~5 | 6（实现偏离，五类分）、7（设计复盘） |
 | `01-上下文压缩/` | 9 | 10（实现反馈）、11（设计取舍） |
-| `02-评论定位和反思/` | 12 | 13（实现反馈） |
+| `02-评论定位和反思/` | 12 | 13（定位）、14（反思） |
 
 - **设计文档冻结、永不回头改**；实现与它不符时**记进反馈文档**
   （唯一例外：反馈文档里写明「这条必须回改设计文档」的，如 13 号 §六 E1）

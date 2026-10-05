@@ -9,11 +9,15 @@
 已定位的评论里，挂在**删除行**上的会标 ``（已删除）``：它的行号是基准版本的
 坐标，不标的话读者会拿它去当前文件里找，找不到还以为定位错了。
 
+**疑似漏报**是反思阶段顺带发现的信号（「这处改动可能没被覆盖」），也单独成段放
+最后。它比未定位评论更弱 —— 它连评论都不是，只是提示。
+
 V1 简化：不渲染 suggestion_code 的 diff、不展示 rule_ref。
 """
 
 import logging
 from collections import Counter
+from collections.abc import Sequence
 
 from prism.core.output.sort import SEVERITY_RANK
 from prism.models.comment import (
@@ -25,6 +29,7 @@ from prism.models.comment import (
     Comment,
     ReviewStats,
 )
+from prism.models.reflection import PotentialMiss
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,11 @@ BADGE_TEMPLATE = "[{category} · {severity}]"
 UNLOCATED_TITLE = "=== 未定位评论（{count} 条）==="
 UNLOCATED_NOTICE = "⚠️ 以下评论无法确定具体行号，请人工确认："
 
+# 疑似漏报段的标题与提示。措辞刻意比未定位那段软 —— 它不是评论，只是提示，
+# 而且反思者「编造漏报」是已知风险（见设计文档 §八）
+MISSES_TITLE = "=== 疑似漏报（{count} 条）==="
+MISSES_NOTICE = "⚠️ 反思时发现下面这些改动可能没有被任何评论覆盖，仅供参考："
+
 # 未定位原因 → 给人看的一句话。**报的是我们这边查不出匹配的原因**，
 # 不是「模型错了」——空片段和歧义都不一定是模型的锅
 REASON_LABELS: dict[str, str] = {
@@ -70,24 +80,37 @@ class TerminalRenderer:
     V1 简化：不渲染 suggestion_code 的 diff，不展示 rule_ref。
     """
 
-    def render(self, comments: list[Comment], stats: ReviewStats) -> str:
+    def render(
+        self,
+        comments: list[Comment],
+        stats: ReviewStats,
+        misses: Sequence[PotentialMiss] = (),
+    ) -> str:
         """渲染评论列表为终端文本。
 
         Args:
             comments: 排序后的评论列表
             stats: 审查统计信息
+            misses: 反思阶段的疑似漏报信号（可为空）
 
         Returns:
             格式化后的终端文本
         """
         located = [item for item in comments if item.locate_level != LOCATE_FAILED]
         failed = [item for item in comments if item.locate_level == LOCATE_FAILED]
-        logger.debug("渲染开始：%d 条评论（未定位 %d 条）", len(comments), len(failed))
+        logger.debug(
+            "渲染开始：%d 条评论（未定位 %d 条，疑似漏报 %d 条）",
+            len(comments),
+            len(failed),
+            len(misses),
+        )
 
         blocks = [self._render_header(stats)]
         blocks.extend(self._render_comment(comment) for comment in located)
         if failed:
             blocks.append(self._render_unlocated(failed))
+        if misses:
+            blocks.append(self._render_misses(misses))
         blocks.append(self._render_footer(comments))
 
         text = "\n\n".join(blocks)
@@ -177,6 +200,29 @@ class TerminalRenderer:
                     f"   （原因：{reason}）",
                 )
             )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_misses(misses: Sequence[PotentialMiss]) -> str:
+        """渲染疑似漏报段。
+
+        格式（与未定位那段同构）：
+        === 疑似漏报（1 条）===
+
+        ⚠️ 反思时发现下面这些改动可能没有被任何评论覆盖，仅供参考：
+
+        1. H-07 internal/store/store.go
+           新增的解锁路径似乎没有被审到
+
+        Args:
+            misses: 疑似漏报信号
+
+        Returns:
+            该段文本
+        """
+        lines = [MISSES_TITLE.format(count=len(misses)), "", MISSES_NOTICE]
+        for index, item in enumerate(misses, start=1):
+            lines.extend((f"{index}. {item.hunk_id} {item.path}", f"   {item.description}"))
         return "\n".join(lines)
 
     @staticmethod

@@ -12,6 +12,7 @@ from prism.models.comment import (
     Comment,
     ReviewStats,
 )
+from prism.models.reflection import PotentialMiss
 
 
 def make_comment(
@@ -287,3 +288,48 @@ def test_unlocated_still_counted_in_footer() -> None:
     output = TerminalRenderer().render(comments, make_stats())
 
     assert "high: 2" in output
+
+
+# ---------- 疑似漏报 ----------
+
+
+def test_no_misses_section_when_empty() -> None:
+    """测试没有漏报信号时不出现那一段。"""
+    output = TerminalRenderer().render([make_comment()], make_stats())
+
+    assert "疑似漏报" not in output
+
+
+def test_misses_section_lists_hunk_and_description() -> None:
+    """测试漏报段列出 hunk 编号、路径与描述。
+
+    它比未定位评论更弱（连评论都不是），所以文案也写得更软 —— 「仅供参考」。
+    """
+    misses = [PotentialMiss(hunk_id="H-07", path="pkg/b.go", description="新加的解锁路径没人提")]
+
+    output = TerminalRenderer().render([make_comment()], make_stats(), misses)
+
+    assert "=== 疑似漏报（1 条）===" in output
+    assert "1. H-07 pkg/b.go" in output
+    assert "新加的解锁路径没人提" in output
+    assert "仅供参考" in output
+
+
+def test_misses_section_comes_last() -> None:
+    """测试漏报段排在未定位段之后、统计之前 —— 信号越弱越靠后。"""
+    comments = [make_comment(), make_unlocated(path="b.go")]
+    misses = [PotentialMiss(hunk_id="H-07", path="c.go", description="疑似漏报")]
+
+    output = TerminalRenderer().render(comments, make_stats(), misses)
+
+    assert output.index("=== 未定位评论") < output.index("=== 疑似漏报")
+    assert output.index("=== 疑似漏报") < output.index("=== 统计 ===")
+
+
+def test_misses_do_not_change_the_comment_footer() -> None:
+    """测试漏报不进评论统计 —— 它不是评论。"""
+    misses = [PotentialMiss(hunk_id="H-07", path="c.go", description="疑似漏报")]
+
+    output = TerminalRenderer().render([make_comment(severity="high")], make_stats(), misses)
+
+    assert "high: 1" in output

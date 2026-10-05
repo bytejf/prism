@@ -45,8 +45,8 @@
 ## 完整审查（调用 LLM，产生 token 成本）
 
     prism review    --path <repo> [--base main] [--head HEAD]
-        串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 定位 → 排序
-        → 终端渲染。
+        串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 定位 → 反思
+        → 排序 → 终端渲染。
 
         审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
         想看完整轨迹设 `PRISM_LOG_LEVEL=DEBUG`，想只看结果设 `PRISM_LOG_LEVEL=WARNING`。
@@ -91,10 +91,12 @@ from prism.core.llm.client import LLMClient
 from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
 from prism.core.output.sort import sort_comments
+from prism.core.reflection.reflect import reflect
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import LOCATE_FAILED, Comment, ReviewStats
 from prism.models.diff import Diff
 from prism.models.grouping import Group
+from prism.models.reflection import PotentialMiss
 from prism.observability.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -360,13 +362,15 @@ def _run_groups(
     groups: list[Group],
     project_root: Path,
     head_rev: str,
-) -> list[Comment]:
-    """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位。
+) -> tuple[list[Comment], list[PotentialMiss]]:
+    """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位与反思。
 
-    定位放在循环体里而不是等所有组跑完，有两个原因：一是与设计文档的
-    「每组审查完成 → 定位」一致，二是后续的反思阶段是**每组一次 LLM 调用**，
-    它要的素材（本组 hunk + 本组评论 + 定位元数据）正好都在这里，不必等到
-    全局再按组拆回来。
+    定位与反思都放在循环体里而不是等所有组跑完：设计文档的节奏就是
+    「每组审查完成 → 定位 → 反思」，而且反思是**每组一次 LLM 调用**，
+    它要的素材（本组 diff + 本组评论 + 定位元数据）只有在这里才齐。
+
+    **每组只用一次模型调用完成复核**（不是每个文件一次），失败时原样保留
+    全部评论 —— 见 `core/reflection/reflect.py`。
 
     Args:
         groups: 审查单元列表
@@ -374,10 +378,11 @@ def _run_groups(
         head_rev: 被审查的版本，传给工具读源码用
 
     Returns:
-        全部已定位的评论（未定位的也在其中，带 locate_level 标记）
+        (保留的评论, 疑似漏报信号)。评论含未定位的那些（带 locate_level 标记）
     """
     llm = _llm_or_exit()
     comments: list[Comment] = []
+    misses: list[PotentialMiss] = []
     for index, item in enumerate(groups, start=1):
         typer.echo(
             f"Processing Group {index}: {item.package_path} "
@@ -393,14 +398,18 @@ def _run_groups(
             settings.compression,
         )
         located = locate_group(item, result.hunk_comments)
-        comments.extend(located)
+        outcome = reflect(llm.model, item, located)
+        comments.extend(outcome.kept)
+        misses.extend(outcome.misses)
+        # 未定位数是**定位**这一步的统计，与反思删掉了几条无关，所以按
+        # 定位结果算
         unlocated = sum(1 for comment in located if comment.locate_level == LOCATE_FAILED)
         typer.echo(
-            f"  {result.group_id} completed: {_plural(len(located), 'comment')} "
+            f"  {result.group_id} completed: {_plural(len(outcome.kept), 'comment')} "
             f"(exit_reason={result.exit_reason}, 轮次={result.round_count}, "
-            f"未定位={unlocated})"
+            f"未定位={unlocated}, 反思删除={len(outcome.removed)})"
         )
-    return comments
+    return comments, misses
 
 
 @app.command()
@@ -431,7 +440,12 @@ def review(
     if not groups:
         typer.echo("没有可审查的 hunk。")
 
-    comments = sort_comments(_run_groups(groups, root, head) if groups else [])
+    # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
+    if groups:
+        comments, misses = _run_groups(groups, root, head)
+    else:
+        comments, misses = [], []
+    comments = sort_comments(comments)
 
     stats = ReviewStats(
         base_branch=base,
@@ -441,5 +455,5 @@ def review(
         duration_seconds=time.monotonic() - started,
     )
     typer.echo("")
-    typer.echo(TerminalRenderer().render(comments, stats))
+    typer.echo(TerminalRenderer().render(comments, stats, misses))
     typer.echo(f"\nReview completed: {_plural(len(comments), 'comment')}")
