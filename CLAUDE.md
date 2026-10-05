@@ -5,14 +5,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 常用命令
 
 ```bash
-uv run pytest tests/unit        # 单测，不调 LLM，快
+uv run pytest tests/unit        # 单测，不调 LLM，快 ← **回归跑这个**
 uv run pytest tests/e2e         # e2e，**真实调用 DeepSeek**，慢且花钱
+uv run pytest tests/manual      # 手动调试 / 校准脚本，多数真调 DeepSeek，别进回归
 uv run pytest tests/unit/test_main_loop.py::test_plain_text_after_tool_call_does_not_end_loop   # 单个用例
 
 ruff check . && ruff format src tests
 mypy src tests                  # 两个一起传：只传 tests 会解析不到 prism 包
 uvx pyright --pythonpath .venv/bin/python src/   # 第二个类型检查器，不进依赖
 ```
+
+**目录的判据是「要不要人驱动」，不是「花不花钱」**：
+
+| 目录 | 性质 | 进回归？ |
+|---|---|---|
+| `tests/unit/` | 断言套件，不联网 | ✅ 就它 |
+| `tests/e2e/` | 断言套件，**真调接口** | ❌ 慢且花钱 |
+| `tests/manual/` | **不是断言套件** —— 给断点、给校准、要人盯着跑 | ❌ 手动 |
+| `tests/test_locate_against_git.py` | 断言套件，免费，但要两个走查仓库 | ❌ 仓库不在就 skip |
+
+`tests/manual/` 里每个文件的开头都写了「跑法 + 看什么变量 + 花不花钱」。
+它们**故意保留 `test_` 前缀**：IDE 的测试运行器靠它才认得出，能单独 Debug 一个
+用例。（所以**别**在 conftest 里 `collect_ignore` 掉这个目录 —— 那会让 IDE 也
+找不到用例。）
 
 **e2e 必须用 `uv run`**：smoke test 起子进程调 `prism`，直接跑 `.venv/bin/pytest`
 时它不在 PATH 上，会以 `FileNotFoundError` 失败。
@@ -147,7 +162,7 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
   「**默认答案是全部保留**」，「不算删除依据」那段是防过度删除的正面清单 ——
   两段都别删
 
-验证这条链路用 `tests/calibrate_reflection.py`（手动跑，不在 pytest 收集范围内）：
+验证这条链路用 `tests/manual/calibrate_reflection.py`（手动跑，不是断言套件）：
 真实 diff + 混进去的假评论，量「该删的删没删、不该删的动没动」。**改提示词必跑。**
 
 ## 框架缺口（LangChain v1，都有实测依据）

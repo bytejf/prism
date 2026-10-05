@@ -26,7 +26,7 @@ F1~F3 量**召回**，P1/R1 量**精度**。P1 尤其关键：它被 diff 直接
 
 用法::
 
-    uv run python tests/calibrate_reflection.py
+    uv run python tests/manual/calibrate_reflection.py
 """
 
 import os

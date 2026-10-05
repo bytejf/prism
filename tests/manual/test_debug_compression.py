@@ -72,7 +72,7 @@ ai · 轮次=3 · 耗时 1347ms
 
 必须**两个都给**，缺一个就一行日志都看不到：
 
-    PRISM_LOG_LEVEL=INFO uv run pytest tests/test_debug_compression.py -s
+    PRISM_LOG_LEVEL=INFO uv run pytest tests/manual/test_debug_compression.py -s
 
 `-s` 不能省：pytest 的捕获是 **fd 级**的（`dup2` 重定向 fd 2），绕不过去。
 想看压缩请求与摘要原文就把级别改成 `DEBUG`（正文很长，几十万字符量级）。

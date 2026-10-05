@@ -1,7 +1,7 @@
 """审查后处理的单步走查：定位 → 反思 → 排序 → 渲染。
 
 **这个文件是给 IDE 断点用的**，每个阶段的结果都留在具名变量里，在任意一行
-下断点就能看清那一步的输入与输出。审查前 / 审查中那两个阶段见它的兄弟文件
+下断点就能看清那一步的输入与输出。审查前 / 审查中那两个阶段见同目录的
 `test_debug_prism_tests.py`。
 
     located   → list[Comment]      定位结果（补上行号与侧）
@@ -17,7 +17,7 @@
 
 看日志（本文件**不自己打** print 或 logger，全部走既有日志）：
 
-    PRISM_LOG_LEVEL=INFO uv run pytest tests/test_debug_post_review.py -s
+    PRISM_LOG_LEVEL=INFO uv run pytest tests/manual/test_debug_post_review.py -s
 
     反思 · 请求 · system / user   ← 送给复核者的完整提示词（INFO）
     反思 · 响应 · 耗时 Nms         ← 模型返回了什么（INFO，失败时这条尤其重要）
@@ -27,7 +27,7 @@
 
 用别的仓库：
 
-    PRISM_MIN_TEST_DIR=~/Projects/foo uv run pytest tests/test_debug_post_review.py -s
+    PRISM_MIN_TEST_DIR=~/Projects/foo uv run pytest tests/manual/test_debug_post_review.py -s
 """
 
 import os

@@ -23,7 +23,7 @@ LLM 用**脚本化的假实现**（不打真实 API）：可复现、秒级完�
 
 在 IDE 里直接 Run/Debug 这个文件即可；命令行跑时加 `-s` 才能看到 print：
 
-    uv run pytest tests/test_debug_prism_tests.py -s
+    uv run pytest tests/manual/test_debug_prism_tests.py -s
 """
 
 import logging
