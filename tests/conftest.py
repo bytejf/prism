@@ -11,7 +11,7 @@ import pytest
 from prism.observability.logging import PRISM_LOGGER, PrismHandler, setup_logging
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(autouse=True, scope="session")
 def prism_logging_to_console() -> None:
     """设了 `PRISM_LOG_LEVEL` 时，把 prism 的日志按约定格式打到控制台。
 
@@ -25,6 +25,16 @@ def prism_logging_to_console() -> None:
     收尾会由 `pytest_terminal_summary` 提示。
 
     为什么默认不开：一次 e2e 的 LLM 轨迹近千行，普通跑测试会被淹掉。
+
+    **`scope="session"` 是必须的，不是随手写的。** pytest 按作用域从大到小
+    初始化夹具，所以 function 作用域的夹具**晚于** module 作用域的夹具 ——
+    而 module 级夹具体内经常就要打日志（走查脚本的 `reviewed` 里就是一次真实
+    审查）。实测顺序：
+
+        function 作用域 → module 夹具 → 测试体      ← 审查循环的日志全丢
+        session  作用域 → module 夹具 → 测试体      ← 正常
+
+    提到 session 之后，handler 在任何 module 级夹具之前就挂好了。
     """
     if not os.getenv("PRISM_LOG_LEVEL"):
         return

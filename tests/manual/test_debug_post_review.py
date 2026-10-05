@@ -30,6 +30,7 @@
     PRISM_MIN_TEST_DIR=~/Projects/foo uv run pytest tests/manual/test_debug_post_review.py -s
 """
 
+import logging
 import os
 from pathlib import Path
 
@@ -56,6 +57,8 @@ from prism.models.grouping import Group
 REPO = Path(os.getenv("PRISM_MIN_TEST_DIR", Path.home() / "Projects/python/prism-min-test"))
 BASE = "main"
 HEAD = "HEAD"
+
+logger = logging.getLogger(__name__)
 
 pytestmark = pytest.mark.skipif(
     not (REPO / ".git").is_dir() or not settings.llm.api_key,
@@ -109,6 +112,15 @@ def test_debug_locate(reviewed: tuple[Group, MainLoopResult]) -> None:
         reviewed: 审查单元与循环产出
     """
     group, result = reviewed
+    # 这行是**分界线**，用来分辨「测试体没跑」和「日志被吞了」：
+    #   看得到它 → 测试体真的跑了（没被 skip、PRISM_LOG_LEVEL 也进了进程），
+    #              那要是还缺日志，就是上面 fixture 阶段被吞（夹具顺序）
+    #   看不到它 → 根本没跑到这里，往上看：skip（缺 key）或环境变量没进去
+    logger.info(
+        "走查 · 定位开始 · %d 个 hunk / %d 条评论",
+        len(group.hunks),
+        sum(len(items) for items in result.hunk_comments.values()),
+    )
     located = locate_group(group, result.hunk_comments)
 
     # 看 located：每条 Comment 比 CommentInput 多了这几个字段 ——
