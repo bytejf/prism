@@ -674,6 +674,25 @@ def test_code_search_searches_reviewed_revision_not_worktree(divergence_repo: Pa
     assert "WHERE id = ?" not in tool.text({"pattern": r"WHERE id = \?"})
 
 
+def test_code_search_strips_revision_prefix(divergence_repo: Path) -> None:
+    """测试带 rev 搜索时结果**不带** `<rev>:` 前缀。
+
+    回归用例：`git grep <rev>` 每条结果是 `feature:db.go:12: ...`。前缀留着的话，
+    模型照抄整行里的路径去调 file_read / file_read_diff 就查不到 —— 前缀不是路径的
+    一部分，而它没有任何理由知道这件事。这里顺带断言剥完之后拼出来的**真的是个
+    存在的文件**：前缀少剥一个字符（如 `eature:`）同样会红。
+    """
+    ctx = ReviewContext(project_root=str(divergence_repo), head_rev="feature")
+    tool = ToolUnderTest(code_search, ctx)
+
+    result = tool.text({"pattern": r"WHERE id = '"})
+
+    assert "feature:" not in result
+    path, line_number, _content = result.split("\n")[0].split(":", 2)
+    assert (divergence_repo / path).is_file(), f"剥出来的不是可用路径：{path!r}"
+    assert line_number.isdigit()
+
+
 def test_code_search_falls_back_to_worktree_without_head_rev(divergence_repo: Path) -> None:
     """测试未指定 head_rev 时搜工作区。"""
     tool = ToolUnderTest(code_search, ReviewContext(project_root=str(divergence_repo)))

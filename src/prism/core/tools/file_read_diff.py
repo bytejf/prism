@@ -56,7 +56,7 @@ def file_read_diff(path: str, runtime: ToolRuntime[ReviewContext, ReviewState]) 
     模型看不到，会被自动排除。
 
     Args:
-        path: 文件相对路径（改过名的文件，新旧路径都能查）
+        path: 文件相对路径
 
     Returns:
         该文件的完整 diff（含 hunk 头）；没有改动、不在审查范围内，
@@ -76,6 +76,9 @@ def file_read_diff(path: str, runtime: ToolRuntime[ReviewContext, ReviewState]) 
     # 查不到就查不到了：这里只是字典查询，不碰文件系统，``..`` 与绝对路径
     # 最多是查不到，不构成路径穿越 —— 不做 file_read 那套路径校验
     diff = ctx.diffs.get(path)
+    # 索引里另有改名前的旧路径别名（见 build_diff_index），但**不在参数说明里
+    # 承诺**：别名只在那个名字没被本次改动里的另一个文件占用时才存在，
+    # 说成「新旧都能查」是过度承诺。模型按 `path=` 属性给的名字查最稳
     if diff is None:
         logger.debug("file_read_diff 未命中：%s", path)
         return NOT_FOUND.format(path=path)

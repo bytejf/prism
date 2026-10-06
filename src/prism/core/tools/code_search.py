@@ -105,6 +105,13 @@ def code_search(
         return f"错误：git grep 失败：{completed.stderr.strip()}"
 
     matched = completed.stdout.splitlines()
+    # git grep 带 rev 搜索时给每条结果加 `<rev>:` 前缀（`HEAD:db.go:12: ...`，
+    # rev 原样回显，分支名 / SHA 都是）。剥掉它：结果的路径要与 file_read /
+    # file_read_diff 是同一套坐标，模型把这一行里的路径直接拿去调工具就能用 ——
+    # 留着前缀，它得自己认出那不是路径的一部分，认错就是白查一次。
+    if ctx.head_rev:
+        prefix = f"{ctx.head_rev}:"
+        matched = [line.removeprefix(prefix) for line in matched]
     if not matched:
         logger.debug("code_search 无匹配：%s", pattern)
         return f"未找到匹配：{pattern}"
