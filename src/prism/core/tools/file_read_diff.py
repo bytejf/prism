@@ -56,7 +56,7 @@ def file_read_diff(path: str, runtime: ToolRuntime[ReviewContext, ReviewState]) 
     模型看不到，会被自动排除。
 
     Args:
-        path: 文件相对路径
+        path: 文件相对路径（改过名的文件，新旧路径都能查）
 
     Returns:
         该文件的完整 diff（含 hunk 头）；没有改动、不在审查范围内，
