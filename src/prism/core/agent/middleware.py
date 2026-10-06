@@ -16,12 +16,18 @@
 """
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from langchain.agents.middleware import AgentMiddleware, after_model
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    ToolCallRequest,
+    after_model,
+    wrap_tool_call,
+)
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
+from langgraph.types import Command
 
 from prism.config.settings import settings
 from prism.core.agent.compression import Compressor
@@ -261,3 +267,60 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     # 与旧实现一致：提醒照样追加，到阈值才结束
     updates["jump_to"] = "end" if no_report >= settings.review.no_progress_exit_rounds else "model"
     return updates
+
+
+# 工具内部抛异常时回给模型的话。**要让模型能自己做决定**：换参数 / 换工具 /
+# 放弃这条线继续审别的，而不是照着同一套参数重试（重试必然再炸一次）
+TOOL_ERROR_MESSAGE = (
+    "错误：工具内部执行失败（{kind}：{detail}）。\n"
+    "这不是你调用方式的问题，换一种方式获取这条信息，或先报告已有的结论继续审查 —— "
+    "不要用同样的参数重试。"
+)
+
+
+# 模块级函数式中间件（同 review_pacing）。它是**无状态**的，所以共享一个实例没问题；
+# 换参数值也一样：它只读不改。
+@wrap_tool_call
+def tool_error_guard(
+    request: ToolCallRequest,
+    handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+) -> ToolMessage | Command[Any]:
+    """把工具抛出的异常兜成一条工具结果，别让它炸掉整组审查。
+
+    **为什么必须有这一层**：框架默认的兜底只认 `ToolInvocationError`（模型传错
+    参数类型时框架自己抛的那类），其余异常原样 re-raise
+    （`langgraph.prebuilt.tool_node._default_handle_tool_errors` 最后一行就是
+    `raise e`）。于是工具里任何一个意外异常 —— 子进程参数非法、pygit2 抛了
+    `KeyError` 之外的错、配置读错 —— 都会穿过图、穿过 `run_review_agent`，
+    把**整条 review 带走**：后面所有组不会再跑，前面已经审出来的评论也一起没
+    （CLI 是最后才渲染的）。
+
+    实测过：`code_search(file_pattern="a\0b")` 让 `subprocess` 抛 `ValueError`，
+    `run_review_agent` 直接把异常抛出来。参数校验（`core/tools/paths.py`）现在
+    把这一条堵住了，但堵的是那一个输入，不是这一**类**。
+
+    **不是静默兜底**：异常按 ERROR 记完整堆栈。回给模型的是「换一种方式」而不是
+    让它重试同一套参数 —— 同样的参数必然再炸一次，白烧一轮。
+
+    位置放在中间件链**最内侧**（`build_review_agent` 里排在最后）：`ReviewTrace`
+    在外侧，于是这次调用照样有一条「tool · 轮次=N · 执行 Xms · 结果 M 字符」，
+    日志的形态不因为失败而变样。
+
+    Args:
+        request: 工具调用请求
+        handler: 真正的工具调用
+
+    Returns:
+        工具返回；抛异常时返回一条说明性的 ToolMessage
+    """
+    try:
+        return handler(request)
+    # 这里是最后一道网，宽except 是有意的（见 docstring）
+    except Exception as exc:
+        logger.exception("工具 %s 抛异常，转成工具结果继续", request.tool_call["name"])
+        return ToolMessage(
+            content=TOOL_ERROR_MESSAGE.format(kind=type(exc).__name__, detail=exc),
+            tool_call_id=request.tool_call["id"],
+            # status="error"：工具结果自身标记失败，模型与日志都能一眼看出来
+            status="error",
+        )

@@ -25,7 +25,7 @@ from langgraph.graph.state import CompiledStateGraph
 from prism.config.settings import settings
 from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
-from prism.core.agent.middleware import ReviewProgress, review_pacing
+from prism.core.agent.middleware import ReviewProgress, review_pacing, tool_error_guard
 from prism.core.agent.state import (
     STATUS_PENDING,
     HunkStatus,
@@ -114,6 +114,10 @@ def build_review_agent(
                     review_pacing,
                     # 轮次上限：框架自带，不用自己数
                     ModelCallLimitMiddleware(run_limit=max_rounds, exit_behavior="end"),
+                    # 兜住工具抛出的异常，别让它炸掉整组审查。
+                    # 放最内侧（最后一个）：ReviewTrace 在它外面，于是失败的那次
+                    # 调用照样有一条带耗时的 tool 日志，日志形态不因失败而变
+                    tool_error_guard,
                 ],
             ),
             state_schema=ReviewState,

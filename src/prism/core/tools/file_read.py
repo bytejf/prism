@@ -5,7 +5,7 @@
 """
 
 import logging
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
@@ -13,6 +13,7 @@ from langgraph.prebuilt import ToolRuntime
 from prism.config.settings import settings
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import ReviewState
+from prism.core.tools.paths import check_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ def file_read(
     # 路径校验放在读取之前：git 读取路径不经过文件系统的 resolve()，
     # 若先读再校验，``../`` 会绕过检查
     try:
-        _validate_relative_path(path)
+        check_relative_path(path)
     except ValueError as exc:
         logger.warning("file_read 路径校验失败：%s", exc)
         return f"错误：{exc}"
@@ -124,30 +125,6 @@ def _read_reviewed(ctx: ReviewContext, path: str) -> str | None:
         logger.warning("file_read 文件不存在：%s", path)
         return None
     return target.read_text(encoding="utf-8", errors="replace")
-
-
-def _validate_relative_path(path: str) -> None:
-    """校验 path 是项目内的相对路径。
-
-    纯字符串判断，与文件系统无关，因此对 git 读取路径同样有效。
-
-    Args:
-        path: 待校验的路径
-
-    Raises:
-        ValueError: 空路径、绝对路径，或含 ``..`` 段
-    """
-    if not path.strip():
-        msg = "path 不能为空"
-        raise ValueError(msg)
-
-    candidate = PurePosixPath(path)
-    if candidate.is_absolute():
-        msg = f"必须是相对路径：{path}"
-        raise ValueError(msg)
-    if ".." in candidate.parts:
-        msg = f"路径不得包含 ..：{path}"
-        raise ValueError(msg)
 
 
 def _resolve_inside_project(project_root: str, path: str) -> Path:

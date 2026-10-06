@@ -37,6 +37,7 @@ from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
 from prism.core.tools.file_read_diff import file_read_diff
+from prism.core.tools.paths import check_relative_path
 from prism.core.tools.report_hunks import report_hunks
 from prism.observability.llm_trace import _describe_tool
 
@@ -985,3 +986,110 @@ def test_end_done_verdict_matches_tool_behavior() -> None:
     assert end_done_verdict(1, ["H-01"]) == (False, ["H-01"])
     assert end_done_verdict(2, ["H-01"]) == (True, ["H-01"])
     assert end_done_verdict(1, []) == (True, [])
+
+
+# ---------- 路径安全：模型给的参数是我们的信任边界 ----------
+
+
+@pytest.mark.parametrize("value", ["", "   ", "/etc/hosts", "../outside.go", "a/../../b", "a\x00b"])
+def test_check_relative_path_rejects(value: str) -> None:
+    """测试越界与非法字符在我们这一侧就被拦下。
+
+    拦住它们是**为了给出统一的失败**：放到下游，`../*` 会变成 git 的英文 stderr
+    （还带本机绝对路径），NUL 会让 `subprocess` 抛没人接的异常。
+    """
+    with pytest.raises(ValueError):
+        check_relative_path(value)
+
+
+@pytest.mark.parametrize(
+    "value", ["a.go", "internal/agent/x.go", "*.go", ".", "a b.go", ":(top)*.go"]
+)
+def test_check_relative_path_accepts(value: str) -> None:
+    """测试合法的路径与 pathspec 不被误杀 —— 校验不能比 git 自己更窄。"""
+    check_relative_path(value)
+
+
+def test_file_read_blocks_symlink_escape(tmp_path: Path) -> None:
+    """测试仓库内指向外面的符号链接读不到外面。
+
+    这是字符串校验**唯一挡不住**的一类：`link.go` 字面上是合法相对路径。
+    拦住它的是读取侧的 `resolve()` + `is_relative_to`。
+    """
+    secret = tmp_path / "secret.txt"
+    secret.write_text("OUTSIDE_CONTENT\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "link.go").symlink_to(secret)
+
+    tool = ToolUnderTest(file_read, ReviewContext(project_root=str(repo)))
+    result = tool.text({"path": "link.go", "start_line": 1, "end_line": 1})
+
+    assert "OUTSIDE_CONTENT" not in result
+    assert "错误" in result
+
+
+def test_file_read_rejects_nul_instead_of_raising() -> None:
+    """测试 NUL 返回错误文本，而不是抛异常。
+
+    实测过：NUL 在下游会让 `Path.resolve()` 抛 `ValueError: embedded null
+    character` —— 工具不接、框架默认也不接，整组审查就没了。
+    """
+    tool = ToolUnderTest(file_read, ReviewContext(project_root="/tmp"))
+
+    assert "错误" in tool.text({"path": "a\x00b.go", "start_line": 1, "end_line": 1})
+
+
+@pytest.mark.parametrize(
+    "args",
+    [{"pattern": "x", "file_pattern": "../*"}, {"pattern": "x", "file_pattern": "/etc/*"}],
+)
+def test_code_search_blocks_escaping_pathspec(go_repo: Path, args: dict[str, str]) -> None:
+    """测试越界 pathspec 由**我们**回中文错误，不再把 git 的 stderr 甩给模型。
+
+    原来靠 git 自己拒（`fatal: outside repository at '/private/...'`）——
+    挡住是挡住了，但那条消息把本机绝对路径一起送给了外部 API。
+    """
+    tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
+
+    result = tool.text(args)
+
+    assert "错误" in result
+    assert "outside repository" not in result, "不该把 git 的英文 stderr 透传给模型"
+    assert str(go_repo) not in result, "不该把本机路径写进送给模型的文本"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [{"pattern": "a\x00b"}, {"pattern": "func", "file_pattern": "a\x00b"}],
+)
+def test_code_search_rejects_nul_args(go_repo: Path, args: dict[str, str]) -> None:
+    """测试两个参数里的 NUL 都被拦住 —— 它们都要进 argv。
+
+    回归用例：`subprocess.run` 的 argv 不接受 NUL，抛的是 `ValueError`，
+    而框架默认只把 `ToolInvocationError` 转成工具结果，其余原样抛 ——
+    实测 `run_review_agent` 直接把异常抛出来，整条 review 结束。
+    """
+    tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
+
+    assert "错误" in tool.text(args)
+
+
+def test_code_search_keeps_dash_arguments_as_pathspec(go_repo: Path) -> None:
+    """测试以 `-` 开头的参数被 `--` 挡成 pathspec，不会变成 git 的选项。"""
+    tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
+
+    # 当选项的话 git 会去搜索引；当 pathspec 就是「没有这个文件」
+    assert "未找到匹配" in tool.text({"pattern": "func Alpha", "file_pattern": "--cached"})
+
+
+def test_file_read_diff_has_nothing_to_escape() -> None:
+    """测试 file_read_diff 对越界路径只有「查不到」一种结局。
+
+    它不碰文件系统（纯字典查询），所以没有需要防的东西 —— 这条用例是把
+    「不需要校验」这个判断钉住，免得以后有人照着 file_read 抄一份进来。
+    """
+    tool = ToolUnderTest(file_read_diff, diff_context(TWO_FILE_DIFF))
+
+    for path in ("../../etc/passwd", "/etc/passwd", "a\x00b"):
+        assert "未找到" in tool.text({"path": path})

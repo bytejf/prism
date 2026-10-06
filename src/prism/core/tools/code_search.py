@@ -13,6 +13,7 @@ from langgraph.prebuilt import ToolRuntime
 from prism.config.settings import settings
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import ReviewState
+from prism.core.tools.paths import check_no_nul, check_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,16 @@ def code_search(
     if not ctx.project_root:
         logger.warning("code_search 缺少 project_root")
         return "错误：ReviewContext.project_root 未设置"
+
+    # 两个参数都会进 argv，先过我们自己的校验：越界让 git 拒的话，模型拿到的是
+    # 带本机绝对路径的英文 stderr；含 NUL 的话 subprocess 直接抛异常（没人接）。
+    # 见 core/tools/paths.py
+    try:
+        check_no_nul(pattern, field="pattern")
+        check_relative_path(file_pattern, field="file_pattern")
+    except ValueError as exc:
+        logger.warning("code_search 参数校验失败：%s", exc)
+        return f"错误：{exc}"
 
     # -c core.quotepath=false：含中文等非 ASCII 的路径按原样输出，
     #   否则 git 会转义成 "a-\346\234\200.md"，LLM 拿到后无法回传给 file_read

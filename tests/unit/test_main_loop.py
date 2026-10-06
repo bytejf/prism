@@ -7,6 +7,7 @@
 Protocol 已经接不上了。
 """
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast, override
@@ -17,6 +18,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
+from langchain_core.tools import tool as langchain_tool
 from pydantic import Field
 
 from prism.config.settings import settings
@@ -736,3 +738,116 @@ def test_main_loop_empty_group(project_root: str) -> None:
 
     assert result.exit_reason == EXIT_END_DONE
     assert result.comments == []
+
+
+# ---------- 工具异常不许炸掉整组 ----------
+
+
+@langchain_tool(description="一个必定抛异常的工具（兜底用例专用）。")
+def exploding_tool(path: str) -> str:
+    """必定抛异常。
+
+    Args:
+        path: 工具参数（模型看不到这个 docstring，描述走 description=）
+
+    Returns:
+        永不返回
+
+    Raises:
+        RuntimeError: 总是
+    """
+    msg = f"工具内部炸了：{path}"
+    raise RuntimeError(msg)
+
+
+@pytest.fixture
+def exploding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """往图里多塞一个「必炸」的工具。
+
+    四个真工具今天都自己兜住了错误，所以要验兜底只能造一个故障源。
+    这条用例保的不是某一次调用，是**这一类**：以后加工具、接 MCP、
+    或者哪个库换了抛法，异常不该带走整组。
+
+    Args:
+        monkeypatch: pytest 的补丁工具
+    """
+
+    def with_exploding() -> list[BaseTool]:
+        return [exploding_tool, *build_tools()]
+
+    monkeypatch.setattr("prism.core.agent.agent.build_tools", with_exploding)
+
+
+def test_tool_exception_does_not_kill_the_group(
+    project_root: str, exploding: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """测试工具抛异常时整组审查照样跑完。
+
+    回归用例（实测过）：框架默认的兜底只认 `ToolInvocationError`，
+    `_default_handle_tool_errors` 最后一行是 `raise e` —— 于是工具里任何一个
+    意外异常都会穿过图、穿过 `run_review_agent`，把**整条 review 带走**：
+    后面所有组不再跑、前面已经审出来的评论也一起没（CLI 最后才渲染）。
+    """
+    llm = ScriptedChatModel(
+        responses=[
+            ai_call("exploding_tool", {"path": "a.go"}, "boom"),
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+
+    with caplog.at_level(logging.ERROR):
+        result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_END_DONE, "整组应继续跑到正常收尾"
+    assert "工具 exploding_tool 抛异常" in caplog.text, "异常要按 ERROR 记下来"
+    # 回给模型的话要能让它自己做决定，而不是照着同一套参数重试
+    second_request = "\n".join(str(message.content) for message in llm.calls[1])
+    assert "工具内部执行失败" in second_request
+    assert "不要用同样的参数重试" in second_request
+
+
+def test_parallel_tool_calls_all_get_a_result_when_one_fails(
+    project_root: str, exploding: None
+) -> None:
+    """测试并行工具调用里一个炸了，另一个的结果照样回给模型。
+
+    一轮里模型可以并发调多个工具。LangGraph 要求**每个 tool_call 都有对应的
+    工具结果**，少一个就是校验错误、整组崩 —— 兜底必须补齐炸掉的那一条，
+    而不是把整轮丢掉。
+    """
+    llm = ScriptedChatModel(
+        responses=[
+            ai_call(
+                "exploding_tool",
+                {"path": "a.go"},
+                "boom",
+            ).model_copy(
+                update={
+                    "tool_calls": [
+                        {
+                            "name": "exploding_tool",
+                            "args": {"path": "a.go"},
+                            "id": "boom",
+                            "type": "tool_call",
+                        },
+                        {
+                            "name": "file_read",
+                            "args": {"path": "a.go", "start_line": 1, "end_line": 2},
+                            "id": "ok",
+                            "type": "tool_call",
+                        },
+                    ]
+                }
+            ),
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_END_DONE
+    second_request = "\n".join(str(message.content) for message in llm.calls[1])
+    assert "工具内部执行失败" in second_request, "炸掉的那条要有回执"
+    assert "     1: package main" in second_request, "没炸的那条结果也要在（a.go 内容带行号）"

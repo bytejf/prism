@@ -146,6 +146,31 @@ bug 藏了很久。**丢弃日志说错原因，比丢东西本身更难发现�
   → `file_read_diff` 确认它没改 → 把结论挂在接口那一行上；两个走查仓库都触发不了
   这个场景（一个单审查单元、一个组内同包）
 
+## 工具的参数是信任边界（改 `core/tools/` 前必读）
+
+**入参是模型给的** —— 这是本项目唯一一处「外部输入直接送到系统调用」的地方。
+三个吃路径的工具里，有两个把参数交给外面，而外面的反应各不相同：git 自己拒越界
+pathspec（`fatal: outside repository`，英文 stderr 还带**本机绝对路径**，那段文字
+要发给外部 API）、`subprocess` 对 NUL 直接抛 `ValueError`、pygit2 给 `KeyError`。
+**校验收在我们的这一侧**（`core/tools/paths.py`），失败就长一个样。
+
+- `check_relative_path`：空 / NUL / 绝对路径 / `..` 段。`check_no_nul` 单独给
+  「不是路径但要进 argv」的参数（`code_search` 的 `pattern`）
+- **别放宽它去迁就 git**：合法 pathspec（`*.go`、`:(top)*.go`）一样要通过，
+  校验不能比 git 自己更窄 —— 用例里有正面清单
+- `file_read_diff` **不走校验**：纯字典查询，越界路径的结局就是「查不到」，
+  没有要防的东西。**别照着 `file_read` 抄一份进来**
+- 字符串校验唯一挡不住的是**符号链接**（`link.go` 字面合法）：由读取侧再挡一道
+  （`_resolve_inside_project` 的 `resolve()` + `is_relative_to`）。走 git 那条路
+  读的是 blob 内容，软链接本身就是一段文本，天然不跟随
+- **评论的 `path` 模型改不了**：`report_hunks` 只收 `existing_code`，path 由
+  `hunk_id` 查出来。这是一处**结构上**的防护，别为了「方便」让它自己填路径
+- 工具体内的异常**由 `tool_error_guard` 兜**（见框架缺口表）：整组不因为它崩，
+  但也不是静默 —— ERROR + 完整堆栈
+
+验证方式：`tests/unit/test_tools.py` 的「路径安全」一节（含 symlink 逃逸、
+NUL、`--` 挡住选项注入），变异 9/9（`/tmp/mutate_paths.py`）。
+
 ## 评论定位（改 `core/output/locate.py` 前必读）
 
 审查后第一步：把 LLM 报的评论挂到具体行号上。**零 LLM**，同一输入同一输出。
@@ -221,6 +246,7 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 | **`@tool(args_schema=...)` 会让 `runtime: ToolRuntime[...]` 注入失效** —— 显式给了 args_schema，框架就不再从函数签名推导，`runtime` 从 `get_input_schema()` 里消失，调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。**五个工具全吃 runtime，所以全都不能用 `args_schema`** | 一律不给 `args_schema`。嵌套结构（`report_hunks` 的 `reports`）靠**类型注解**表达，一样能出嵌套 schema |
 | `parse_docstring=True` + `args_schema=` 一起给时，工具描述会**静默变成参数模型的 docstring** | 同上：不给 `args_schema`。另注意**参数模型的 docstring 本身也会进 schema**，所以要写成给模型看的话，设计理由用 `#` 注释 |
 | 工具定义**入站**还要过一道转换：`convert_to_openai_tool` 会剥掉所有 `title`、剥掉参数顶层的 `description`、把 `$defs` + `$ref` **内联展开** | 日志与对账一律用 `convert_to_openai_tool(tool)["function"]`，别拿 `tool_call_schema.model_json_schema()`（那是转换前的，`report_hunks` 两份差 2000 vs 1279 字节） |
+| `ToolNode` 的默认兜底 **`_default_handle_tool_errors` 只把 `ToolInvocationError` 转成工具结果，最后一行是 `raise e`** —— 工具里任何一个意外异常都会穿过图、穿过 `run_review_agent`，把**整条 review 带走**（后面所有组不跑，前面审出来的评论也一起没，CLI 最后才渲染） | 注册 `tool_error_guard`（`middleware.py` 的 `wrap_tool_call`），放中间件链**最内侧**：ERROR + 堆栈记全，回给模型一句「换一种方式」，日志的 tool 行照样在（`ReviewTrace` 在它外侧） |
 | `recursion_limit` 按 **super-step** 算，`create_agent` 实测每轮约 **6.1** 步 | `max_rounds * 7 + 20` |
 | **思考模式下不能强制 `tool_choice`** —— `with_structured_output` 的 `function_calling` / `json_schema` 两条路都靠强制，实测直接 `400 Thinking mode does not support this tool_choice`；`json_mode` 另要提示词里出现 "json" 且只保证合法 JSON、不保证 schema | 单次结构化调用也走 `bind_tools(tool_choice="auto")`（审查循环本来就没强制过），回参自己用 Pydantic 校验 —— 见 `core/reflection/reflect.py` |
 
