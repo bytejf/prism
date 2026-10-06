@@ -22,7 +22,7 @@ schema）/ 每次工具调用的参数与耗时」这套日志与审查流程**�
 
 ## 形态约定
 
-与审查的四个工具一致：`@tool(parse_docstring=True, description="…")`，
+与审查的五个工具一致：`@tool(parse_docstring=True, description="…")`，
 **不给 `args_schema`** —— 给了它 `runtime: ToolRuntime[...]` 的注入就失效
 （见 CLAUDE.md 的「框架缺口」表）。嵌套结构靠 Pydantic 模型的类型注解表达。
 """

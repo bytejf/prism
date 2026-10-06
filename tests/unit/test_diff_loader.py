@@ -7,7 +7,7 @@ from pathlib import Path
 import pygit2
 import pytest
 
-from prism.core.diff.loader import load_diffs, resolve_commit
+from prism.core.diff.loader import build_diff_index, load_diffs, resolve_commit
 from prism.core.diff.parser import parse_diff_text
 
 
@@ -327,3 +327,81 @@ def test_load_diffs_matches_git_cli_u0(blank_line_repo: Path) -> None:
         for diff in load_diffs(blank_line_repo, "main", "feature")
     }
     assert ours == shape(cli_patch)
+
+
+# ---------- build_diff_index ----------
+
+# 「A 改名成 B」与「新建一个 A」同时发生 ——
+# 索引里两个 A 会撞车，这个样本就是那场撞车
+RENAME_AND_REUSE = """\
+diff --git a/old.go b/new.go
+similarity index 90%
+rename from old.go
+rename to new.go
+--- a/old.go
++++ b/new.go
+@@ -1 +1 @@
+-package old
++package new
+diff --git a/old.go b/old.go
+new file mode 100644
+--- /dev/null
++++ b/old.go
+@@ -0,0 +1 @@
++package fresh
+"""
+
+
+def test_build_diff_index_keys_by_repo_path() -> None:
+    """测试每个文件都能按自己的路径查到。"""
+    diffs = parse_diff_text(
+        "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-x()\n+y()\n"
+        "diff --git a/sub/b.go b/sub/b.go\n--- a/sub/b.go\n+++ b/sub/b.go\n"
+        "@@ -1 +1 @@\n-p()\n+q()\n"
+    )
+
+    index = build_diff_index(diffs)
+
+    assert sorted(index) == ["a.go", "sub/b.go"]
+    assert index["sub/b.go"].hunks[0].content == "-p()\n+q()"
+
+
+def test_build_diff_index_adds_old_path_alias_for_renames() -> None:
+    """测试改名的文件按旧路径也查得到，且指向同一份改动。
+
+    提示词里带着 `renamed-from="old.go"`，模型很可能拿旧名字来查。
+    """
+    (diff,) = parse_diff_text(
+        "diff --git a/old.go b/new.go\n--- a/old.go\n+++ b/new.go\n@@ -1 +1 @@\n-a\n+b\n"
+    )
+
+    index = build_diff_index([diff])
+
+    assert index["old.go"] is index["new.go"] is diff
+
+
+def test_build_diff_index_lets_the_real_file_win_the_alias() -> None:
+    """测试「改名 + 新建同名文件」时，查那个名字拿到的是**新建的文件**。
+
+    回归用例：别名用直接赋值写的话，别名会把规范路径盖掉 —— 模型问 old.go
+    拿到的是 new.go 的改动，一个不报错的错答案。
+    """
+    index = build_diff_index(parse_diff_text(RENAME_AND_REUSE))
+
+    assert index["old.go"].is_new, "old.go 应该指新建的那个文件"
+    assert index["new.go"].old_path == "old.go", "new.go 仍是那份改名 diff"
+
+
+def test_build_diff_index_skips_dev_null() -> None:
+    """测试新增文件不会在索引里留下 `/dev/null` 这个键。
+
+    解析器用 `/dev/null` 表示「该侧不存在」，它不是一个可查询的路径。
+    """
+    diffs = parse_diff_text(
+        "diff --git a/fresh.go b/fresh.go\nnew file mode 100644\n--- /dev/null\n"
+        "+++ b/fresh.go\n@@ -0,0 +1 @@\n+package fresh\n"
+    )
+
+    index = build_diff_index(diffs)
+
+    assert sorted(index) == ["fresh.go"]

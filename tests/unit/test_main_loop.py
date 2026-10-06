@@ -36,6 +36,8 @@ from prism.core.agent.state import (
     pending_ids,
 )
 from prism.core.agent.status import build_review_status
+from prism.core.diff.loader import build_diff_index
+from prism.core.diff.parser import parse_diff_text
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
@@ -357,10 +359,10 @@ def test_initial_state_builds_user_message_and_round_budget(project_root: str) -
     assert user_text.index("<diff>") < user_text.index("### 审查要求")
 
 
-def test_build_tools_exposes_four_tools() -> None:
-    """测试 4 个工具都构造出来且名字正确。"""
+def test_build_tools_exposes_five_tools() -> None:
+    """测试 5 个工具都构造出来且名字正确。"""
     names = sorted(tool.name for tool in build_tools())
-    assert names == ["code_search", "end_done", "file_read", "report_hunks"]
+    assert names == ["code_search", "end_done", "file_read", "file_read_diff", "report_hunks"]
 
 
 # ---------- review_status ----------
@@ -412,11 +414,42 @@ def test_main_loop_exits_on_end_done(project_root: str) -> None:
 
 
 def test_main_loop_passes_tools_to_llm(project_root: str) -> None:
-    """测试每轮都把 4 个工具传给 LLM。"""
+    """测试每轮都把 5 个工具传给 LLM。"""
     llm = ScriptedChatModel(responses=[report_call(["H-01"]), done_call()])
     run_review_agent(make_group(["H-01"]), llm, project_root)
 
-    assert [len(tools) for tools in llm.tools_seen] == [4, 4]
+    assert [len(tools) for tools in llm.tools_seen] == [5, 5]
+
+
+def test_diff_index_reaches_the_tool(project_root: str) -> None:
+    """测试 diff 索引从 run_review_agent 一路传到了工具手里。
+
+    回归用例：`run_review_agent` 里少传一个 `diffs=...`，file_read_diff 只会
+    回「不可用」—— 没有异常、没有日志红字，只是跨文件查询**整条静默失效**。
+    这里断言渲染出来的 diff 真的出现在下一轮请求里（走的是真实的
+    ReviewContext 注入路径，不是直接构造上下文调工具）。
+    """
+    sample = parse_diff_text(
+        "diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n-old()\n+new()\n"
+    )
+    llm = ScriptedChatModel(
+        responses=[
+            ai_call("file_read_diff", {"path": "b.go"}, "c1"),
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+
+    run_review_agent(
+        make_group(["H-01"]),
+        llm,
+        project_root,
+        diff_index=build_diff_index(sample),
+    )
+
+    second_request = "\n".join(str(message.content) for message in llm.calls[1])
+    assert "@@ -1,1 +1,1 @@" in second_request
+    assert "+new()" in second_request
 
 
 def test_main_loop_exits_on_max_rounds(project_root: str) -> None:

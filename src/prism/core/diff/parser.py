@@ -7,7 +7,7 @@
 import logging
 import re
 
-from prism.models.diff import Diff, Hunk
+from prism.models.diff import DEV_NULL, Diff, Hunk
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +24,6 @@ UNKNOWN_PATH = "<unknown>"
 
 # git 中符号链接的文件模式（普通文件为 100644 / 100755）
 SYMLINK_MODE = "120000"
-
-# 未变更侧路径的占位符
-DEV_NULL = "/dev/null"
 
 
 def parse_diff_text(text: str) -> list[Diff]:

@@ -32,6 +32,9 @@ REVIEW_DIMENSIONS: tuple[str, ...] = (
 # 的东西（角色、输入格式、硬约束），随本次审查走的都放 user。
 WORKFLOW: tuple[str, ...] = (
     "先用 file_read 读取 hunk 周边上下文，必要时用 code_search 查调用方与定义",
+    "怀疑改动波及其他文件（接口签名、公共函数、共享常量变更）时："
+    "用 code_search 找到相关文件，用 file_read_diff 看它改了什么，"
+    "再判断是否同步适配 —— 判断权在你，我们不会预先告诉你哪些文件相关",
     "每完成 1~2 个 hunk 的审查，立即调用 report_hunks 报告结论，不要攒批",
     "某个 hunk 需要深入探索时，可以在探索完成后报告该 hunk",
     "同一 hunk 的多个问题可以合并到一次 report_hunks 中",
@@ -90,6 +93,8 @@ SYSTEM = _t("""\
 ## 硬约束
 
 - 只审查给定的 hunk，不要审查未列出的代码
+- file_read_diff 读到的是**别的文件**的改动，只作为判断依据，
+  不要在它上面报评论 —— 报评论只能是本 hunk 里的代码
 - 每条评论必须给出 severity、category、content、existing_code
 
 ## existing_code 怎么写

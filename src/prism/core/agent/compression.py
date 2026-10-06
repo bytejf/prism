@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # `report_hunks`（回一句 ack + 进度计数）和 `end_done`（回「审查完成」或
 # 「⚠️ 剩余 X 未审」）也清掉 —— 后者的拒绝消息是摘要里 `Errors and Fixes`
 # 段唯一的素材来源，删了那一段永远是「（无）」
-REFETCHABLE_TOOLS = frozenset({"file_read", "code_search"})
+REFETCHABLE_TOOLS = frozenset({"file_read", "file_read_diff", "code_search"})
 
 # 占位符要同时说清三件事：发生了什么、原内容是什么、怎么拿回来。
 # 只说「(已清理)」模型不知道这儿原本有什么，也看不出能重新取；

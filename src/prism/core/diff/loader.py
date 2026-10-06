@@ -5,6 +5,7 @@
 """
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 
 import pygit2
@@ -105,6 +106,36 @@ def read_blob(repo: pygit2.Repository, commit: pygit2.Commit, path: str) -> str 
     if not isinstance(blob, pygit2.Blob):
         return None
     return bytes(blob.data).decode("utf-8", errors="replace")
+
+
+def build_diff_index(diffs: Iterable[Diff]) -> dict[str, Diff]:
+    """按路径给 diff 建索引，供 `file_read_diff` 查询。
+
+    两步走，顺序不能反：
+
+    1. 每个文件的**规范路径**（`Diff.path`）先占位 —— 见 models/diff.py
+    2. 改过名的文件再补一个**旧路径别名**：提示词里带着
+       `renamed-from="old.go"`，模型很可能拿着旧名字来查，查不到就会得到
+       「没有改动」这个错答案
+
+    第 2 步用 `setdefault` 而不是直接赋值：同一次 diff 里可能既有「A 改名成 B」
+    又有「新建了一个 A」。直接赋值会让新建的 A 被别名盖掉，模型问 A 拿到的是
+    B 的改动 —— 一个不报错的错答案。`setdefault` 保证第 1 步建立的规范路径赢。
+
+    Args:
+        diffs: 待索引的 diff（通常是过滤后的可审查文件）
+
+    Returns:
+        `路径 → Diff` 映射，含改名文件的旧路径别名
+    """
+    items = list(diffs)
+    index: dict[str, Diff] = {item.path: item for item in items}
+    for item in items:
+        if item.is_new or item.old_path == item.path:
+            continue
+        index.setdefault(item.old_path, item)
+    logger.debug("diff 索引：%d 个文件 → %d 个路径", len(items), len(index))
+    return index
 
 
 def load_diffs(repo_path: str | Path, base: str, head: str) -> list[Diff]:

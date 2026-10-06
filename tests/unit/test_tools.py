@@ -1,10 +1,11 @@
-"""工具系统的单元测试（file_read / code_search / report_hunks / end_done）。
+"""工具系统的单元测试（file_read / file_read_diff / code_search / report_hunks / end_done）。
 
 工具通过 `ToolRuntime` 拿静态上下文（`runtime.context`）与可变状态
 （`runtime.state`），不再吃一个共享的 ToolContext 对象。
 写状态的工具返回 `Command`，测试从 `Command.update` 里读结果。
 """
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -30,9 +31,12 @@ from prism.core.agent.state import (
     merge_hunk_status,
     pending_ids,
 )
+from prism.core.diff.loader import build_diff_index
+from prism.core.diff.parser import parse_diff_text
 from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
+from prism.core.tools.file_read_diff import file_read_diff
 from prism.core.tools.report_hunks import report_hunks
 from prism.observability.llm_trace import _describe_tool
 
@@ -40,7 +44,7 @@ CONTEXT_WITHOUT_ROOT = ReviewContext(project_root="")
 
 
 def test_tools_keep_runtime_injectable() -> None:
-    """测试四个工具都还能拿到 `runtime` 注入，且它不出现在模型看到的 schema 里。
+    """测试五个工具都还能拿到 `runtime` 注入，且它不出现在模型看到的 schema 里。
 
     回归用例：**不能改用 `args_schema=`**。显式给了它，框架就不再从函数签名
     推导，`runtime` 会从 `get_input_schema()` 里消失 —— 注入断掉，调用时报
@@ -305,6 +309,155 @@ def test_file_read_without_project_root() -> None:
     tool = ToolUnderTest(file_read, CONTEXT_WITHOUT_ROOT)
     result = tool.text({"path": "a.go", "start_line": 1, "end_line": 1})
     assert "project_root" in result
+
+
+# ---------- file_read_diff ----------
+
+# 两个文件的 diff。样本走**真实解析器**生成 Diff，不手搓对象 ——
+# 手搓的话解析器改了、这里却还是绿的
+TWO_FILE_DIFF = """\
+diff --git a/a.go b/a.go
+--- a/a.go
++++ b/a.go
+@@ -3,2 +3,3 @@
+-old()
++new()
++extra()
+diff --git a/b.go b/b.go
+--- a/b.go
++++ b/b.go
+@@ -9 +9 @@
+-ping()
++pong()
+"""
+
+RENAMED_DIFF = """\
+diff --git a/old.go b/new.go
+similarity index 90%
+rename from old.go
+rename to new.go
+--- a/old.go
++++ b/new.go
+@@ -1 +1 @@
+-package old
++package new
+"""
+
+NEW_FILE_DIFF = """\
+diff --git a/fresh.go b/fresh.go
+new file mode 100644
+--- /dev/null
++++ b/fresh.go
+@@ -0,0 +1,2 @@
++package fresh
++var x = 1
+"""
+
+
+def diff_context(text: str) -> ReviewContext:
+    """由 diff 文本构造带索引的上下文。
+
+    Args:
+        text: unified diff 文本
+
+    Returns:
+        ReviewContext，diffs 为按路径建好的索引
+    """
+    return ReviewContext(project_root="", diffs=build_diff_index(parse_diff_text(text)))
+
+
+def test_file_read_diff_returns_only_the_requested_file() -> None:
+    """测试按路径取到该文件的完整 diff（含 hunk 头），且不含别的文件。
+
+    只给一个文件的改动是本工具存在的意义：模型要判断「调用方有没有跟着改」，
+    拿一堆别的文件的 diff 只会烧 token。
+    """
+    tool = ToolUnderTest(file_read_diff, diff_context(TWO_FILE_DIFF))
+
+    result = tool.text({"path": "a.go"})
+
+    assert "diff --git a/a.go b/a.go" in result
+    assert "@@ -3,2 +3,3 @@" in result, "hunk 头必须给 —— 行号信息只在这里"
+    assert "+extra()" in result
+    assert "pong()" not in result, "不该夹带别的文件"
+
+
+def test_file_read_diff_hunk_header_always_spells_out_counts() -> None:
+    """测试行数为 1 时也写 `,1`，不学 git 省略。
+
+    省略的那个数正是模型数行号的起点（`@@ -9 +9 @@` 里 9 是起始行还是行数？），
+    省掉的字节换来一次误读不划算。
+    """
+    tool = ToolUnderTest(file_read_diff, diff_context(TWO_FILE_DIFF))
+
+    assert "@@ -9,1 +9,1 @@" in tool.text({"path": "b.go"})
+
+
+def test_file_read_diff_reports_unknown_path() -> None:
+    """测试查不到时给出说明，而不是空串。
+
+    被过滤的文件与「确实没改」在这里是同一句话：索引里只有可审查文件，
+    说不清是哪种。见 file_read_diff 模块 docstring。
+    """
+    tool = ToolUnderTest(file_read_diff, diff_context(TWO_FILE_DIFF))
+
+    result = tool.text({"path": "nope.go"})
+
+    assert "未找到" in result
+    assert "nope.go" in result
+
+
+def test_file_read_diff_reports_missing_index(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """测试索引为空时**报错**，而不是回「没有改动」。
+
+    回归用例：索引没装上（装配错误）时若按「查不到 = 没改」处理，每次查询都
+    得到「没有改动」，模型据此判断「调用方没同步改」并报出假问题 ——
+    一条不报错的错链路。这是「静默失效比丢东西更难发现」的那一类。
+    """
+    tool = ToolUnderTest(file_read_diff, ReviewContext(project_root=""))
+
+    with caplog.at_level(logging.WARNING):
+        result = tool.text({"path": "a.go"})
+
+    assert "错误" in result
+    assert "diffs 为空" in caplog.text
+
+
+def test_file_read_diff_finds_renamed_file_by_old_path() -> None:
+    """测试改名后的文件用**旧路径**也查得到。
+
+    提示词里带着 `renamed-from="old.go"`，模型很可能拿着旧名字来查；
+    查不到就会得到「没有改动」这个错答案。
+    """
+    tool = ToolUnderTest(file_read_diff, diff_context(RENAMED_DIFF))
+
+    by_old = tool.text({"path": "old.go"})
+    by_new = tool.text({"path": "new.go"})
+
+    assert by_old == by_new, "两个名字指向同一份改动"
+    assert "rename from old.go" in by_old, "新旧名字要在文本里对得上号"
+
+
+def test_file_read_diff_marks_new_and_deleted_files() -> None:
+    """测试新增 / 删除文件的两侧用 /dev/null 标出来。"""
+    tool = ToolUnderTest(file_read_diff, diff_context(NEW_FILE_DIFF))
+
+    result = tool.text({"path": "fresh.go"})
+
+    assert "new file" in result
+    assert "--- /dev/null" in result
+    assert "+++ b/fresh.go" in result
+    # 新增文件在 diff --git 行里仍写 a/x：git 自己就是这么写的
+    assert "diff --git a/fresh.go b/fresh.go" in result
+
+
+def test_file_read_diff_rejects_empty_path() -> None:
+    """测试空路径给出明确错误，而不是拼出「未找到 的改动」这种半截话。"""
+    tool = ToolUnderTest(file_read_diff, diff_context(TWO_FILE_DIFF))
+
+    assert "错误" in tool.text({"path": "  "})
 
 
 # ---------- 必须读「被审查版本」而不是工作区 ----------

@@ -2,6 +2,12 @@
 
 from dataclasses import dataclass
 
+# 未变更侧的路径占位符。
+#
+# 放在模型这一层而不是解析器里：它是 `Diff.old_path` / `new_path` 的**取值约定**
+# （新增文件 old_path 是它），解析器与渲染工具都要按它判断，各写一份就会漂。
+DEV_NULL = "/dev/null"
+
 
 @dataclass
 class Hunk:

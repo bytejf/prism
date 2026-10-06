@@ -156,6 +156,23 @@ def test_clean_replaces_refetchable_and_drops_old_status() -> None:
     assert cleaned[4].content == "已记录 1 个 hunk：H-01", "report_hunks 的返回要留着"
 
 
+def test_clean_replaces_file_read_diff() -> None:
+    """测试：file_read_diff 的返回也换成占位符。
+
+    判据只有「能不能重新拿到」这一条 —— 它查的是内存里的 diff 索引，
+    再调一次就能拿回原文，和 file_read / code_search 同类。
+    """
+    history = [
+        HumanMessage(content="指导 + diff", id="m0"),
+        call_message("file_read_diff", {"path": "b.go"}, "c1"),
+        ToolMessage(content="diff --git a/b.go b/b.go\n@@ -1 +1 @@\n-p\n+q", tool_call_id="c1"),
+    ]
+
+    cleaned = clean_history(history)
+
+    assert str(cleaned[2].content) == PLACEHOLDER.format(call="file_read_diff(path='b.go')")
+
+
 def test_clean_keeps_end_done_rejection() -> None:
     """测试：end_done 被拒绝的返回必须保留。
 

@@ -12,6 +12,7 @@
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any, cast
 
 from langchain.agents import create_agent
@@ -39,8 +40,10 @@ from prism.core.guidance.builder import build_diff_block, build_requirements
 from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
+from prism.core.tools.file_read_diff import file_read_diff
 from prism.core.tools.report_hunks import report_hunks
 from prism.models.compression import CompressionConfig
+from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.observability.llm_trace import ReviewTrace
 
@@ -48,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_tools() -> list[BaseTool]:
-    """构造 4 个审查工具。
+    """构造 5 个审查工具。
 
     工具通过 `ToolRuntime` 取静态上下文与状态（框架注入，模型看不到该参数），
     因此不需要按运行时构造 —— 图构建时定一次即可。
@@ -56,7 +59,7 @@ def build_tools() -> list[BaseTool]:
     Returns:
         工具列表
     """
-    return [file_read, code_search, report_hunks, end_done]
+    return [file_read, file_read_diff, code_search, report_hunks, end_done]
 
 
 # 交给 `create_agent` 的那个图和它的实际类型不一样，这里手写一份更精确的。
@@ -158,6 +161,7 @@ def run_review_agent(
     project_root: str,
     head_rev: str = "",
     compression: CompressionConfig | None = None,
+    diff_index: Mapping[str, Diff] | None = None,
 ) -> MainLoopResult:
     """跑一个审查单元的循环。
 
@@ -170,6 +174,8 @@ def run_review_agent(
             1M 窗口下几乎不会触发，它是保险不是常规操作。传
             ``dataclasses.replace(settings.compression, context_window=...)``
             收小窗口就能在测试里逼出压缩
+        diff_index: `路径 → Diff` 索引，供 `file_read_diff` 查跨文件改动。
+            不传时该工具只能回「不可用」—— 只有测试会这样传
 
     Returns:
         循环产出（退出原因、评论、未审 hunk 等）
@@ -195,7 +201,11 @@ def run_review_agent(
         ReviewState,
         agent.invoke(
             initial_state(group, max_rounds),
-            context=ReviewContext(project_root=project_root, head_rev=head_rev),
+            context=ReviewContext(
+                project_root=project_root,
+                head_rev=head_rev,
+                diffs=diff_index or {},
+            ),
             # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约
             # 6.1 步（30 轮 = 182 步），旧手写图的 ×5 不够，取 ×7 留余量。
             # 真正的终止保证是 ModelCallLimitMiddleware，这里只是防图跑飞。

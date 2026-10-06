@@ -74,6 +74,7 @@
 
 import logging
 import time
+from collections.abc import Mapping
 from importlib.metadata import version
 from itertools import groupby
 from pathlib import Path, PurePosixPath
@@ -84,7 +85,7 @@ import typer
 from prism.config.settings import settings
 from prism.core.agent.agent import run_review_agent
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
-from prism.core.diff.loader import load_diffs
+from prism.core.diff.loader import build_diff_index, load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import group_by_package
 from prism.core.llm.client import LLMClient
@@ -362,6 +363,7 @@ def _run_groups(
     groups: list[Group],
     project_root: Path,
     head_rev: str,
+    diff_index: Mapping[str, Diff],
 ) -> tuple[list[Comment], list[PotentialMiss]]:
     """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位与反思。
 
@@ -376,6 +378,8 @@ def _run_groups(
         groups: 审查单元列表
         project_root: 项目根目录
         head_rev: 被审查的版本，传给工具读源码用
+        diff_index: `路径 → Diff` 索引，每组都要传 —— 它是**全量**的，
+            组内组外都有，`file_read_diff` 靠它看别的包改了什么
 
     Returns:
         (保留的评论, 疑似漏报信号)。评论含未定位的那些（带 locate_level 标记）
@@ -396,6 +400,7 @@ def _run_groups(
             str(project_root),
             head_rev,
             settings.compression,
+            diff_index,
         )
         located = locate_group(item, result.hunk_comments)
         outcome = reflect(llm.model, item, located)
@@ -429,6 +434,11 @@ def review(
     typer.echo(f"Filtering files... ({_plural(len(diffs), 'file')} in diff)")
     reviewable = filter_files(diffs).reviewable
 
+    # 索引在分组**之前**建、且建在**过滤之后**：filter 的产出既决定了哪些文件
+    # 可审，也决定了 file_read_diff 能看到什么。分组不参与 —— 跨组查询要的正是
+    # 别的组的改动，按组建索引就等于没建
+    diff_index = build_diff_index(reviewable)
+
     typer.echo(f"Grouping by package... ({_plural(len(reviewable), 'reviewable file')})")
     try:
         groups = group_by_package(map_hunks_to_symbols(root, base, head, reviewable))
@@ -442,7 +452,7 @@ def review(
 
     # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
     if groups:
-        comments, misses = _run_groups(groups, root, head)
+        comments, misses = _run_groups(groups, root, head, diff_index)
     else:
         comments, misses = [], []
     comments = sort_comments(comments)

@@ -4,7 +4,7 @@
 """
 
 from prism.core.guidance.builder import build_diff_block, build_requirements
-from prism.core.guidance.templates import REVIEW_DIMENSIONS, WORKFLOW
+from prism.core.guidance.templates import REVIEW_DIMENSIONS, SYSTEM, WORKFLOW
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
@@ -242,6 +242,22 @@ def test_requirements_lists_workflow() -> None:
     assert "### 工作方式" in text
     for step in WORKFLOW:
         assert f"- {step}" in text
+
+
+def test_prompt_teaches_cross_file_lookup_without_exposing_groups() -> None:
+    """测试提示词教了 file_read_diff 的用法，且**不暴露「组」这个概念**。
+
+    分组是我们的实现细节：告诉模型「其他组改了什么」，它就得先理解组是什么，
+    而且我们要主动判断哪些文件相关 —— 那是在用近似规则模拟调用图（见设计
+    文档 15 号 §4.4）。判断权交给它，配一个能查改动的工具就够。
+    """
+    system = SYSTEM
+    text = build_requirements()
+
+    assert "file_read_diff" in text, "工作方式里要说到这个工具"
+    assert "file_read_diff" in system, "硬约束里要划定它的用途"
+    assert "只作为判断依据" in system, "越界评论是它带来的新失败模式"
+    assert "其他组" not in text and "分组" not in text, "分组是内部概念，不给模型看"
 
 
 def test_requirements_instructs_report_hunks_and_end_done() -> None:

@@ -109,6 +109,37 @@ per step`，整组审查崩掉（实测 21 轮里有 8 轮是并行调用）。
 合成一个数时，「重命名 + 纯删除被丢弃」的信号被写成了「改动只涉及注释或空行」，
 bug 藏了很久。**丢弃日志说错原因，比丢东西本身更难发现。**
 
+## 跨文件改动查询（改 `core/tools/file_read_diff.py` 前必读）
+
+分组是**按包**分的：一个跨包改动（改接口 + 改实现 + 改调用方）会被切成互不可见的
+审查单元。补足手段只有一个 —— `file_read_diff(path)`：按路径取该文件的 diff，
+让模型自己判断「那个文件跟着改了吗」。**刻意不做调用图分组**，理由与触发条件写在
+设计文档 15 号（精度实测见 `4-建图技术方案`：`(*Agent).Run` 的 57 个 callee 里只有
+约 15 个是项目内函数，噪音比 73%；**错误的分组比不分组更糟**）。
+
+- 数据是 `ReviewContext.diffs`（`build_diff_index` 建的索引），**不重读 git、不读工作区**
+  —— 一次审查内 diff 不变，查的是已经在内存里的那份
+- 索引**只含可审查文件**，在 `review` 里**过滤之后**建：被过滤的文件不进索引，
+  也就不会通过这个工具暴露出去（与压缩的清理判据同源）
+- **改名文件的旧路径也建别名**（`setdefault`，规范路径优先）：提示词里带着
+  `renamed-from`，模型很可能拿旧名字来查，不建别名它拿到的是「没有改动」这个错答案
+- **输出是 git 原味、不带 `hunk_id`**：`<hunk id>` 是本组待审清单的编号，别的组的
+  hunk 编不出号，硬编一个等于邀请它越界评论，而 `report_hunks` 只认本组编号 ——
+  白费一轮。hunk 头的行数一律显式写出（`@@ -5,1 +5,1 @@`），不学 git 在行数为 1 时省略
+- **索引为空要报错，不能回「这个文件没改」**：装配错误会退化成「每个查询都说没改」
+  → 模型判断「调用方没同步改」→ 报出假问题。一条不报错的错链路
+- 结果进压缩的**可重新获取**白名单（`REFETCHABLE_TOOLS`），压缩时清成占位符
+- 提示词里**不出现「组」这个概念**：只谈「文件」，判断权交给模型；硬约束里写明
+  「别处的改动只作为判断依据，不要在它上面报评论」
+- 「查不到」= 没改动**或**不在审查范围内，两者在工具这里**是同一句话**：
+  `file_read` 能读到测试文件、`code_search` 能搜到它，只有这个工具多设一道卡，
+  三个工具对「过滤」的态度就不一致了
+- 改了工作方式段 / 硬约束段 / 这个工具，跑一次
+  `tests/manual/check_cross_file.py`（现场搭一个「改了接口、别的包的实现与调用方
+  没跟着改」的单组仓库，真调 LLM，约 10 秒）。实测模型会 `code_search` 找到实现方
+  → `file_read_diff` 确认它没改 → 把结论挂在接口那一行上；两个走查仓库都触发不了
+  这个场景（一个单审查单元、一个组内同包）
+
 ## 评论定位（改 `core/output/locate.py` 前必读）
 
 审查后第一步：把 LLM 报的评论挂到具体行号上。**零 LLM**，同一输入同一输出。
@@ -180,8 +211,8 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 | `create_agent` 的 `middleware` 参数只填了 `AgentMiddleware` 三个类型参数中的两个（漏 `ResponseT`），连它自带的 `ModelCallLimitMiddleware` 都过不了 mypy | `cast`，注释写明是框架签名问题 |
 | 四个 overload 都不把 `state_schema` / `context_schema` 串进返回类型，推出来是 `AgentState[Any]` / `Any` —— `invoke` 的 `context=` 传错也不报错 | `agent.py` 手写 `Agent` 别名（**比框架推出来的更精确**）+ 出参 `cast` |
 | `@wrap_model_call` / `@wrap_tool_call` 装饰**模块级函数**时，返回的中间件实例是**全局共享**的 | 用**类式中间件**，每组审查由 `build_review_agent` 造一个实例，跨轮次状态才不会串到下一组 |
-| `@tool` 的 **`parse_docstring` 默认 False** —— docstring 里 `Args:` 的参数说明**一个字都到不了模型** | 四个工具统一 `@tool(parse_docstring=True, description="…")`：描述走 `description=`、参数说明走 docstring 的 `Args:` |
-| **`@tool(args_schema=...)` 会让 `runtime: ToolRuntime[...]` 注入失效** —— 显式给了 args_schema，框架就不再从函数签名推导，`runtime` 从 `get_input_schema()` 里消失，调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。**四个工具全吃 runtime，所以全都不能用 `args_schema`** | 一律不给 `args_schema`。嵌套结构（`report_hunks` 的 `reports`）靠**类型注解**表达，一样能出嵌套 schema |
+| `@tool` 的 **`parse_docstring` 默认 False** —— docstring 里 `Args:` 的参数说明**一个字都到不了模型** | 五个工具统一 `@tool(parse_docstring=True, description="…")`：描述走 `description=`、参数说明走 docstring 的 `Args:` |
+| **`@tool(args_schema=...)` 会让 `runtime: ToolRuntime[...]` 注入失效** —— 显式给了 args_schema，框架就不再从函数签名推导，`runtime` 从 `get_input_schema()` 里消失，调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。**五个工具全吃 runtime，所以全都不能用 `args_schema`** | 一律不给 `args_schema`。嵌套结构（`report_hunks` 的 `reports`）靠**类型注解**表达，一样能出嵌套 schema |
 | `parse_docstring=True` + `args_schema=` 一起给时，工具描述会**静默变成参数模型的 docstring** | 同上：不给 `args_schema`。另注意**参数模型的 docstring 本身也会进 schema**，所以要写成给模型看的话，设计理由用 `#` 注释 |
 | 工具定义**入站**还要过一道转换：`convert_to_openai_tool` 会剥掉所有 `title`、剥掉参数顶层的 `description`、把 `$defs` + `$ref` **内联展开** | 日志与对账一律用 `convert_to_openai_tool(tool)["function"]`，别拿 `tool_call_schema.model_json_schema()`（那是转换前的，`report_hunks` 两份差 2000 vs 1279 字节） |
 | `recursion_limit` 按 **super-step** 算，`create_agent` 实测每轮约 **6.1** 步 | `max_rounds * 7 + 20` |
@@ -189,7 +220,7 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 
 **不使用已废弃的 API**（尤其 `langchain-classic` 包）；其余尽量用框架，别自己重造。
 
-**工具定义的形态约定**：四个工具一律 `@tool(parse_docstring=True, description="…")`。
+**工具定义的形态约定**：五个工具一律 `@tool(parse_docstring=True, description="…")`。
 `description=` 是**给模型看的**那一段；docstring 的 `Args:` 是**参数说明的来源**；
 `Returns:` / `Notes:` 之类给开发者看的内容不会发出去（`Notes:` 要发就把内容并进 `description=`）。
 不要为了「都用 Pydantic」改用 `args_schema=` —— 见上表，它会让 `runtime` 注入失效。
@@ -302,6 +333,7 @@ PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
 | `00-最小闭环/` | 1~5 | 6（实现偏离，五类分）、7（设计复盘） |
 | `01-上下文压缩/` | 9 | 10（实现反馈）、11（设计取舍） |
 | `02-评论定位和反思/` | 12 | 13（定位）、14（反思） |
+| `03-添加工具和调用图/` | 15 | 16（跨组工具实现反馈） |
 
 - **设计文档冻结、永不回头改**；实现与它不符时**记进反馈文档**
   （唯一例外：反馈文档里写明「这条必须回改设计文档」的，如 13 号 §六 E1）

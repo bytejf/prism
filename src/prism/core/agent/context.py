@@ -10,11 +10,13 @@
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import pygit2
 
 from prism.core.diff.loader import read_blob, resolve_commit
+from prism.models.diff import Diff
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,14 @@ class ReviewContext:
         head_rev: 被审查的版本（分支名 / SHA）。工具必须读这一版而不是工作区，
             否则「审别人的 PR、自己 checkout 在 main」时会读到改之前的代码。
             为空表示只能读工作区。
+        diffs: `路径 → Diff` 索引（只含可审查文件，含改名文件的旧路径别名）。
+            `file_read_diff` 靠它回答「别的文件改了什么」—— 分组把跨包改动切成了
+            互不可见的审查单元，这是唯一的补足手段。由 `build_diff_index` 建。
     """
 
     project_root: str = ""
     head_rev: str = ""
+    diffs: Mapping[str, Diff] = field(default_factory=dict)
     # 懒加载的 (仓库, 被审查版本的 commit)，只解析一次
     _head_cache: "tuple[pygit2.Repository, pygit2.Commit] | None" = field(
         default=None, init=False, repr=False, compare=False
