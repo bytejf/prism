@@ -45,22 +45,16 @@ def build_diff_block(group: Group, findings: Sequence[StaticFinding] = ()) -> st
     hints = _hints_by_hunk(findings)
     ids = sorted(item.hunk_id for item in group.hunks)
     span = ids[0] if len(ids) == 1 else f"{ids[0]} ~ {ids[-1]}"
-    text = tpl.SCOPE.format(
+    # **这里不打日志**：分组装箱的试算（`grouping.group_tokens`）会拿一个临时组
+    # 反复调本函数量成本，O(k²) 次。日志挂在真调用点（`initial_state` / `reflect`），
+    # 那里才有真的组名与「这是审查还是反思」的语境
+    return tpl.SCOPE.format(
         span=span,
         count=len(group.hunks),
         files=len(group.files),
         order_note=tpl.ORDER_NOTE if hints else "",
         diff=_render_diff(group, hints),
     )
-    logger.debug(
-        "组装 diff 块：%s（%d 个 hunk / %d 个文件，%d 字符，静态发现 %d 条）",
-        group.group_id,
-        len(group.hunks),
-        len(group.files),
-        len(text),
-        len(findings),
-    )
-    return text
 
 
 def build_static_block(findings: Sequence[StaticFinding]) -> str:

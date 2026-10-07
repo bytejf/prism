@@ -179,18 +179,27 @@ def test_run_groups_stops_on_review_time_budget(
 
 
 def test_run_groups_reports_total_when_nothing_was_skipped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """没触发闸门时照常跑完，并打一行总计。"""
+    """没触发闸门时照常跑完，并打一行总计 —— **stdout 与日志各一份**。
+
+    stdout 那份给人看，日志那份给 grep 的：排查「这条命令花了多久、多少钱」时
+    不该要求人重定向 stdout。
+    """
     ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=10))
 
-    _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
-        make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
-    )
+    with caplog.at_level("INFO"):
+        _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
+            make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
+        )
 
     assert ran == ["group-001", "group-002"]
     assert skipped == 0
     assert "总计" in capsys.readouterr().out
+    assert "所有审查单元跑完：2/2 组" in caplog.text
 
 
 def test_unfinished_hunks_are_counted_and_reported(

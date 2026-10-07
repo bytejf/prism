@@ -86,11 +86,11 @@ def test_smoke_review_reports_progress(sample_repo: Path) -> None:
     )
 
     assert result.returncode == 0, f"命令失败：{result.stderr}"
-    assert "Loading diffs..." in result.stdout
-    assert "Filtering files..." in result.stdout
-    assert "Grouping by package..." in result.stdout
-    assert "Processing Group 1:" in result.stdout
-    assert "Review completed:" in result.stdout
+    assert "加载 diff…" in result.stdout
+    assert "过滤文件…" in result.stdout
+    assert "按包分组…" in result.stdout
+    assert "第 1 组：" in result.stdout
+    assert "审查完成：" in result.stdout
 
 
 def test_smoke_review_without_api_key_fails_clearly(sample_repo: Path) -> None:

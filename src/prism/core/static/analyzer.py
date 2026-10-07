@@ -331,12 +331,12 @@ def _parse(
         if path not in allowed:
             continue
         result.append(_to_finding(item, path))
+    dropped = len(raw) - len(result)
     logger.debug(
-        "静态发现解析：原始 %d 条，保留 %d 条（路径不在可审查文件里，"
-        "或不在分析目录内而丢弃 %d 条）",
+        "静态发现解析：原始 %d 条，保留 %d 条%s",
         len(raw),
         len(result),
-        len(raw) - len(result),
+        f"，丢弃 {dropped} 条（不在可审查文件里，或不在分析目录内）" if dropped else "",
     )
     return result, len(raw)
 

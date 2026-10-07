@@ -248,7 +248,17 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         # 退出判定要看重置之后的值
         end_done_count = 0 if reset else state["end_done_count"]
         if should_exit(state, end_done_count=end_done_count):
-            logger.info("退出：end_done 或连续无产出已达阈值")
+            # 两个原因分开说：一句「end_done 或连续无产出」在排查时等于没说
+            # （一个是我们想要的收尾，一个说明模型卡住了）
+            pending = pending_ids(state["hunk_status"])
+            if end_done_count > 0:
+                logger.info("退出：end_done 已被受理（未审 %d 个 hunk）", len(pending))
+            else:
+                logger.info(
+                    "退出：连续 %d 轮无产出（阈值 %d）",
+                    state["no_report_rounds"],
+                    settings.review.no_progress_exit_rounds,
+                )
             return {**updates, "jump_to": "end"}
 
         # **语义退出优先于预算**：审完了就是审完了 —— 让预算把一个已完成的组标成

@@ -270,9 +270,16 @@ def reflect(model: BaseChatModel, group: Group, comments: list[Comment]) -> Refl
         comment_paths={item_id: item.path for item_id, item in numbered},
         hunk_paths={item.hunk_id: item.file_path for item in group.hunks},
     )
-    prompt = tpl.REFLECTION_USER.format(
-        diff=build_diff_block(group),
-        comments="\n".join(_render_comment(item_id, item) for item_id, item in numbered),
+    diff_block = build_diff_block(group)
+    comments_block = "\n".join(_render_comment(item_id, item) for item_id, item in numbered)
+    prompt = tpl.REFLECTION_USER.format(diff=diff_block, comments=comments_block)
+    logger.debug(
+        "反思提示词：%s（diff %d 字符 + 评论 %d 条 %d 字符，共 %d 字符）",
+        group.group_id,
+        len(diff_block),
+        len(numbered),
+        len(comments_block),
+        len(prompt),
     )
     initial = ReflectionState(
         messages=[HumanMessage(content=prompt)], removals={}, misses=[], reported=0

@@ -13,6 +13,7 @@
 """
 
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
@@ -26,6 +27,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
 from prism.config.settings import settings
+from prism.core.agent.budget import describe
 from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.middleware import (
@@ -153,10 +155,22 @@ def initial_state(group: Group, static_findings: Sequence[StaticFinding] = ()) -
     Returns:
         初始 ReviewState
     """
+    diff_block = build_diff_block(group, static_findings)
+    static_block = build_static_block(static_findings)
+    requirements = build_requirements()
     user_text = tpl.USER.format(
-        diff_block=build_diff_block(group, static_findings),
-        static_block=build_static_block(static_findings),
-        requirements=build_requirements(),
+        diff_block=diff_block,
+        static_block=static_block,
+        requirements=requirements,
+    )
+    logger.debug(
+        "审查提示词：%s（%d 个 hunk / %d 个文件，diff %d 字符 + 静态发现 %d 条，共 %d 字符）",
+        group.group_id,
+        len(group.hunks),
+        len(group.files),
+        len(diff_block),
+        len(static_findings),
+        len(user_text),
     )
     return ReviewState(
         messages=[HumanMessage(content=user_text)],
@@ -213,6 +227,7 @@ def run_review_agent(
         len(group.hunks),
     )
 
+    started = time.monotonic()
     agent = build_review_agent(model, compression or settings.compression)
     initial = initial_state(group, static_findings)
     final, crashed = _run_graph(agent, initial, group, project_root, head_rev, diff_index or {})
@@ -233,13 +248,17 @@ def run_review_agent(
     }
     pending = pending_ids(hunk_status)
     total_comments = sum(len(items) for items in hunk_comments.values())
+    # 耗时与用量都要打：预算闸是按这两个量判的，排查「这组为什么停」时
+    # 第一个要看的就是它们（只看轮次看不出花了多快）
     logger.info(
-        "结束审查 %s：exit_reason=%s，轮次 %d，评论 %d 条，未审 %d 个",
+        "结束审查 %s：exit_reason=%s，轮次 %d，评论 %d 条，未审 %d 个，耗时 %.1f 秒，用量 %s",
         group.group_id,
         exit_reason,
         final["round_count"],
         total_comments,
         len(pending),
+        time.monotonic() - started,
+        describe(final["usage"], settings.cost),
     )
     return MainLoopResult(
         group_id=group.group_id,

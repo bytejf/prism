@@ -120,9 +120,10 @@ class PrismHandler(logging.Handler):
             text.append(f"{record.levelname} ", style=LEVEL_STYLES.get(record.levelname))
             text.append(f"[{short_path(record.pathname)}:{record.lineno}]", style=PATH_STYLE)
             text.append(f" {record.getMessage()}")
-            self._console.print(text)
-            # 每条日志之间空一行，多行记录才不会糊在一起
-            self._console.print()
+            # 正文与结尾空行**必须一次 print**：rich 的锁是每次 print 一把，
+            # 分两次调用时并发（多组同时跑）会把两条记录的空行交错到一起，
+            # 「每条记录之间空一行」这个约定就破了
+            self._console.print(text, end="\n\n")
         except Exception:
             self.handleError(record)
 

@@ -1349,3 +1349,47 @@ def test_parallel_failures_each_count(project_root: str, exploding: None) -> Non
     # 3 轮 × 2 个 = 6 次失败 > 上限 5 → 第 3 轮之后停
     assert final["stop_reason"] == STOP_TOOL_FAILURES
     assert final["round_count"] == 3
+
+
+# ---------- 关键日志清单 ----------
+
+
+def test_key_logs_are_present_on_a_normal_group(
+    project_root: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """一次正常审查里，这几条日志必须都在。
+
+    它们是排查的骨架：缺哪一条，都会让人少一块信息（没有耗时就没法对账时间预算，
+    没有用量就没法对账花费）。**清单写在这里，就不靠人眼** —— 改日志很容易顺手
+    删掉一条，用例钉住才守得住。
+    """
+    llm = ScriptedChatModel(responses=[report_call(["H-01"]), done_call()])
+
+    with caplog.at_level(logging.DEBUG):
+        run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    text = caplog.text
+    # 开场：组名 + 规模
+    assert "开始审查 group-001" in text
+    # 分组装好的提示词多大（DEBUG）—— 排查「提示词为什么这么长」时第一条就看它
+    assert "审查提示词：group-001" in text
+    # 退出原因写清是哪一个（不是含糊的「end_done 或连续无产出」）
+    assert "退出：end_done 已被受理" in text
+    # 收场：原因 + 轮次 + 评论 + 未审 + **耗时** + **用量**
+    assert "结束审查 group-001：exit_reason=end_done" in text
+    assert "耗时" in text
+    assert "用量" in text
+
+
+def test_budget_stop_is_logged_as_warning(
+    project_root: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """预算闸触发时要有 WARNING，并带上用量与两个上限 —— 不然只能靠猜。"""
+    tiny_budget(monkeypatch, max_group_cost=1e-9)
+    llm = ScriptedChatModel(responses=[report_call(["H-01"])])
+
+    with caplog.at_level("WARNING"):
+        run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
+
+    assert "本组超预算（cost）" in caplog.text
+    assert "预算 0.000 元 / 300 秒" in caplog.text

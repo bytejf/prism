@@ -164,7 +164,7 @@ def load_diffs(repo_path: str | Path, base: str, head: str) -> list[Diff]:
     diffs = parse_diff_text(diff.patch or "")
 
     logger.info(
-        "Loaded %d files, %d hunks (+%d/-%d)",
+        "加载 diff 完成：%d 个文件，%d 个 hunk（+%d/-%d）",
         len(diffs),
         sum(len(d.hunks) for d in diffs),
         sum(d.insertions for d in diffs),

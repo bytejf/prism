@@ -225,19 +225,6 @@ def _load_or_exit(root: Path, base: str, head: str) -> list[Diff]:
         raise typer.Exit(code=1) from exc
 
 
-def _plural(count: int, word: str) -> str:
-    """渲染带单复数的计数文本。
-
-    Args:
-        count: 数量
-        word: 单数名词，如 "file"
-
-    Returns:
-        ``1 file`` 或 ``3 files``
-    """
-    return f"{count} {word}" if count == 1 else f"{count} {word}s"
-
-
 def _map_or_exit(root: Path, base: str, head: str) -> list[HunkWithSymbol]:
     """跑完审查前流程（diff → 过滤 → hunk 映射），失败时终止进程。
 
@@ -272,7 +259,7 @@ def diff(
     logger.info("加载 diff: root=%s base=%s head=%s", root, base, head)
     diffs = _load_or_exit(root, base, head)
 
-    typer.echo(f"Loaded {len(diffs)} files, {sum(len(d.hunks) for d in diffs)} hunks")
+    typer.echo(f"文件 {len(diffs)} 个，hunk {sum(len(d.hunks) for d in diffs)} 个")
     for item in diffs:
         typer.echo(f"  {item.path}: {len(item.hunks)} hunks (+{item.insertions}/-{item.deletions})")
 
@@ -293,12 +280,12 @@ def filter_cmd(
     diffs = _load_or_exit(root, base, head)
     result = filter_files(diffs)
 
-    typer.echo(f"Reviewable: {_plural(len(result.reviewable), 'file')}")
+    typer.echo(f"可审查：{len(result.reviewable)} 个文件")
     for item in result.reviewable:
         typer.echo(f"  {item.path}")
 
     typer.echo("")
-    typer.echo(f"Skipped: {_plural(len(result.skipped), 'file')}")
+    typer.echo(f"跳过：{len(result.skipped)} 个文件")
     for skipped in result.skipped:
         typer.echo(f"  {skipped.path} ({skipped.reason})")
 
@@ -355,9 +342,9 @@ def group(
         total = tokens + fixed_prompt_tokens()
         over = "  ⚠️ 超过预算" if total > budget else ""
         header = (
-            f"Group {index}: {package_label(item)} "
-            f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')}, "
-            f"约 {total}/{budget} token){over}"
+            f"第 {index} 组：{package_label(item)}"
+            f"（{len(item.files)} 个文件，{len(item.hunks)} 个 hunk，"
+            f"约 {total}/{budget} token）{over}"
         )
         lines = [header]
         # hunks 已按文件路径排序，同文件的连续 → groupby 一次即可
@@ -409,15 +396,13 @@ def static_cmd(
         typer.echo(f"静态分析跳过：{report.skip_reason}")
         return
     if not report.findings:
-        typer.echo(f"没有发现（本组可审查文件 {_plural(len(reviewable), 'file')}）")
+        typer.echo(f"没有发现（本组可审查文件 {len(reviewable)} 个）")
         return
 
     for item in report.findings:
         typer.echo(format_finding(item))
     typer.echo("")
-    typer.echo(
-        f"共 {_plural(len(report.findings), 'finding')}（耗时 {report.elapsed_seconds:.1f}s）"
-    )
+    typer.echo(f"共 {len(report.findings)} 条发现（耗时 {report.elapsed_seconds:.1f}s）")
 
 
 def _llm_or_exit() -> LLMClient:
@@ -460,6 +445,8 @@ class _GroupOutcome:
         injected: 注入本组的静态发现数
         referenced: 被引用的静态发现数
         pending_hunks: 没审完的 hunk 数
+        elapsed_seconds: 本组从开始审查到反思结束的墙钟耗时。**含反思** ——
+            预算闸判的就是这个量级的耗时，报不全等于没法对账
     """
 
     index: int
@@ -475,6 +462,7 @@ class _GroupOutcome:
     injected: int
     referenced: int
     pending_hunks: int
+    elapsed_seconds: float
 
 
 def _run_one_group(
@@ -503,6 +491,7 @@ def _run_one_group(
     Returns:
         本组的全部结果
     """
+    started = time.monotonic()
     # 挑选不做二次裁剪：**预算在分组那一步就执行完了**（装不下的 hunk 顺延到
     # 下一组），这里再裁一次只会让「注入的」与「算过成本的」变成两批东西
     injected = select_for_group(item.files, static_report.findings)
@@ -535,6 +524,7 @@ def _run_one_group(
         injected=len(injected),
         referenced=len(verdict.referenced),
         pending_hunks=len(result.pending_hunk_ids),
+        elapsed_seconds=time.monotonic() - started,
     )
 
 
@@ -546,8 +536,8 @@ def _echo_group(item: Group, index: int) -> None:
         index: 组序号（从 1 起）
     """
     typer.echo(
-        f"Processing Group {index}: {package_label(item)} "
-        f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
+        f"第 {index} 组：{package_label(item)}"
+        f"（{len(item.files)} 个文件，{len(item.hunks)} 个 hunk）"
     )
 
 
@@ -560,14 +550,14 @@ def _echo_outcome(found: _GroupOutcome, costs: CostConfig) -> None:
         found: 本组结果
         costs: 价格表
     """
-    static_note = f", 静态发现={found.injected}(引用{found.referenced})" if found.injected else ""
-    gap_note = f", ⚠️ 未审 hunk={found.pending_hunks}" if found.pending_hunks else ""
+    static_note = f"，静态发现={found.injected}(引用{found.referenced})" if found.injected else ""
+    gap_note = f"，⚠️ 未审 hunk={found.pending_hunks}" if found.pending_hunks else ""
     typer.echo(
-        f"  {found.group_id} completed: {_plural(len(found.comments), 'comment')} "
-        f"(exit_reason={found.exit_reason}, 轮次={found.round_count}, "
-        f"未定位={found.unlocated}, 反思删除={found.removed}{static_note}{gap_note})"
+        f"  {found.group_id} 完成：{len(found.comments)} 条评论"
+        f"（exit_reason={found.exit_reason}，轮次={found.round_count}，"
+        f"未定位={found.unlocated}，反思删除={found.removed}{static_note}{gap_note}）"
     )
-    typer.echo(f"    本组 {describe(found.usage, costs)}")
+    typer.echo(f"    本组 {describe(found.usage, costs)} · {found.elapsed_seconds:.1f} 秒")
 
 
 def _run_groups(
@@ -629,6 +619,19 @@ def _run_groups(
         total = add_usage(total, found.usage)
         pending_hunks += found.pending_hunks
     skipped = len(groups) - len(outcomes) - failed
+    # 总计也要进日志：stdout 那份是给人看的，日志这份是给 grep 的（排查「这条命令
+    # 花了多久、多少钱」时不该要求人重定向 stdout）
+    # 措辞是「审查单元跑完」而不是「review 结束」：这时候排序与渲染还没做，
+    # 日志里写「结束」会让后面那几条看起来像是发生在收尾之后
+    logger.info(
+        "所有审查单元跑完：%d/%d 组（未跑 %d，异常 %d），%s，共 %.1f 秒",
+        len(outcomes),
+        len(groups),
+        skipped,
+        failed,
+        describe(total, settings.cost),
+        time.monotonic() - started,
+    )
     if not skipped and not failed:
         typer.echo(f"总计 {describe(total, settings.cost)}")
     return comments, misses, gaps, skipped, failed, pending_hunks
@@ -800,10 +803,10 @@ def review(
     root = _resolve_repo(path)
     logger.info("开始审查: root=%s base=%s head=%s", root, base, head)
 
-    typer.echo("Loading diffs...")
+    typer.echo("加载 diff…")
     diffs = _load_or_exit(root, base, head)
 
-    typer.echo(f"Filtering files... ({_plural(len(diffs), 'file')} in diff)")
+    typer.echo(f"过滤文件…（diff 里 {len(diffs)} 个文件）")
     reviewable = filter_files(diffs).reviewable
 
     # 索引在分组**之前**建、且建在**过滤之后**：filter 的产出既决定了哪些文件
@@ -821,11 +824,11 @@ def review(
     # 静态分析夹在 hunk 映射与分组之间（设计 18 号 §2.3）：它的发现要按文件分桶进
     # 各组，而「关联到哪个 hunk」需要映射结果。可审查文件的路径直接取自映射结果 ——
     # 一个文件过了过滤但一个 hunk 都没活下来时，它本来也不会进任何组
-    typer.echo(f"Running static analysis... ({_plural(len(reviewable), 'reviewable file')})")
+    typer.echo(f"静态分析…（{len(reviewable)} 个可审查文件）")
     static_report = analyze(root, head, sorted({item.file_path for item in mapped}), mapped)
     _echo_static(static_report)
 
-    typer.echo(f"Grouping by package... ({_plural(len(reviewable), 'reviewable file')})")
+    typer.echo(f"按包分组…（{len(reviewable)} 个可审查文件）")
     groups = group_by_package(mapped, static_report.findings)
 
     if not groups:
@@ -852,4 +855,4 @@ def review(
     )
     typer.echo("")
     typer.echo(TerminalRenderer().render(comments, stats, misses, gaps))
-    typer.echo(f"\nReview completed: {_plural(len(comments), 'comment')}")
+    typer.echo(f"\n审查完成：{len(comments)} 条评论")
