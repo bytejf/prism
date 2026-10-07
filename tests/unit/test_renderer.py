@@ -13,6 +13,7 @@ from prism.models.comment import (
     ReviewStats,
 )
 from prism.models.reflection import PotentialMiss
+from prism.models.static import PRIORITY_HIGH, StaticFinding
 
 
 def make_comment(
@@ -333,3 +334,72 @@ def test_misses_do_not_change_the_comment_footer() -> None:
     output = TerminalRenderer().render([make_comment(severity="high")], make_stats(), misses)
 
     assert "high: 1" in output
+
+
+def test_no_static_gaps_section_when_empty() -> None:
+    """测试没有未处理的静态发现时不出现那一段。"""
+    output = TerminalRenderer().render([make_comment()], make_stats())
+
+    assert "静态发现未处理" not in output
+
+
+def test_static_gaps_lists_id_position_and_text() -> None:
+    """测试未处理段给出编号、位置与工具原话 —— 用户要能自己回查。"""
+    gaps = [
+        StaticFinding(
+            finding_id="S-03",
+            path="pkg/a/iface.go",
+            line=15,
+            linter="gosec",
+            priority=PRIORITY_HIGH,
+            text="G107: Potential HTTP request made with variable url",
+        )
+    ]
+
+    output = TerminalRenderer().render([make_comment()], make_stats(), static_gaps=gaps)
+
+    assert "=== 静态发现未处理（1 条）===" in output
+    assert "S-03 pkg/a/iface.go:15 [gosec · high]" in output
+    assert "G107: Potential HTTP request" in output
+    assert "人工核查" in output
+
+
+def test_static_gaps_do_not_enter_the_comment_footer() -> None:
+    """静态发现不进评论统计 —— 它不是评论（设计 18 号 §2.1）。"""
+    gaps = [
+        StaticFinding(
+            finding_id="S-03",
+            path="pkg/a.go",
+            line=1,
+            linter="gosec",
+            priority=PRIORITY_HIGH,
+            text="x",
+        )
+    ]
+
+    output = TerminalRenderer().render(
+        [make_comment(severity="high")], make_stats(), static_gaps=gaps
+    )
+
+    assert "high: 1" in output
+    assert "【" not in output
+
+
+def test_static_gaps_come_after_misses() -> None:
+    """测试静态发现段排在漏报段之后 —— 同样越弱越靠后。"""
+    misses = [PotentialMiss(hunk_id="H-07", path="c.go", description="疑似漏报")]
+    gaps = [
+        StaticFinding(
+            finding_id="S-01",
+            path="pkg/a.go",
+            line=1,
+            linter="gosec",
+            priority=PRIORITY_HIGH,
+            text="x",
+        )
+    ]
+
+    output = TerminalRenderer().render([make_comment()], make_stats(), misses, gaps)
+
+    assert output.index("=== 疑似漏报") < output.index("=== 静态发现未处理")
+    assert output.index("=== 静态发现未处理") < output.index("=== 统计 ===")

@@ -12,7 +12,7 @@
 """
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from langchain.agents import create_agent
@@ -36,7 +36,7 @@ from prism.core.agent.state import (
     pending_ids,
 )
 from prism.core.guidance import templates as tpl
-from prism.core.guidance.builder import build_diff_block, build_requirements
+from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
 from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
@@ -45,6 +45,7 @@ from prism.core.tools.report_hunks import report_hunks
 from prism.models.compression import CompressionConfig
 from prism.models.diff import Diff
 from prism.models.grouping import Group
+from prism.models.static import StaticFinding
 from prism.observability.llm_trace import ReviewTrace
 
 logger = logging.getLogger(__name__)
@@ -126,22 +127,28 @@ def build_review_agent(
     )
 
 
-def initial_state(group: Group, max_rounds: int) -> ReviewState:
+def initial_state(
+    group: Group, max_rounds: int, static_findings: Sequence[StaticFinding] = ()
+) -> ReviewState:
     """构造审查循环的初始状态。
 
     提示词文本在 `guidance/templates.py` 里整块书写：
     system 段交给 `create_agent(system_prompt=...)`，
-    user 段（diff 块 + 要求块）作为首条用户消息 —— **diff 在前、要求在后**。
+    user 段（diff 块 + 静态发现块 + 要求块）作为首条用户消息 ——
+    **数据在前、线索居中、要求在后**。
 
     Args:
         group: 审查单元
         max_rounds: 单组最大模型调用次数
+        static_findings: 注入本组的静态发现（已按 token 预算裁过），
+            由 `core/static/inject.py` 挑出
 
     Returns:
         初始 ReviewState
     """
     user_text = tpl.USER.format(
-        diff_block=build_diff_block(group),
+        diff_block=build_diff_block(group, static_findings),
+        static_block=build_static_block(static_findings),
         requirements=build_requirements(),
     )
     return ReviewState(
@@ -166,6 +173,7 @@ def run_review_agent(
     head_rev: str = "",
     compression: CompressionConfig | None = None,
     diff_index: Mapping[str, Diff] | None = None,
+    static_findings: Sequence[StaticFinding] = (),
 ) -> MainLoopResult:
     """跑一个审查单元的循环。
 
@@ -180,6 +188,8 @@ def run_review_agent(
             收小窗口就能在测试里逼出压缩
         diff_index: `路径 → Diff` 索引，供 `file_read_diff` 查跨文件改动。
             不传时该工具只能回「不可用」—— 只有测试会这样传
+        static_findings: 注入本组的静态发现。**由调用方先算好**（挑文件 + 按预算
+            截断），这里只管渲染 —— 后置校验要用同一批编号，各算一次就会漂
 
     Returns:
         循环产出（退出原因、评论、未审 hunk 等）
@@ -204,7 +214,7 @@ def run_review_agent(
     final = cast(
         ReviewState,
         agent.invoke(
-            initial_state(group, max_rounds),
+            initial_state(group, max_rounds, static_findings),
             context=ReviewContext(
                 project_root=project_root,
                 head_rev=head_rev,

@@ -1,13 +1,16 @@
 """静态指导组装的单元测试。
 
-两块分开测：`build_diff_block`（数据，XML）与 `build_requirements`（流程，md）。
+三块分开测：`build_diff_block`（数据，XML）、`build_static_block`（线索，md 表格）
+与 `build_requirements`（流程，md）。静态发现那部分还额外守两条：注入之后 hunk 的
+展示顺序按优先级走，而**没有静态发现时的渲染结果与引入这个功能之前一致**。
 """
 
-from prism.core.guidance.builder import build_diff_block, build_requirements
-from prism.core.guidance.templates import REVIEW_DIMENSIONS, SYSTEM, WORKFLOW
+from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
+from prism.core.guidance.templates import MAIN_TASK_DIMENSIONS, SYSTEM, WORKFLOW
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
+from prism.models.static import PRIORITY_HIGH, PRIORITY_LOW, StaticFinding
 
 
 def make_item(
@@ -228,12 +231,14 @@ def test_empty_group() -> None:
 
 
 def test_requirements_lists_all_dimensions() -> None:
-    """测试五个审查维度都在文本里。"""
+    """测试六个审查维度都在文本里。"""
     text = build_requirements()
-    for dimension in REVIEW_DIMENSIONS:
+    for dimension in MAIN_TASK_DIMENSIONS:
         assert dimension in text
     assert "1. **业务逻辑正确性**" in text
-    assert "5. **副作用**" in text
+    assert "4. **副作用与隐式契约**" in text
+    assert "6. **安全**" in text
+    assert "### 你的主任务" in text
 
 
 def test_requirements_lists_workflow() -> None:
@@ -282,3 +287,127 @@ def test_is_deterministic() -> None:
     group = _fixture()
     assert build_diff_block(group) == build_diff_block(group)
     assert build_requirements() == build_requirements()
+
+
+# ---------- 静态发现注入 ----------
+
+
+def make_finding(
+    finding_id: str,
+    *,
+    hunk_id: str | None = "H-01",
+    priority: str = PRIORITY_HIGH,
+    path: str = "internal/agent/agent.go",
+    line: int = 245,
+    linter: str = "gosec",
+    text: str = "G107: Potential HTTP request made with variable url",
+) -> StaticFinding:
+    """构造测试用的静态发现。
+
+    Args:
+        finding_id: 编号
+        hunk_id: 关联 hunk
+        priority: 工具标记
+        path: 文件路径
+        line: 行号
+        linter: linter 名
+        text: 描述
+
+    Returns:
+        StaticFinding
+    """
+    return StaticFinding(
+        finding_id=finding_id,
+        path=path,
+        line=line,
+        linter=linter,
+        priority=priority,
+        text=text,
+        hunk_id=hunk_id,
+    )
+
+
+def test_without_findings_the_prompt_is_unchanged() -> None:
+    """没有静态发现时，渲染结果与引入静态分析之前逐字节一致。
+
+    设计 §3.4 要求「整段省略，不写本次没有静态发现这类废话」。这条守的是它 ——
+    注意 `USER` 模板靠 `{static_block}` 自带的前导空行来决定有没有段间隔，
+    多一个换行都会让提示词隔出一个空段落。
+    """
+    group = _fixture()
+    text = build_diff_block(group)
+
+    assert build_static_block([]) == ""
+    assert "静态分析提示" not in text
+    assert "static_hint" not in text
+    assert "按静态分析的建议顺序" not in text
+    assert "\n\n\n" not in text
+
+
+def test_hunk_order_follows_static_priority() -> None:
+    """关联到高优先级发现的 hunk 排到前面，**编号不动**（设计 §2.8）。"""
+    group = _fixture()
+    findings = [make_finding("S-01", hunk_id="H-03")]
+    block = build_diff_block(group, findings)
+
+    resolver = block.index('path="internal/diff/resolver.go"')
+    agent = block.index('path="internal/agent/agent.go"')
+    assert resolver < agent, "H-03 有高优先级发现，它的文件该排前面"
+    assert '<hunk id="H-03"' in block, "只改顺序，编号不变"
+
+
+def test_hunk_with_findings_is_marked() -> None:
+    """hunk 标签上标 `static_hint`，**只标编号不标严重性**（设计 §2.7 层 1）。"""
+    block = build_diff_block(
+        _fixture(),
+        [make_finding("S-01", hunk_id="H-01"), make_finding("S-02", hunk_id="H-01")],
+    )
+
+    assert 'static_hint="S-01 S-02"' in block
+    assert "high" not in block, "hunk 属性里不出现严重性"
+    assert "（以下按静态分析的建议顺序排列，仅供参考）" in block
+
+
+def test_same_file_hunks_stay_under_one_file_tag_after_reorder() -> None:
+    """重排之后同一个文件的 hunk 仍然收在一个 `<file>` 里。
+
+    旧实现靠 `groupby`（要求同类相邻）分组，重排恰好会打破这个前提 ——
+    破了就是同一个文件出现两个 `<file>` 块，模型会以为是两个文件。
+    """
+    group = _fixture()
+    # H-01 有高优先级发现、H-02 没有 → 重排后两个同文件的 hunk 不再相邻
+    block = build_diff_block(group, [make_finding("S-01", hunk_id="H-01")])
+
+    assert block.count('<file path="internal/agent/agent.go">') == 1
+    agent_block = block.split('<file path="internal/agent/agent.go">')[1].split("</file>")[0]
+    assert "H-01" in agent_block
+    assert "H-02" in agent_block
+
+
+def test_static_block_is_a_weak_worded_table() -> None:
+    """静态发现列表用「提示 / 工具标记 / 高优先」这三层弱化措辞（设计 §2.7 层 2）。"""
+    text = build_static_block(
+        [
+            make_finding("S-01", priority=PRIORITY_HIGH),
+            make_finding("S-02", priority=PRIORITY_LOW, hunk_id=None),
+        ]
+    )
+
+    assert "### 静态分析提示（待验证的假设）" in text
+    assert "需你自己" in text or "需要你结合实际代码判断" in text
+    assert "| S-01 | internal/agent/agent.go | 245 | 高优先 | H-01 |" in text
+    assert "低优先" in text
+    assert "| — |" in text, "关联不上 hunk 的发现显示占位符"
+    assert "high" not in text.replace("优先", "")
+
+
+def test_static_row_escapes_pipes() -> None:
+    """描述里的竖线要转义 —— 一个裸竖线会把整行表格切断。"""
+    text = build_static_block([make_finding("S-01", text="bad | worse")])
+    assert "bad \\| worse" in text
+
+
+def test_static_finding_number_appears_in_the_row_not_as_severity() -> None:
+    """行里的编号就是模型引用时要抄的那个（`[S-01]`）。"""
+    text = build_static_block([make_finding("S-07")])
+    assert "| S-07 |" in text

@@ -103,6 +103,20 @@ class ToolsSettings:
 
 
 @dataclass(frozen=True)
+class StaticSettings:
+    """静态分析（golangci-lint）的开关与预算。
+
+    Attributes:
+        max_prompt_tokens: 单组提示词的 token 上限（估算值）。提示词模板 + hunk
+            内容 + 静态发现加起来不许超过它，超了从静态发现那头砍
+        timeout_seconds: golangci-lint / git 子进程超时
+    """
+
+    max_prompt_tokens: int
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class LogSettings:
     """日志配置。
 
@@ -124,6 +138,7 @@ class Settings:
         llm: 模型、端点与窗口
         compression: 压缩阈值。`context_window` 来自 `[llm]`，不重复写在 toml 里
         review: 审查循环的轮次与节奏
+        static: 静态分析的预算与超时
         tools: 工具限制
         log: 日志
     """
@@ -131,6 +146,7 @@ class Settings:
     llm: LLMConfig
     compression: CompressionConfig
     review: ReviewSettings
+    static: StaticSettings
     tools: ToolsSettings
     log: LogSettings
 
@@ -147,6 +163,7 @@ SCHEMA: dict[str, tuple[type, frozenset[str]]] = {
     "llm": (LLMConfig, frozenset({"api_key", "temperature"})),
     "compression": (CompressionConfig, frozenset({"context_window"})),
     "review": (ReviewSettings, frozenset()),
+    "static": (StaticSettings, frozenset()),
     "log": (LogSettings, frozenset()),
     "tools.file_read": (FileReadSettings, frozenset()),
     "tools.code_search": (CodeSearchSettings, frozenset()),
@@ -356,6 +373,12 @@ def load(path: Path = PATH) -> Settings:
         max_rejections=review.count("max_rejections"),
     )
 
+    static = root.section("static")
+    static_settings = StaticSettings(
+        max_prompt_tokens=static.count("max_prompt_tokens"),
+        timeout_seconds=static.count("timeout_seconds"),
+    )
+
     tools = root.section("tools")
     file_read = tools.section("file_read")
     file_read_settings = FileReadSettings(max_lines=file_read.count("max_lines"))
@@ -372,6 +395,7 @@ def load(path: Path = PATH) -> Settings:
         llm=llm_config,
         compression=compression_config,
         review=review_settings,
+        static=static_settings,
         tools=ToolsSettings(file_read=file_read_settings, code_search=code_search_settings),
         log=log_settings,
     )

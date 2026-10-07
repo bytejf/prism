@@ -30,6 +30,7 @@ from prism.models.comment import (
     ReviewStats,
 )
 from prism.models.reflection import PotentialMiss
+from prism.models.static import StaticFinding
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,14 @@ UNLOCATED_NOTICE = "⚠️ 以下评论无法确定具体行号，请人工确�
 MISSES_TITLE = "=== 疑似漏报（{count} 条）==="
 MISSES_NOTICE = "⚠️ 反思时发现下面这些改动可能没有被任何评论覆盖，仅供参考："
 
+# 静态发现未处理段的标题与提示。
+#
+# **它不是「静态发现」的输出通道**：静态发现本身依然不进评论列表，这里报的是
+# 「哪几条没人管」—— 用户据此决定要不要人工核一下（设计文档 18 号 §2.1 的兜底）。
+# 只列高优先级的：低优先级没被引用是常态，列出来只会让这段变成噪音。
+STATIC_GAPS_TITLE = "=== 静态发现未处理（{count} 条）==="
+STATIC_GAPS_NOTICE = "⚠️ 以下高优先级静态发现没有被任何评论引用，建议人工核查："
+
 # 未定位原因 → 给人看的一句话。**报的是我们这边查不出匹配的原因**，
 # 不是「模型错了」——空片段和歧义都不一定是模型的锅
 REASON_LABELS: dict[str, str] = {
@@ -85,6 +94,7 @@ class TerminalRenderer:
         comments: list[Comment],
         stats: ReviewStats,
         misses: Sequence[PotentialMiss] = (),
+        static_gaps: Sequence[StaticFinding] = (),
     ) -> str:
         """渲染评论列表为终端文本。
 
@@ -92,6 +102,8 @@ class TerminalRenderer:
             comments: 排序后的评论列表
             stats: 审查统计信息
             misses: 反思阶段的疑似漏报信号（可为空）
+            static_gaps: 没被任何评论引用的高优先级静态发现（可为空）。
+                静态分析被跳过或没跑出发现时都是空
 
         Returns:
             格式化后的终端文本
@@ -99,10 +111,11 @@ class TerminalRenderer:
         located = [item for item in comments if item.locate_level != LOCATE_FAILED]
         failed = [item for item in comments if item.locate_level == LOCATE_FAILED]
         logger.debug(
-            "渲染开始：%d 条评论（未定位 %d 条，疑似漏报 %d 条）",
+            "渲染开始：%d 条评论（未定位 %d 条，疑似漏报 %d 条，静态发现未处理 %d 条）",
             len(comments),
             len(failed),
             len(misses),
+            len(static_gaps),
         )
 
         blocks = [self._render_header(stats)]
@@ -111,6 +124,8 @@ class TerminalRenderer:
             blocks.append(self._render_unlocated(failed))
         if misses:
             blocks.append(self._render_misses(misses))
+        if static_gaps:
+            blocks.append(self._render_static_gaps(static_gaps))
         blocks.append(self._render_footer(comments))
 
         text = "\n\n".join(blocks)
@@ -223,6 +238,32 @@ class TerminalRenderer:
         lines = [MISSES_TITLE.format(count=len(misses)), "", MISSES_NOTICE]
         for index, item in enumerate(misses, start=1):
             lines.extend((f"{index}. {item.hunk_id} {item.path}", f"   {item.description}"))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_static_gaps(gaps: Sequence[StaticFinding]) -> str:
+        """渲染静态发现未处理段。
+
+        格式（与疑似漏报那段同构）：
+
+        === 静态发现未处理（1 条）===
+
+        ⚠️ 以下高优先级静态发现没有被任何评论引用，建议人工核查：
+
+        1. S-03 pkg/a/iface.go:15 [gosec · high]
+           G107: Potential HTTP request made with variable url
+
+        Args:
+            gaps: 未被引用的高优先级静态发现
+
+        Returns:
+            该段文本
+        """
+        lines = [STATIC_GAPS_TITLE.format(count=len(gaps)), "", STATIC_GAPS_NOTICE]
+        for index, item in enumerate(gaps, start=1):
+            badge = BADGE_TEMPLATE.format(category=item.linter, severity=item.priority)
+            head = f"{index}. {item.finding_id} {item.path}:{item.line} {badge}"
+            lines.extend((head, f"   {item.text}"))
         return "\n".join(lines)
 
     @staticmethod

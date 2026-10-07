@@ -37,6 +37,11 @@
         只处理通过过滤的 .go 文件。对应 core/ast/：tree-sitter 提取符号
         （函数 / 方法 / 包声明 / import / const / var / type），按改动行求交。
 
+    prism static    --path <repo> [--base main] [--head HEAD]
+        跑一次 golangci-lint，打印静态发现清单（编号 / 档位 / 位置 / 关联 hunk）。
+        只留可审查文件上的发现。对应 core/static/：检出 head → 跑工具 → 解析 JSON。
+        **依赖外部二进制** `golangci-lint`（未安装时明确说「跳过」而不是「没发现」）。
+
     prism group     --path <repo> [--base main] [--head HEAD]
         按包路径（目录）分组，打印审查单元。
         这是审查前流程的最后一个环节，输出即为送进 LLM 的「审查单元」。
@@ -45,8 +50,8 @@
 ## 完整审查（调用 LLM，产生 token 成本）
 
     prism review    --path <repo> [--base main] [--head HEAD]
-        串起完整链路：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 定位 → 反思
-        → 排序 → 终端渲染。
+        串起完整链路：diff → 过滤 → hunk 映射 → 静态分析 → 分组 → LLM 审查
+        → 定位 → 反思 → 排序 → 终端渲染。
 
         审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
         想看完整轨迹设 `PRISM_LOG_LEVEL=DEBUG`，想只看结果设 `PRISM_LOG_LEVEL=WARNING`。
@@ -93,11 +98,15 @@ from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
 from prism.core.output.sort import sort_comments
 from prism.core.reflection.reflect import reflect
+from prism.core.static.analyzer import analyze, format_finding, select_for_group
+from prism.core.static.inject import select_within_budget
+from prism.core.static.verify import verify_group
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import LOCATE_FAILED, Comment, ReviewStats
 from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.models.reflection import PotentialMiss
+from prism.models.static import StaticFinding, StaticReport
 from prism.observability.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -342,6 +351,56 @@ def group(
     typer.echo("\n\n".join(blocks))
 
 
+def _echo_static(report: StaticReport) -> None:
+    """把静态分析的结果打一行到 stdout。
+
+    **「跳过」与「没有发现」必须分开说**：合成一句「没有静态发现」会让「没装
+    golangci-lint」看起来像「代码很干净」—— 那正是一条不报错的错链路
+    （同 `file_read_diff` 的索引为空要报错）。
+
+    Args:
+        report: 静态分析结果
+    """
+    if report.skipped:
+        typer.echo(f"  静态分析跳过：{report.skip_reason}")
+        return
+    typer.echo(f"  静态发现 {len(report.findings)} 条（耗时 {report.elapsed_seconds:.1f}s）")
+
+
+@app.command("static")
+def static_cmd(
+    base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
+    head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
+    path: RepoPath = None,
+) -> None:
+    """跑一次静态分析，打印发现清单（不调用 LLM）。
+
+    函数名带 ``_cmd`` 后缀：命令名由 ``@app.command("static")`` 显式给出，
+    避免模块里的 ``static`` 与「静态」这个词的其他用法撞在一起。
+    """
+    root = _resolve_repo(path)
+    logger.info("静态分析: root=%s base=%s head=%s", root, base, head)
+    mapped = _map_or_exit(root, base, head)
+    reviewable = sorted({item.file_path for item in mapped})
+
+    report = analyze(root, head, reviewable, mapped)
+    if report.skipped:
+        # 「跳过」与「没发现」是两件事，CLI 上必须分开说 —— 合成一句话，
+        # 用户会把「没装工具」读成「代码很干净」
+        typer.echo(f"静态分析跳过：{report.skip_reason}")
+        return
+    if not report.findings:
+        typer.echo(f"没有发现（本组可审查文件 {_plural(len(reviewable), 'file')}）")
+        return
+
+    for item in report.findings:
+        typer.echo(format_finding(item))
+    typer.echo("")
+    typer.echo(
+        f"共 {_plural(len(report.findings), 'finding')}（耗时 {report.elapsed_seconds:.1f}s）"
+    )
+
+
 def _llm_or_exit() -> LLMClient:
     """构造 LLM 客户端，失败时打印错误并终止进程。
 
@@ -364,7 +423,8 @@ def _run_groups(
     project_root: Path,
     head_rev: str,
     diff_index: Mapping[str, Diff],
-) -> tuple[list[Comment], list[PotentialMiss]]:
+    static_report: StaticReport,
+) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding]]:
     """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位与反思。
 
     定位与反思都放在循环体里而不是等所有组跑完：设计文档的节奏就是
@@ -374,24 +434,32 @@ def _run_groups(
     **每组只用一次模型调用完成复核**（不是每个文件一次），失败时原样保留
     全部评论 —— 见 `core/reflection/reflect.py`。
 
+    静态发现的**挑选在这里做一次**（挑本组文件 + 按 token 预算截断），注入与
+    后置校验共用同一份结果 —— 各算一次的话，预算边界上两条路会给出不同的集合，
+    校验出来的「未处理」也就不再是模型实际看到的那批。
+
     Args:
         groups: 审查单元列表
         project_root: 项目根目录
         head_rev: 被审查的版本，传给工具读源码用
         diff_index: `路径 → Diff` 索引，每组都要传 —— 它是**全量**的，
             组内组外都有，`file_read_diff` 靠它看别的包改了什么
+        static_report: 静态分析结果（可能是被跳过的那份）
 
     Returns:
-        (保留的评论, 疑似漏报信号)。评论含未定位的那些（带 locate_level 标记）
+        (保留的评论, 疑似漏报信号, 未被引用的高优先级静态发现)。
+        评论含未定位的那些（带 locate_level 标记）
     """
     llm = _llm_or_exit()
     comments: list[Comment] = []
     misses: list[PotentialMiss] = []
+    gaps: list[StaticFinding] = []
     for index, item in enumerate(groups, start=1):
         typer.echo(
             f"Processing Group {index}: {item.package_path} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
+        injected = select_within_budget(item, select_for_group(item.files, static_report.findings))
         # 压缩配置直接用 settings 里那一份：它的 context_window 已经是从
         # [llm] 拼过来的，这里不再自己算一遍
         result = run_review_agent(
@@ -401,20 +469,26 @@ def _run_groups(
             head_rev,
             settings.compression,
             diff_index,
+            injected,
         )
         located = locate_group(item, result.hunk_comments)
         outcome = reflect(llm.model, item, located)
         comments.extend(outcome.kept)
         misses.extend(outcome.misses)
+        verdict = verify_group(injected, outcome.kept)
+        gaps.extend(verdict.unhandled_high)
         # 未定位数是**定位**这一步的统计，与反思删掉了几条无关，所以按
         # 定位结果算
         unlocated = sum(1 for comment in located if comment.locate_level == LOCATE_FAILED)
+        static_note = (
+            f", 静态发现={len(injected)}(引用{len(verdict.referenced)})" if injected else ""
+        )
         typer.echo(
             f"  {result.group_id} completed: {_plural(len(outcome.kept), 'comment')} "
             f"(exit_reason={result.exit_reason}, 轮次={result.round_count}, "
-            f"未定位={unlocated}, 反思删除={len(outcome.removed)})"
+            f"未定位={unlocated}, 反思删除={len(outcome.removed)}{static_note})"
         )
-    return comments, misses
+    return comments, misses, gaps
 
 
 @app.command()
@@ -423,7 +497,7 @@ def review(
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
     path: RepoPath = None,
 ) -> None:
-    """完整审查：diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 排序 → 终端渲染。"""
+    """完整审查：diff → 过滤 → hunk 映射 → 静态分析 → 分组 → LLM 审查 → 排序 → 渲染。"""
     started = time.monotonic()
     root = _resolve_repo(path)
     logger.info("开始审查: root=%s base=%s head=%s", root, base, head)
@@ -439,22 +513,31 @@ def review(
     # 别的组的改动，按组建索引就等于没建
     diff_index = build_diff_index(reviewable)
 
-    typer.echo(f"Grouping by package... ({_plural(len(reviewable), 'reviewable file')})")
     try:
-        groups = group_by_package(map_hunks_to_symbols(root, base, head, reviewable))
+        mapped = map_hunks_to_symbols(root, base, head, reviewable)
     except ValueError as exc:
         logger.error("hunk 映射失败: %s", exc)
         typer.echo(f"错误：{exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+    # 静态分析夹在 hunk 映射与分组之间（设计 18 号 §2.3）：它的发现要按文件分桶进
+    # 各组，而「关联到哪个 hunk」需要映射结果。可审查文件的路径直接取自映射结果 ——
+    # 一个文件过了过滤但一个 hunk 都没活下来时，它本来也不会进任何组
+    typer.echo(f"Running static analysis... ({_plural(len(reviewable), 'reviewable file')})")
+    static_report = analyze(root, head, sorted({item.file_path for item in mapped}), mapped)
+    _echo_static(static_report)
+
+    typer.echo(f"Grouping by package... ({_plural(len(reviewable), 'reviewable file')})")
+    groups = group_by_package(mapped)
 
     if not groups:
         typer.echo("没有可审查的 hunk。")
 
     # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
     if groups:
-        comments, misses = _run_groups(groups, root, head, diff_index)
+        comments, misses, gaps = _run_groups(groups, root, head, diff_index, static_report)
     else:
-        comments, misses = [], []
+        comments, misses, gaps = [], [], []
     comments = sort_comments(comments)
 
     stats = ReviewStats(
@@ -465,5 +548,5 @@ def review(
         duration_seconds=time.monotonic() - started,
     )
     typer.echo("")
-    typer.echo(TerminalRenderer().render(comments, stats, misses))
+    typer.echo(TerminalRenderer().render(comments, stats, misses, gaps))
     typer.echo(f"\nReview completed: {_plural(len(comments), 'comment')}")

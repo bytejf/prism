@@ -358,7 +358,10 @@ def test_initial_state_builds_user_message_and_round_budget(project_root: str) -
     assert "### 审查范围" in user_text
     assert "<diff>" in user_text
     # diff 块在前、要求块在后 —— 模型决策前最后读到的是一段短要求
-    assert user_text.index("<diff>") < user_text.index("### 审查要求")
+    assert user_text.index("<diff>") < user_text.index("### 你的主任务")
+    # 没有静态发现时整段省略（工作方式那句会提到段名，所以断言的是段标题）
+    assert "### 静态分析提示" not in user_text
+    assert "\n\n\n" not in user_text
 
 
 def test_build_tools_exposes_five_tools() -> None:
