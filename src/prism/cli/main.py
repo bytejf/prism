@@ -54,7 +54,9 @@
         → 定位 → 反思 → 排序 → 终端渲染。
 
         审查前三个阶段的进度打到 stdout，详细轨迹走 logging（stderr）：
-        想看完整轨迹设 `PRISM_LOG_LEVEL=DEBUG`，想只看结果设 `PRISM_LOG_LEVEL=WARNING`。
+        想看完整的 LLM 轨迹设 `PRISM_LOG_LEVEL=INFO`（默认，轨迹本身就在 INFO），
+        想只看结果设 `WARNING`，想要内部细节（符号表、装箱 token、提示词大小）设
+        `DEBUG`。
 
         需要环境变量 `DEEPSEEK_API_KEY`，缺失时以退出码 1 明确报错。
 

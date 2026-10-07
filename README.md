@@ -79,7 +79,7 @@ high: 4 | medium: 1 | low: 0
 | 变量 | 说明 |
 |------|------|
 | `DEEPSEEK_API_KEY` | **必填**（仅 `review` 需要）。缺失时 `review` 以退出码 1 明确报错 |
-| `PRISM_LOG_LEVEL` | 日志级别，覆盖配置文件里的 `[log].level`。只作用于 `prism` 命名空间，不影响第三方库。想看完整轨迹设 `DEBUG`，想只看结果设 `WARNING` |
+| `PRISM_LOG_LEVEL` | 日志级别，覆盖配置文件里的 `[log].level`。只作用于 `prism` 命名空间，不影响第三方库。**完整的 LLM 轨迹在 `INFO`**（默认），想只看结果设 `WARNING`，想要内部细节设 `DEBUG` |
 
 ## 配置文件
 
