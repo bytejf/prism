@@ -36,12 +36,11 @@ from prism.core.agent.agent import run_review_agent
 from prism.core.ast.mapper import map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
-from prism.core.grouping.packages import group_by_package
+from prism.core.grouping.packages import fixed_prompt_tokens, group_by_package, group_tokens
 from prism.core.guidance.builder import build_diff_block, build_static_block
 from prism.core.llm.client import LLMClient
 from prism.core.output.locate import locate_group
 from prism.core.static.analyzer import analyze, format_finding, select_for_group
-from prism.core.static.inject import base_prompt_tokens, select_within_budget
 from prism.core.static.verify import verify_group
 from prism.models.grouping import Group
 from prism.models.static import StaticFinding
@@ -168,9 +167,12 @@ def injected(static_repo: Path) -> tuple[Group, list[StaticFinding]]:
         print(format_finding(item))
 
     group = group_by_package(mapped)[0]
-    selected = select_within_budget(group, select_for_group(group.files, report.findings))
-    used = base_prompt_tokens(group) + len(build_static_block(selected))
-    print(f"\n=== 注入 {group.group_id} 的 {len(selected)} 条（基准 {used} 字符量级）===")
+    selected = select_for_group(group.files, report.findings)
+    total = fixed_prompt_tokens() + group_tokens(group.hunks, report.findings)
+    print(
+        f"\n=== 注入 {group.group_id} 的 {len(selected)} 条"
+        f"（本组约 {total}/{settings.review.max_group_tokens} token）==="
+    )
     print(build_static_block(selected) or "（空：这一组没有静态发现）")
 
     print("\n=== 带 static_hint 的 diff 块 ===")

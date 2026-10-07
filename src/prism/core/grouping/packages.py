@@ -1,15 +1,42 @@
-"""按包路径分组。
+"""按包路径分组，并按 token 预算切成审查单元。
 
-V1 只用目录路径作为分组依据：不调调用图、不做装箱算法、不做 token 预算。
-同一个包的文件倾向于一起看，分组结果也是后续并发审查的最小单位。
+两条规则叠在一起：
+
+1. **包是分组边界** —— 一个包（目录）就是一个审查单元，同一个包的文件倾向于
+   一起看，这是审查质量的来源（也是 `file_read_diff` 那条设计的前提）
+2. **组有 token 预算** —— 一个包攒的 hunk 太多时，**一个包不再等于一个审查
+   单元**：装不下的部分顺延到下一组（设计 18 号 §2.4 要求分组把静态发现的
+   token 也计入预算）。于是同一个包可能出现若干个连续编号的组
+
+**小包不合并**：两个各自只有 3 个 hunk 的包不会被塞进同一组。理由不是成本
+（合并反而更便宜），而是「一个审查单元 = 一个包」这条契约：合并会让
+`package_path` 不再是单值，也会让每个组的主题变糊。所以预算只用来**向下切**，
+不用来**向上并**。
+
+拆包的三个取舍：
+
+- **顺序 = 包 → 文件 → 行号**，装不下就往后顺延。于是每组拿到的是一段**连续**
+  的 hunk，同一个文件的两个 hunk 不会被拆到两组（除非触发了下面那条）
+- **切分粒度是文件，不是 hunk**：一个文件的 hunk 默认整块进同一组。只有当**这个
+  文件自己**就超预算（改了几百行的大文件）时，才退化成按 hunk 切并记 WARNING ——
+  到那一层已经没有更细的边界可用了
+- **成本用真实渲染量出来**，不另写一套「每个 hunk 多少 token」的估算模型：
+  试算时直接调 `build_diff_block` / `build_static_block` 渲染候选内容再数字符。
+  代价是装箱过程是 O(k²) 次渲染（k = 一组的 hunk 数，实测最大的组 95 个），
+  换来的是**不会出现「成本模型算得下、真渲染超了」这种漂移**
 """
 
 import logging
-from collections import defaultdict
+from collections.abc import Sequence
 from pathlib import PurePosixPath
 
+from prism.config.settings import settings
+from prism.core.guidance import templates as tpl
+from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
+from prism.core.guidance.tokens import estimate_tokens
 from prism.models.ast import HunkWithSymbol
 from prism.models.grouping import Group
+from prism.models.static import StaticFinding
 
 logger = logging.getLogger(__name__)
 
@@ -21,42 +48,45 @@ GROUP_ID_WIDTH = 3
 ROOT_PACKAGE = "."
 
 
-def group_by_package(hunks: list[HunkWithSymbol]) -> list[Group]:
-    """把 hunk 按所在包（目录）分组。
+def group_by_package(
+    hunks: list[HunkWithSymbol], findings: Sequence[StaticFinding] = ()
+) -> list[Group]:
+    """把 hunk 按包分组，再按 token 预算装箱。
 
-    组按包路径升序排列；组内文件按路径升序，hunk 按文件路径 + 行号升序。
-    同一个包无论多少文件都不再拆分（V1 不做装箱）。
+    组按包路径升序；组内 hunk 保持「文件路径 + 行号」升序。一个包放得下就一组，
+    放不下的部分顺延到下一组（仍是同一个包）。**组与组之间不会混包** ——
+    小包也不合并，预算只用来向下切。
 
     Args:
         hunks: 带归属符号的 hunk 列表
+        findings: 全量静态发现。**参与预算**：某个 hunk 关联的发现要占额度，
+            所以静态发现多的组会更早被切开
 
     Returns:
-        Group 列表，按包路径升序；无输入时返回空列表
+        Group 列表，按顺序编号；无输入时返回空列表
     """
-    by_package: dict[str, list[HunkWithSymbol]] = defaultdict(list)
-    for item in hunks:
-        by_package[package_path(item.file_path)].append(item)
+    ordered = sorted(hunks, key=_hunk_sort_key)
+    budget = settings.review.max_group_tokens
+    pieces = _pieces(ordered, findings, budget)
+    groups = _pack(pieces, findings, budget)
 
-    groups: list[Group] = []
-    for index, package in enumerate(sorted(by_package), start=1):
-        ordered = sorted(by_package[package], key=_hunk_sort_key)
-        groups.append(
-            Group(
-                group_id=f"{GROUP_ID_PREFIX}{index:0{GROUP_ID_WIDTH}d}",
-                package_path=package,
-                files=sorted({item.file_path for item in ordered}),
-                hunks=ordered,
-            )
-        )
-
-    logger.info("分组完成：%d 个包，%d 个 hunk", len(groups), len(hunks))
+    logger.info(
+        "分组完成：%d 个包，%d 个 hunk → %d 组（预算 %d token/组）",
+        len({package_path(item.file_path) for item in ordered}),
+        len(hunks),
+        len(groups),
+        budget,
+    )
     for group in groups:
+        tokens = group_tokens(group.hunks, findings)
         logger.debug(
-            "%s %s：%d 个文件，%d 个 hunk",
+            "%s %s：%d 个文件，%d 个 hunk，约 %d token（额度 %d）",
             group.group_id,
             group.package_path,
             len(group.files),
             len(group.hunks),
+            tokens,
+            budget,
         )
     return groups
 
@@ -73,15 +103,189 @@ def package_path(file_path: str) -> str:
     return str(PurePosixPath(file_path).parent)
 
 
-def _hunk_sort_key(item: HunkWithSymbol) -> tuple[str, int, int]:
-    """组内 hunk 的排序键。
+def group_tokens(hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFinding]) -> int:
+    """量一组提示词（不含 system 与要求块）的 token 数。
 
-    纯删除的 hunk 新文件行号为 0，用旧文件起始行兜底保证顺序稳定。
+    直接渲染再数字符 —— 与真正发出去的提示词是同一份代码路径。
+
+    Args:
+        hunks: 这一组的 hunk
+        findings: 全量静态发现（内部按文件挑出属于这些 hunk 的）
+
+    Returns:
+        估算 token 数
+    """
+    files = sorted({item.file_path for item in hunks})
+    if not files:
+        return 0
+    related = _findings_for_files(files, findings)
+    return estimate_tokens(build_diff_block(_probe(hunks), related)) + estimate_tokens(
+        build_static_block(related)
+    )
+
+
+def group_cost(hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFinding]) -> int:
+    """一组的**总**成本：固定开销 + 内容。
+
+    **装箱的每一处判断都必须用它**，不要拿 `group_tokens` 单独跟预算比 ——
+    漏掉固定开销的写法会让「文件自己放得下」与「装进组里放不下」给出两个答案，
+    结果就是一个超预算的组带着 ⚠️ 出现在干跑输出里（实测踩到过）。
+
+    Args:
+        hunks: 这一组的 hunk
+        findings: 全量静态发现
+
+    Returns:
+        估算 token 数
+    """
+    return fixed_prompt_tokens() + group_tokens(hunks, findings)
+
+
+def fixed_prompt_tokens() -> int:
+    """量一组的固定开销：system 段 + 要求块。
+
+    它每轮都要重发，所以是**每一轮的地板价** —— 组数越多，这笔钱付得越多。
+
+    Returns:
+        估算 token 数
+    """
+    return estimate_tokens(tpl.SYSTEM) + estimate_tokens(build_requirements())
+
+
+def _findings_for_files(
+    files: Sequence[str], findings: Sequence[StaticFinding]
+) -> list[StaticFinding]:
+    """挑出属于这些文件的静态发现（与注入那一侧同一个判据）。
+
+    Args:
+        files: 文件路径
+        findings: 全量静态发现
+
+    Returns:
+        相关发现，保持全量列表顺序（已按优先级降序）
+    """
+    wanted = set(files)
+    return [item for item in findings if item.path in wanted]
+
+
+def _probe(hunks: Sequence[HunkWithSymbol]) -> Group:
+    """构造一个只为试算用的临时组。
+
+    Args:
+        hunks: 候选 hunk
+
+    Returns:
+        临时 Group（编号与包路径都是占位，不会外泄）
+    """
+    return Group(
+        group_id="probe",
+        package_path="probe",
+        files=sorted({item.file_path for item in hunks}),
+        hunks=list(hunks),
+    )
+
+
+def _pieces(
+    hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFinding], budget: int
+) -> list[list[HunkWithSymbol]]:
+    """把有序 hunk 切成「不可再切的片」。
+
+    一个文件一片（它的 hunk 必须待在一起）；**只有这个文件自己就超预算时**才退化成
+    每个 hunk 一片。切完的片仍然保持原顺序。
+
+    Args:
+        hunks: 已排序的 hunk
+        findings: 全量静态发现
+        budget: 单组预算
+
+    Returns:
+        片的列表
+    """
+    by_file: dict[str, list[HunkWithSymbol]] = {}
+    for item in hunks:
+        by_file.setdefault(item.file_path, []).append(item)
+
+    pieces: list[list[HunkWithSymbol]] = []
+    for path, items in by_file.items():
+        cost = group_cost(items, findings)
+        if cost <= budget:
+            pieces.append(items)
+            continue
+        logger.warning(
+            "文件 %s 自己就超过单组预算（约 %d > %d token）：按 hunk 切成 %d 片，它的 hunk 会跨组",
+            path,
+            cost,
+            budget,
+            len(items),
+        )
+        pieces.extend([item] for item in items)
+    return pieces
+
+
+def _pack(
+    pieces: Sequence[Sequence[HunkWithSymbol]],
+    findings: Sequence[StaticFinding],
+    budget: int,
+) -> list[Group]:
+    """把片按顺序装进组：装不下就封口，下一片开新组。
+
+    Args:
+        pieces: 有序的片
+        findings: 全量静态发现（参与预算）
+        budget: 单组预算
+
+    Returns:
+        组装好的审查单元列表
+    """
+    packed: list[list[HunkWithSymbol]] = []
+    current: list[HunkWithSymbol] = []
+    for piece in pieces:
+        # 封口条件有两个：换包了（一个组只装一个包），或者装不下了
+        if current and (
+            package_path(current[0].file_path) != package_path(piece[0].file_path)
+            or group_cost([*current, *piece], findings) > budget
+        ):
+            packed.append(current)
+            current = []
+        current.extend(piece)
+        if group_cost(current, findings) > budget:
+            # 一片（单文件或单 hunk）自己就超：它单独成组，只提醒不改预算 ——
+            # 到这一层已经没有更细的边界，硬拆只会把上下文切碎
+            logger.warning(
+                "单组预算 %d 装不下这一片（约 %d token，%d 个 hunk）：它单独成组",
+                budget,
+                group_cost(current, findings),
+                len(current),
+            )
+    if current:
+        packed.append(current)
+
+    return [
+        Group(
+            group_id=f"{GROUP_ID_PREFIX}{index:0{GROUP_ID_WIDTH}d}",
+            package_path=package_path(items[0].file_path),
+            files=sorted({item.file_path for item in items}),
+            hunks=list(items),
+        )
+        for index, items in enumerate(packed, start=1)
+    ]
+
+
+def _hunk_sort_key(item: HunkWithSymbol) -> tuple[str, str, int, int]:
+    """全量排序键：包 → 文件路径 → 新文件起始行 → 旧文件起始行。
+
+    先按包排是为了让**同一个包的 hunk 连续**（装箱才不会把包打散）；纯删除的 hunk
+    新文件行号为 0，用旧文件起始行兜底保证顺序稳定。
 
     Args:
         item: 带符号的 hunk
 
     Returns:
-        (文件路径, 新文件起始行, 旧文件起始行)
+        (包路径, 文件路径, 新文件起始行, 旧文件起始行)
     """
-    return item.file_path, item.part.new_start, item.part.old_start
+    return (
+        package_path(item.file_path),
+        item.file_path,
+        item.part.new_start,
+        item.part.old_start,
+    )

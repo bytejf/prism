@@ -92,14 +92,13 @@ from prism.core.agent.agent import run_review_agent
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import build_diff_index, load_diffs
 from prism.core.filter.rules import filter_files
-from prism.core.grouping.packages import group_by_package
+from prism.core.grouping.packages import fixed_prompt_tokens, group_by_package, group_tokens
 from prism.core.llm.client import LLMClient
 from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
 from prism.core.output.sort import sort_comments
 from prism.core.reflection.reflect import reflect
 from prism.core.static.analyzer import analyze, format_finding, select_for_group
-from prism.core.static.inject import select_within_budget
 from prism.core.static.verify import verify_group
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import LOCATE_FAILED, Comment, ReviewStats
@@ -322,23 +321,33 @@ def group(
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
     path: RepoPath = None,
 ) -> None:
-    """按包路径分组，打印审查单元（不调用 LLM）。
+    """按包路径分组并按预算装箱，打印审查单元（静态分析要跑，但不调用 LLM）。
 
     这是审查前流程的最后一个环节：输出即为送入 LLM 的「审查单元」。
+    静态分析也在这里跑一次，因为**静态发现参与装箱预算** —— 不跑它，
+    干跑出来的分组与真审时的不一样，那就失去核对的意义了。
     """
     root = _resolve_repo(path)
     logger.info("分组: root=%s base=%s head=%s", root, base, head)
-    groups = group_by_package(_map_or_exit(root, base, head))
+    mapped = _map_or_exit(root, base, head)
+    report = analyze(root, head, sorted({item.file_path for item in mapped}), mapped)
+    _echo_static(report)
+    groups = group_by_package(mapped, report.findings)
 
     if not groups:
         typer.echo("没有可审查的 hunk")
         return
 
+    budget = settings.review.max_group_tokens
     blocks = []
     for index, item in enumerate(groups, start=1):
+        tokens = group_tokens(item.hunks, report.findings)
+        total = tokens + fixed_prompt_tokens()
+        over = "  ⚠️ 超过预算" if total > budget else ""
         header = (
             f"Group {index}: {item.package_path} "
-            f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
+            f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')}, "
+            f"约 {total}/{budget} token){over}"
         )
         lines = [header]
         # hunks 已按文件路径排序，同文件的连续 → groupby 一次即可
@@ -459,7 +468,9 @@ def _run_groups(
             f"Processing Group {index}: {item.package_path} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
-        injected = select_within_budget(item, select_for_group(item.files, static_report.findings))
+        # 挑选不做二次裁剪：**预算在分组那一步就执行完了**（装不下的 hunk 顺延到
+        # 下一组），这里再裁一次只会让「注入的」与「算过成本的」变成两批东西
+        injected = select_for_group(item.files, static_report.findings)
         # 压缩配置直接用 settings 里那一份：它的 context_window 已经是从
         # [llm] 拼过来的，这里不再自己算一遍
         result = run_review_agent(
@@ -528,7 +539,7 @@ def review(
     _echo_static(static_report)
 
     typer.echo(f"Grouping by package... ({_plural(len(reviewable), 'reviewable file')})")
-    groups = group_by_package(mapped)
+    groups = group_by_package(mapped, static_report.findings)
 
     if not groups:
         typer.echo("没有可审查的 hunk。")

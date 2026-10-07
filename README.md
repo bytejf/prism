@@ -98,9 +98,9 @@ reserve_tokens = 20000       # 已用达到 (窗口 - 预留) 就压缩
 [review]
 min_rounds = 30
 rounds_per_hunk = 5
+max_group_tokens = 20000     # 单个审查组的提示词预算，分组按它装箱
 
 [static]
-max_prompt_tokens = 12000    # 整条提示词的 token 上限；超了从静态发现那头砍
 timeout_seconds = 180        # golangci-lint / git 子进程超时
 
 [tools.file_read]
@@ -135,6 +135,9 @@ max_lines = 500
 - **跨文件改动可查** —— 按包分组会把「改接口 + 改实现 + 改调用方」切成互不可见的
   审查单元，`file_read_diff` 让模型按需取其他文件的 diff，自己判断有没有同步适配。
   刻意**不做调用图分组**：实测调用图的噪音比 73%，而且错误的分组比不分组更糟
+- **分组有 token 预算** —— 一个包（目录）是一个审查单元，但攒的 hunk 太多时
+  按预算装箱：装不下的部分顺延到下一组。预算是**整条请求**的（system + 要求 +
+  hunk + 静态发现），成本用真实渲染量出来，不另建一套估算模型
 - **静态发现只当线索，进不了输出** —— golangci-lint 的误报是常态（`gosec` 会标记
   任何含 `Password` 字段的结构体，哪怕它已被掩码），所以它**只作为线索注入提示词**：
   独立成段列出、每条标上关联的 hunk，每组的 hunk 再按它标出的优先级排展示顺序。

@@ -141,7 +141,7 @@ def initial_state(
         group: 审查单元
         max_rounds: 单组最大模型调用次数
         static_findings: 注入本组的静态发现（已按 token 预算裁过），
-            由 `core/static/inject.py` 挑出
+            由 `static.analyzer.select_for_group` 按文件挑出（额度在分组那一步已经算过）
 
     Returns:
         初始 ReviewState

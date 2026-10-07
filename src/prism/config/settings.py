@@ -56,6 +56,7 @@ class ReviewSettings:
         no_progress_remind_rounds: 连续无产出到这些轮次时注入提醒
         no_progress_exit_rounds: 连续无产出到该轮次强制退出
         max_rejections: end_done 被拒绝的上限，超过就接受并带缺口退出
+        max_group_tokens: 单个审查组的提示词预算（估算 token），分组按它装箱
     """
 
     min_rounds: int
@@ -63,6 +64,7 @@ class ReviewSettings:
     no_progress_remind_rounds: tuple[int, ...]
     no_progress_exit_rounds: int
     max_rejections: int
+    max_group_tokens: int
 
 
 @dataclass(frozen=True)
@@ -104,15 +106,12 @@ class ToolsSettings:
 
 @dataclass(frozen=True)
 class StaticSettings:
-    """静态分析（golangci-lint）的开关与预算。
+    """静态分析的超时。
 
     Attributes:
-        max_prompt_tokens: 单组提示词的 token 上限（估算值）。提示词模板 + hunk
-            内容 + 静态发现加起来不许超过它，超了从静态发现那头砍
         timeout_seconds: golangci-lint / git 子进程超时
     """
 
-    max_prompt_tokens: int
     timeout_seconds: int
 
 
@@ -138,7 +137,7 @@ class Settings:
         llm: 模型、端点与窗口
         compression: 压缩阈值。`context_window` 来自 `[llm]`，不重复写在 toml 里
         review: 审查循环的轮次与节奏
-        static: 静态分析的预算与超时
+        static: 静态分析的超时
         tools: 工具限制
         log: 日志
     """
@@ -371,13 +370,11 @@ def load(path: Path = PATH) -> Settings:
         no_progress_remind_rounds=review.numbers("no_progress_remind_rounds"),
         no_progress_exit_rounds=review.count("no_progress_exit_rounds"),
         max_rejections=review.count("max_rejections"),
+        max_group_tokens=review.count("max_group_tokens"),
     )
 
     static = root.section("static")
-    static_settings = StaticSettings(
-        max_prompt_tokens=static.count("max_prompt_tokens"),
-        timeout_seconds=static.count("timeout_seconds"),
-    )
+    static_settings = StaticSettings(timeout_seconds=static.count("timeout_seconds"))
 
     tools = root.section("tools")
     file_read = tools.section("file_read")

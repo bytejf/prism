@@ -1,4 +1,4 @@
-"""静态分析（analyzer / inject / verify）的单元测试。
+"""静态分析（analyzer / verify）的单元测试。
 
 **全都不依赖真实的 golangci-lint**：二进制是外部依赖，不在 `pyproject.toml` 里，
 装了才有。所以这里只喂**真实的 JSON 载荷**（从 v2.14.0 的输出里抄下来的形状）
@@ -8,15 +8,12 @@
 
 import json
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from prism.config.settings import settings
-from prism.core.guidance.builder import build_static_block
-from prism.core.static import analyzer, inject
+from prism.core.static import analyzer
 from prism.core.static.analyzer import (
     LINTERS,
     analyze,
@@ -28,7 +25,6 @@ from prism.core.static.verify import verify_group
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.comment import Comment
 from prism.models.diff import Hunk
-from prism.models.grouping import Group
 from prism.models.static import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
@@ -532,62 +528,6 @@ def test_temp_worktrees_are_removed_from_the_repo(tmp_path: Path) -> None:
         ["git", "-C", str(repo), "worktree", "list"], check=True, capture_output=True, text=True
     ).stdout
     assert listing.count("\n") == 1, f"只该剩主工作树：{listing}"
-
-
-# ---------- token 预算 ----------
-
-
-@pytest.fixture
-def group() -> Group:
-    """造一个只有一个 hunk 的审查单元。
-
-    Returns:
-        Group
-    """
-    item = make_hunk("H-01")
-    return Group(group_id="group-001", package_path="pkg/a", files=["pkg/a/iface.go"], hunks=[item])
-
-
-def test_estimate_tokens() -> None:
-    """估算是字符数 ÷ 2.5（设计 §2.4 的取整口径）。"""
-    assert inject.estimate_tokens("") == 0
-    assert inject.estimate_tokens("a" * 25) == 11
-
-
-def test_budget_truncates_low_priority_first(group: Group, monkeypatch: pytest.MonkeyPatch) -> None:
-    """预算不够时按顺序截断，先丢的是低优先级。"""
-    findings = [
-        make_finding("S-01", hunk_id="H-01", priority=PRIORITY_HIGH),
-        make_finding("S-02", hunk_id="H-01", priority=PRIORITY_MEDIUM),
-        make_finding("S-03", hunk_id="H-01", priority=PRIORITY_LOW),
-    ]
-    # 预算**正好等于**「基准 + 前两条的渲染结果」：第三条进不来，前两条必须留下。
-    # 不写死数字 —— 表格的宽度会随模板改，写死就成了又一处会漂的东西
-    budget = inject.base_prompt_tokens(group) + inject.estimate_tokens(
-        build_static_block(findings[:2])
-    )
-    monkeypatch.setattr(
-        inject,
-        "settings",
-        replace(settings, static=replace(settings.static, max_prompt_tokens=budget)),
-    )
-
-    selected = inject.select_within_budget(group, findings)
-
-    assert [item.finding_id for item in selected] == ["S-01", "S-02"]
-
-
-def test_budget_overflow_injects_nothing(group: Group, monkeypatch: pytest.MonkeyPatch) -> None:
-    """提示词本身就超预算时一条都不注入（diff 一个字不砍）。"""
-    monkeypatch.setattr(
-        inject, "settings", replace(settings, static=replace(settings.static, max_prompt_tokens=1))
-    )
-    assert inject.select_within_budget(group, [make_finding("S-01")]) == []
-
-
-def test_no_findings_returns_empty(group: Group) -> None:
-    """没有发现时不注入、也不算预算。"""
-    assert inject.select_within_budget(group, []) == []
 
 
 # ---------- 后置校验 ----------
