@@ -20,16 +20,19 @@
 
 跑法（真调 LLM，只跑 Go 子集时约 22 次调用 / 十几秒 / 几分钱）：
 
-    PRISM_BENCH_DATASET=/tmp/aacr.json \
     PRISM_LOG_LEVEL=INFO uv run pytest tests/manual/calibrate_reflection_bench.py -s
 
     # 只跑前 3 个 PR（先验证流程）
     PRISM_BENCH_LIMIT=3 uv run pytest tests/manual/calibrate_reflection_bench.py -s
 
-数据集下载（2 MB）：
+数据集（2 MB）放在 bench 目录里（跟随 harness，不放 `/tmp` —— 那里会被系统清掉）：
+
+    ~/Projects/python/prism-bench/evaluation/benchmark/AACR-Bench/dataset-full.json
+
+重新下载：
 
     curl -sL https://huggingface.co/datasets/Alibaba-Aone/aacr-bench/resolve/main/dataset.json \
-        -o /tmp/aacr.json
+        -o ~/Projects/python/prism-bench/evaluation/benchmark/AACR-Bench/dataset-full.json
 
 看什么：
 
@@ -78,7 +81,8 @@ def read_options() -> dict[str, Any]:
     **不用 pytest 的命令行参数**：pytest 会把不认识的选项直接报错，为几个可选参数
     去改 `conftest.py` 加 `pytest_addoption`，收益不抵那份共享改动。
 
-        PRISM_BENCH_DATASET     数据集 json（默认 /tmp/aacr.json）
+        PRISM_BENCH_DATASET     完整数据集 json（默认 prism-bench 里那份；
+                                下载见文件头）
         PRISM_BENCH_REPO_CACHE  仓库克隆缓存（默认复用 prism-bench 的那份）
         PRISM_BENCH_LANGUAGE    只看哪个语言（默认 Go）
         PRISM_BENCH_LIMIT       只跑前 N 个 PR（默认 0 = 全跑）
@@ -89,7 +93,14 @@ def read_options() -> dict[str, Any]:
     import os
 
     return {
-        "dataset": os.getenv("PRISM_BENCH_DATASET", "/tmp/aacr.json"),
+        "dataset": os.getenv(
+            "PRISM_BENCH_DATASET",
+            # 放在 bench 目录里（不放 /tmp —— 那里会被系统清掉，而这个文件是标定的输入）
+            str(
+                Path.home()
+                / "Projects/python/prism-bench/evaluation/benchmark/AACR-Bench/dataset-full.json"
+            ),
+        ),
         "repo_cache": os.getenv(
             "PRISM_BENCH_REPO_CACHE",
             str(Path.home() / "Projects/python/prism-bench/evaluation/repo"),

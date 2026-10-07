@@ -577,7 +577,39 @@ PyCharm：Environment variables 填 `PRISM_LOG_LEVEL=INFO`，Additional Argument
    能证伪「我以为的行号规则」。两个走查仓库都在时才跑（改定位必跑）
 3. e2e 打真实接口，**偶发红灯**（实测遇到过 1 次）—— 先重跑一次，别直接当回归
 
-对账用的两个项目：
+### 评测（AACR-Bench）—— 东西在哪
+
+**测试集与逐次运行的日志都不在 prism 仓库里**，在 `~/Projects/python/prism-bench/`
+（`alibaba/aacr-bench` 的克隆 + 我们的接入点）：
+
+```
+prism-bench/evaluation/
+  benchmark/AACR-Bench/positive_samples.json   # 官方数据（只有 label=1，按 PR 聚合）
+  benchmark/AACR-Bench/dataset-full.json       # 完整数据集（1505 正 + 640 低质，按评论聚合）
+  data/aacr_bench.jsonl                        # 转成标准格式的 196 个 PR
+  data/prism-smoke.jsonl  data/prism-baseline.jsonl   # 我们挑的批次（1 条 / 3 条）
+  repo/<owner__name>/                          # 仓库克隆缓存（~910 MB）
+  results/<批次>/prism/<run_id>/               # ★ 每局四件套：
+      <样本>.json          # harness 结果（含 review.summary / review.comments）
+      <样本>.prism.json    # 我们自己的 JSON 报告（评论、用量、花费、缺口）
+      <样本>.stderr.log    # ★ 审查全量日志（逐轮工具调用、提醒、停用闸、退出原因）
+      <样本>.trace.jsonl   # OTel trace（五类 span）
+  metrics/<批次>/prism/<run_id>/metrics_*.json # ★ 裁判算出来的 P/R/F1（含逐条匹配）
+  reviewers/prism.py     # 我们的 reviewer 插件（改的是克隆，不在 prism 仓库里）
+```
+
+跑一批：
+
+```bash
+cd ~/Projects/python/prism-bench/evaluation
+JUDGE_BASE_URL=https://api.deepseek.com JUDGE_API_KEY="$DEEPSEEK_API_KEY" \
+JUDGE_MODEL=deepseek-flash JUDGE_USE_MOCK=false \
+.venv/bin/python -m pipeline run --stage all --reviewer prism --dataset data/prism-baseline.jsonl
+```
+
+看一局的轨迹：`grep -E "ai · 轮次|tool · 轮次|注入提醒|收尾闸|结束审查" <样本>.stderr.log`
+
+**对账用的两个项目：**
 
 - `~/Projects/python/prism-min-test` —— 2 个 Go 文件、6 个 hunk、**单审查单元**，
   约 5 轮收尾。`NOTES.md` 列了埋的 6 处问题，专供走查与断点调试
