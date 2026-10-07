@@ -108,6 +108,7 @@ from prism.core.grouping.packages import (
 from prism.core.llm.client import LLMClient
 from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
+from prism.core.output.report import build_report, write_report
 from prism.core.output.sort import sort_comments
 from prism.core.reflection.reflect import reflect
 from prism.core.static.analyzer import analyze, format_finding, select_for_group
@@ -474,6 +475,32 @@ class _GroupOutcome:
     elapsed_seconds: float
 
 
+@dataclass(frozen=True)
+class _RunResult:
+    """`_run_groups` 的产出。
+
+    做成值对象而不是元组：字段已经到七个（评论、漏报、静态缺口、三个计数、用量），
+    再往下加一个元组就没法读了，而调用方要的是「有哪些东西」而不是「第几个」。
+
+    Attributes:
+        comments: 保留的评论（含未定位）
+        misses: 疑似漏报信号
+        gaps: 没被引用的高优先级静态发现
+        skipped_groups: 因预算没跑的组数
+        failed_groups: 异常退出的组数
+        pending_hunks: 没审完的 hunk 数
+        usage: 累计用量（审查循环 + 反思）
+    """
+
+    comments: list[Comment]
+    misses: list[PotentialMiss]
+    gaps: list[StaticFinding]
+    skipped_groups: int
+    failed_groups: int
+    pending_hunks: int
+    usage: UsageTotals
+
+
 def _run_one_group(
     index: int,
     item: Group,
@@ -576,7 +603,7 @@ def _run_groups(
     diff_index: Mapping[str, Diff],
     static_report: StaticReport,
     started: float,
-) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding], int, int, int]:
+) -> _RunResult:
     """跑完所有审查单元，每组跑完立刻定位与反思。
 
     定位与反思都放在单组里而不是等所有组跑完：设计文档的节奏就是「每组审查完成
@@ -604,8 +631,7 @@ def _run_groups(
             于是「20 分钟」读起来就是「这条命令最长跑多久」，含静态分析
 
     Returns:
-        (保留的评论, 疑似漏报信号, 未被引用的高优先级静态发现,
-        因预算未跑的组数, 异常退出的组数, 没审完的 hunk 数)。
+        `_RunResult`（评论、漏报、静态缺口、三个计数、累计用量）。
         评论含未定位的那些（带 locate_level 标记）
     """
     llm = _llm_or_exit()
@@ -643,7 +669,15 @@ def _run_groups(
     )
     if not skipped and not failed:
         typer.echo(f"总计 {describe(total, settings.cost)}")
-    return comments, misses, gaps, skipped, failed, pending_hunks
+    return _RunResult(
+        comments=comments,
+        misses=misses,
+        gaps=gaps,
+        skipped_groups=skipped,
+        failed_groups=failed,
+        pending_hunks=pending_hunks,
+        usage=total,
+    )
 
 
 def _dispatch(
@@ -814,6 +848,13 @@ def review(
             "这类只有调用方知道的信息由它带进来",
         ),
     ] = None,
+    json_out: Annotated[
+        Path | None,
+        typer.Option(
+            "--json-out",
+            help="把机器可读的结果写到这个文件（终端渲染照常）。bench 驱动靠它拿评论",
+        ),
+    ] = None,
 ) -> None:
     """完整审查：diff → 过滤 → hunk 映射 → 静态分析 → 分组 → LLM 审查 → 排序 → 渲染。
 
@@ -828,7 +869,7 @@ def review(
 
     with tracer.start_as_current_span("prism_review") as span:
         set_attributes(span, {sc.PRISM_BASE_REV: base, sc.PRISM_HEAD_REV: head, **extra})
-        stats = _review(base, head, path)
+        stats = _review(base, head, path, json_out)
         set_attributes(
             span,
             {
@@ -840,13 +881,14 @@ def review(
         )
 
 
-def _review(base: str, head: str, path: Path | None) -> ReviewStats:
+def _review(base: str, head: str, path: Path | None, json_out: Path | None = None) -> ReviewStats:
     """`prism review` 的主体（根 span 由调用方开）。
 
     Args:
         base: base 分支 / 版本
         head: head 分支 / 版本
         path: 被审查仓库路径
+        json_out: 机器可读结果的输出路径；None 表示不写
 
     Returns:
         审查统计（根 span 的属性从它取）
@@ -888,12 +930,18 @@ def _review(base: str, head: str, path: Path | None) -> ReviewStats:
 
     # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
     if groups:
-        comments, misses, gaps, skipped_groups, failed_groups, pending_hunks = _run_groups(
-            groups, root, head, diff_index, static_report, started
-        )
+        outcome = _run_groups(groups, root, head, diff_index, static_report, started)
     else:
-        comments, misses, gaps, skipped_groups, failed_groups, pending_hunks = [], [], [], 0, 0, 0
-    comments = sort_comments(comments)
+        outcome = _RunResult(
+            comments=[],
+            misses=[],
+            gaps=[],
+            skipped_groups=0,
+            failed_groups=0,
+            pending_hunks=0,
+            usage=UsageTotals(),
+        )
+    comments = sort_comments(outcome.comments)
 
     stats = ReviewStats(
         base_branch=base,
@@ -901,11 +949,26 @@ def _review(base: str, head: str, path: Path | None) -> ReviewStats:
         files_count=len(reviewable),
         comments_count=len(comments),
         duration_seconds=time.monotonic() - started,
-        skipped_groups=skipped_groups,
-        pending_hunks=pending_hunks,
-        failed_groups=failed_groups,
+        skipped_groups=outcome.skipped_groups,
+        pending_hunks=outcome.pending_hunks,
+        failed_groups=outcome.failed_groups,
     )
     typer.echo("")
-    typer.echo(TerminalRenderer().render(comments, stats, misses, gaps))
+    typer.echo(TerminalRenderer().render(comments, stats, outcome.misses, outcome.gaps))
     typer.echo(f"\n审查完成：{len(comments)} 条评论")
+    if json_out is not None:
+        write_report(
+            json_out,
+            build_report(
+                base=base,
+                head=head,
+                project_root=str(root),
+                stats=stats,
+                usage=outcome.usage,
+                prices=settings.cost,
+                comments=comments,
+                misses=outcome.misses,
+                static_gaps=outcome.gaps,
+            ),
+        )
     return stats

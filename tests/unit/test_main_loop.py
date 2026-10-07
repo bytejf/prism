@@ -1393,3 +1393,39 @@ def test_budget_stop_is_logged_as_warning(
 
     assert "本组超预算（cost）" in caplog.text
     assert "预算 0.000 元 / 300 秒" in caplog.text
+
+
+def test_no_progress_reminder_reaches_a_model_that_keeps_calling_tools(
+    project_root: str,
+) -> None:
+    """「一直在调工具、从不报告」到阈值时要真的收到提醒。
+
+    这是**实测踩出来的回归**：提醒原来只写在 `review_pacing` 的「没有工具调用」
+    分支里，于是「连续 8 轮读文件、一条不报」这种最该被提醒的形态一次提醒都拿不到，
+    第 8 轮被 no_progress 直接砍掉（第一次真跑一条真实 PR 就撞上了）。
+
+    提醒现在挂在 `before_model`（工具跑完、追加人类消息合法的地方）。
+    """
+    # 每轮读不同范围：避免被去重拦下（那会让「一直在调工具」这个前提失真）
+    llm = ScriptedChatModel(
+        responses=[
+            ai_call("file_read", {"path": "a.go", "start_line": i, "end_line": i + 5}, f"c{i}")
+            for i in range(8)
+        ]
+    )
+
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    delivered = [
+        str(message.content)
+        for call in llm.calls
+        for message in call
+        if "连续" in str(message.content)
+    ]
+    assert result.exit_reason == EXIT_NO_PROGRESS, "8 轮无产出仍然按原阈值收尾"
+    assert any("你已经连续 5 轮未报告" in text for text in delivered), "第 5 轮的提醒没送到"
+    assert any("你已经连续 7 轮未报告" in text for text in delivered), "第 7 轮的提醒没送到"
+    # 每轮**只能有一条**：实测撞过「同一轮注入两条」—— 那是我改这块时补丁被应用了两次，
+    # 而两条一模一样的提醒白占 token，也让日志读起来像跑了两遍
+    sixth = [str(message.content) for message in llm.calls[5]]
+    assert sum(1 for text in sixth if "你已经连续 5 轮未报告" in text) == 1

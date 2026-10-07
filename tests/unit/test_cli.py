@@ -124,13 +124,13 @@ def test_run_groups_stops_when_review_cost_is_exceeded(
         replace(settings, review=replace(settings.review, max_review_cost=2.0)),
     )
 
-    comments, misses, gaps, skipped, _failed, _pending = main._run_groups(
+    outcome = main._run_groups(
         make_groups(4), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert ran == ["group-001", "group-002"], "第三组之前就该停"
-    assert skipped == 2
-    assert (comments, misses, gaps) == ([], [], [])
+    assert outcome.skipped_groups == 2
+    assert (outcome.comments, outcome.misses, outcome.gaps) == ([], [], [])
 
 
 def test_reflection_usage_counts_toward_the_review_budget(
@@ -152,12 +152,12 @@ def test_reflection_usage_counts_toward_the_review_budget(
         replace(settings, review=replace(settings.review, max_review_cost=1.0)),
     )
 
-    _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
+    outcome = main._run_groups(
         make_groups(4), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert ran == ["group-001"], "只有算上反思那一笔，上限才会在第一组之后就响"
-    assert skipped == 3
+    assert outcome.skipped_groups == 3
 
 
 def test_run_groups_stops_on_review_time_budget(
@@ -170,12 +170,12 @@ def test_run_groups_stops_on_review_time_budget(
         replace(settings, review=replace(settings.review, max_review_seconds=60.0)),
     )
 
-    _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
+    outcome = main._run_groups(
         make_groups(3), tmp_path, "HEAD", {}, StaticReport(), time.monotonic() - 120.0
     )
 
     assert ran == []
-    assert skipped == 3
+    assert outcome.skipped_groups == 3
 
 
 def test_run_groups_reports_total_when_nothing_was_skipped(
@@ -192,12 +192,12 @@ def test_run_groups_reports_total_when_nothing_was_skipped(
     ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=10))
 
     with caplog.at_level("INFO"):
-        _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
+        outcome = main._run_groups(
             make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
         )
 
     assert ran == ["group-001", "group-002"]
-    assert skipped == 0
+    assert outcome.skipped_groups == 0
     assert "总计" in capsys.readouterr().out
     assert "所有审查单元跑完：2/2 组" in caplog.text
 
@@ -220,12 +220,12 @@ def test_unfinished_hunks_are_counted_and_reported(
 
     monkeypatch.setattr(main, "run_review_agent", incomplete)
 
-    _comments, _misses, _gaps, skipped, _failed, pending = main._run_groups(
+    outcome = main._run_groups(
         make_groups(1), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
-    assert pending == 1
-    assert skipped == 0
+    assert outcome.pending_hunks == 1
+    assert outcome.skipped_groups == 0
     assert "未审 hunk=1" in capsys.readouterr().out
 
 
@@ -274,12 +274,12 @@ def test_concurrency_actually_runs_groups_in_parallel(
     monkeypatch.setattr(main, "run_review_agent", rendezvous)
     set_concurrency(monkeypatch, 2)
 
-    _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+    outcome = main._run_groups(
         make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert sorted(reached) == ["group-001", "group-002"]
-    assert (skipped, failed) == (0, 0)
+    assert (outcome.skipped_groups, outcome.failed_groups) == (0, 0)
 
 
 def test_concurrent_results_are_ordered_by_group(
@@ -323,12 +323,12 @@ def test_concurrent_results_are_ordered_by_group(
     monkeypatch.setattr(main, "reflect", tag)
     set_concurrency(monkeypatch, 2)
 
-    comments, *_rest = main._run_groups(
+    outcome = main._run_groups(
         make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert ran == ["group-002", "group-001"], "第 2 组确实先跑完（前提）"
-    assert [item.content for item in comments] == ["group-001", "group-002"], "汇总按组序"
+    assert [item.content for item in outcome.comments] == ["group-001", "group-002"], "汇总按组序"
 
 
 def test_concurrency_keeps_every_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,12 +337,12 @@ def test_concurrency_keeps_every_group(tmp_path: Path, monkeypatch: pytest.Monke
         ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=1))
         set_concurrency(monkeypatch, concurrency)
 
-        _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+        outcome = main._run_groups(
             make_groups(5), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
         )
 
         assert ran == [f"group-{index:03d}" for index in range(1, 6)], f"并发度 {concurrency}"
-        assert (skipped, failed) == (0, 0)
+        assert (outcome.skipped_groups, outcome.failed_groups) == (0, 0)
 
 
 def test_concurrent_budget_stops_submitting_new_groups(
@@ -362,12 +362,12 @@ def test_concurrent_budget_stops_submitting_new_groups(
         ),
     )
 
-    _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+    outcome = main._run_groups(
         make_groups(6), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert ran == ["group-001", "group-002"], "前两组已提交、不打断；第三组起不再提交"
-    assert (skipped, failed) == (4, 0)
+    assert (outcome.skipped_groups, outcome.failed_groups) == (4, 0)
 
 
 def test_one_crashed_group_does_not_kill_the_rest(
@@ -395,10 +395,10 @@ def test_one_crashed_group_does_not_kill_the_rest(
     monkeypatch.setattr(main, "run_review_agent", boom_on_second)
     set_concurrency(monkeypatch, 3)
 
-    _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+    outcome = main._run_groups(
         make_groups(3), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert ran == ["group-001", "group-002", "group-003"], "第三组照跑"
-    assert failed == 1
-    assert skipped == 0, "出错的组不能被算成「因预算没跑」"
+    assert outcome.failed_groups == 1
+    assert outcome.skipped_groups == 0, "出错的组不能被算成「因预算没跑」"

@@ -272,6 +272,10 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
                 "jump_to": "end",
             }
 
+        reminder = self._remind_no_progress(state)
+        if reminder is not None:
+            updates["messages"] = [*updates.get("messages", []), reminder]
+
         # **退出判定要在压缩之前**：这一轮就要收尾了还去压一遍历史，是白烧一次
         # 完整的摘要请求（实测踩到过 —— end_done 已经调完的那一轮仍然压了一次）
         if self._compressor is not None and self._compressor.should_compress(state["messages"]):
@@ -285,6 +289,27 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
                 ]
 
         return updates or None
+
+    def _remind_no_progress(self, state: ReviewState) -> HumanMessage | None:
+        """「一直在调工具、从不报告」到阈值时注入提醒。
+
+        判据是「上一轮**调了**工具」：纯文本那种形态由 `review_pacing` 负责
+        （那里模型刚返回、没有待执行的 tool_calls，追加不会破坏消息顺序），
+        两处各管一种，不重复发。
+
+        Args:
+            state: 当前状态
+
+        Returns:
+            要注入的提醒；不需要时 None
+        """
+        rounds = state["no_report_rounds"]
+        if rounds not in settings.review.no_progress_remind_rounds:
+            return None
+        if not _last_tool_calls(state["messages"]):
+            return None
+        logger.warning("连续 %d 轮无产出（模型一直在调工具），注入提醒", rounds)
+        return HumanMessage(content=NO_PROGRESS_REMINDER.format(rounds=rounds))
 
     def _warn_if_usage_missing(self, state: ReviewState) -> None:
         """拿不到用量时警告一次（每组一次）。
@@ -369,9 +394,16 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     }
 
     if calls:
-        # 有工具调用 → 交给框架执行工具，不干预路由
+        # 有工具调用 → 交给框架执行工具，不干预路由。
+        #
+        # **但「无产出」的提醒不能只在这里发**：这条路是「一直在调工具、从不报告」
+        # 的形态，而那恰恰是最需要提醒的一种。这里追加消息是**非法**的 ——
+        # AI 消息带 tool_calls 时，tool 结果必须紧跟其后，中间插一条人类消息
+        # 会被 API 拒。所以那一种挪到 `ReviewProgress.before_model`（工具已经跑完、
+        # 追加永远安全），见那边的 `_remind_no_progress`
         return updates
 
+    # 走到这里说明模型**一个工具都没调**（纯文本）—— 不干预的话框架会直接收尾
     if no_report in settings.review.no_progress_remind_rounds:
         logger.warning("连续 %d 轮无产出，注入提醒", no_report)
         content = NO_PROGRESS_REMINDER.format(rounds=no_report)
