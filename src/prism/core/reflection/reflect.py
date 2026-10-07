@@ -63,6 +63,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
+from opentelemetry import trace
 
 from prism.core.agent.budget import usage_of
 from prism.core.guidance import templates as tpl
@@ -77,9 +78,13 @@ from prism.models.comment import Comment
 from prism.models.cost import UsageTotals
 from prism.models.grouping import Group
 from prism.models.reflection import PotentialMiss
+from prism.observability import semconv as sc
 from prism.observability.llm_trace import ReviewTrace, fields
+from prism.observability.tracing import set_attributes
 
 logger = logging.getLogger(__name__)
+
+tracer = trace.get_tracer(__name__)
 
 # 评论在反思提示词里的编号：与 `H-01` 一套写法，只在这一次调用内有意义
 COMMENT_ID_PREFIX = "C-"
@@ -248,6 +253,10 @@ def _render_comment(comment_id: str, comment: Comment) -> str:
 def reflect(model: BaseChatModel, group: Group, comments: list[Comment]) -> ReflectionOutcome:
     """复核一组评论，去掉被 diff 推翻的那些。
 
+    外面这层只做一件事：开一个 `reflection` span 把整段复核圈住并挂属性。
+    主体在 `_reflect_once` —— 它有多个 fail-open 的提前返回，逐个去挂属性
+    不如在出口统一记。
+
     Args:
         model: 主模型
         group: 审查单元，复核只看它的 diff
@@ -255,6 +264,34 @@ def reflect(model: BaseChatModel, group: Group, comments: list[Comment]) -> Refl
 
     Returns:
         反思结果；失败时 `failure` 非空、`kept` 是原样的全部评论
+    """
+    started = time.monotonic()
+    with tracer.start_as_current_span("reflection") as span:
+        set_attributes(
+            span, {sc.PRISM_GROUP_ID: group.group_id, sc.PRISM_CANDIDATE_COUNT: len(comments)}
+        )
+        outcome = _reflect_once(model, group, comments)
+        set_attributes(
+            span,
+            {
+                sc.PRISM_REMOVED_COUNT: len(outcome.removed),
+                sc.PRISM_FAILURE: outcome.failure,
+                sc.PRISM_DURATION_MS: int((time.monotonic() - started) * 1000),
+            },
+        )
+    return outcome
+
+
+def _reflect_once(model: BaseChatModel, group: Group, comments: list[Comment]) -> ReflectionOutcome:
+    """复核的主体（见 `reflect`）。
+
+    Args:
+        model: 主模型
+        group: 审查单元
+        comments: 已定位的评论
+
+    Returns:
+        反思结果
     """
     if not comments:
         return ReflectionOutcome(kept=[])

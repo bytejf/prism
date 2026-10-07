@@ -91,6 +91,7 @@ from pathlib import Path, PurePosixPath
 from typing import Annotated
 
 import typer
+from opentelemetry import trace
 
 from prism.config.settings import settings
 from prism.core.agent.agent import run_review_agent
@@ -118,9 +119,13 @@ from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.models.reflection import PotentialMiss
 from prism.models.static import StaticFinding, StaticReport
+from prism.observability import semconv as sc
 from prism.observability.logging import setup_logging
+from prism.observability.tracing import parse_trace_attrs, set_attributes, setup_tracing
 
 logger = logging.getLogger(__name__)
+
+tracer = trace.get_tracer(__name__)
 
 app = typer.Typer(help="Prism — 确定性优先的 Go 代码审查 Agent")
 
@@ -202,6 +207,8 @@ def main(
             「只为声明 CLI 参数而存在」的形参。
     """
     setup_logging()
+    # 追踪没配就完全不初始化：OTel 默认 tracer 是 no-op，埋点处不需要分支
+    setup_tracing()
     if ctx.invoked_subcommand is None:
         logger.debug("未指定子命令：打印帮助")
         typer.echo(ctx.get_help())
@@ -799,8 +806,51 @@ def review(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
     path: RepoPath = None,
+    trace_attr: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--trace-attr",
+            help="附加到根 span 的属性（key=value，可重复）。pr_url / instance_id "
+            "这类只有调用方知道的信息由它带进来",
+        ),
+    ] = None,
 ) -> None:
-    """完整审查：diff → 过滤 → hunk 映射 → 静态分析 → 分组 → LLM 审查 → 排序 → 渲染。"""
+    """完整审查：diff → 过滤 → hunk 映射 → 静态分析 → 分组 → LLM 审查 → 排序 → 渲染。
+
+    开了追踪时（`PRISM_TRACE_FILE` / `PRISM_TRACE_DIR`）会额外写一份 OTLP JSON：
+    根 span 是这次审查，子 span 是每个审查组、每次 LLM 调用、每次工具执行。
+    """
+    try:
+        extra = parse_trace_attrs(trace_attr or [])
+    except ValueError as exc:
+        typer.echo(f"错误：{exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    with tracer.start_as_current_span("prism_review") as span:
+        set_attributes(span, {sc.PRISM_BASE_REV: base, sc.PRISM_HEAD_REV: head, **extra})
+        stats = _review(base, head, path)
+        set_attributes(
+            span,
+            {
+                sc.PRISM_SKIPPED_GROUPS: stats.skipped_groups,
+                sc.PRISM_FAILED_GROUPS: stats.failed_groups,
+                sc.PRISM_PENDING_HUNKS: stats.pending_hunks,
+                sc.PRISM_DURATION_MS: int(stats.duration_seconds * 1000),
+            },
+        )
+
+
+def _review(base: str, head: str, path: Path | None) -> ReviewStats:
+    """`prism review` 的主体（根 span 由调用方开）。
+
+    Args:
+        base: base 分支 / 版本
+        head: head 分支 / 版本
+        path: 被审查仓库路径
+
+    Returns:
+        审查统计（根 span 的属性从它取）
+    """
     started = time.monotonic()
     root = _resolve_repo(path)
     logger.info("开始审查: root=%s base=%s head=%s", root, base, head)
@@ -858,3 +908,4 @@ def review(
     typer.echo("")
     typer.echo(TerminalRenderer().render(comments, stats, misses, gaps))
     typer.echo(f"\n审查完成：{len(comments)} 条评论")
+    return stats

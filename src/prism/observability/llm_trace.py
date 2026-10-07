@@ -65,8 +65,16 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import Command
+from opentelemetry import trace
+from opentelemetry.trace import Span
+
+from prism.observability import semconv as sc
+from prism.observability.tracing import record_error, set_attributes
 
 logger = logging.getLogger(__name__)
+
+# 每模块自己的 tracer：没配 tracing 时拿到的是 no-op，埋点处不需要分支
+tracer = trace.get_tracer(__name__)
 
 # 字段为空时的占位。省略字段就看不出「确实没有」，统一打占位更清楚
 EMPTY = "（空）"
@@ -225,18 +233,56 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
         self._log_request(request)
 
         started = time.monotonic()
-        response = handler(request)
-        elapsed_ms = int((time.monotonic() - started) * 1000)
+        # LLM 调用的 span：属性用 GenAI 语义约定，Langfuse 的 OTLP 端点认得这些名字
+        with tracer.start_as_current_span("llm_call") as span:
+            try:
+                response = handler(request)
+            except Exception as error:
+                record_error(span, error)
+                raise
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            set_attributes(span, {sc.PRISM_DURATION_MS: elapsed_ms})
 
-        round_no = self._round_no + 1
-        for message in response.result:
-            if isinstance(message, AIMessage):
-                self._log_response(message, round_no=round_no, elapsed_ms=elapsed_ms)
-                self._round_no = round_no
-                usage = message.usage_metadata
-                # 记下来给下一轮算环比增量
-                self._prev_input_tokens = usage.get("input_tokens") if usage else None
+            round_no = self._round_no + 1
+            for message in response.result:
+                if isinstance(message, AIMessage):
+                    self._log_response(message, round_no=round_no, elapsed_ms=elapsed_ms)
+                    self._round_no = round_no
+                    self._trace_usage(span, message)
+                    usage = message.usage_metadata
+                    # 记下来给下一轮算环比增量
+                    self._prev_input_tokens = usage.get("input_tokens") if usage else None
         return response
+
+    @staticmethod
+    def _trace_usage(span: Span, message: AIMessage) -> None:
+        """把一条响应里的用量与结束原因挂到 span 上。
+
+        用 GenAI 语义约定（不是我们自己的名字）：Langfuse 的 OTLP 端点靠它们
+        构建 LLM 视图，换成自定义名字就白记了。
+
+        Args:
+            span: llm_call span
+            message: 模型响应
+        """
+        usage = message.usage_metadata
+        if usage:
+            details = usage.get("input_token_details") or {}
+            out_details = usage.get("output_token_details") or {}
+            set_attributes(
+                span,
+                {
+                    sc.GEN_AI_USAGE_INPUT_TOKENS: usage.get("input_tokens"),
+                    sc.GEN_AI_USAGE_OUTPUT_TOKENS: usage.get("output_tokens"),
+                    sc.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS: details.get("cache_read"),
+                    sc.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS: details.get("cache_creation"),
+                    # 思考 token 也算输出，但它是成本里最贵的一块，单独记一笔
+                    sc.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS: out_details.get("reasoning"),
+                },
+            )
+        finish = message.response_metadata.get("finish_reason")
+        if finish:
+            span.set_attribute(sc.GEN_AI_RESPONSE_FINISH_REASONS, str(finish))
 
     def wrap_tool_call(
         self,
@@ -253,8 +299,32 @@ class ReviewTrace(AgentMiddleware[Any, Any, Any]):
             工具的返回（原样透传）
         """
         started = time.monotonic()
-        result = handler(request)
-        elapsed_ms = int((time.monotonic() - started) * 1000)
+        with tracer.start_as_current_span("tool_call") as span:
+            name = str(request.tool_call["name"])
+            set_attributes(
+                span,
+                {
+                    sc.PRISM_TOOL_NAME: name,
+                    # 参数按 JSON 存：模型给的参数是结构化数据，拼成字符串以后没法查
+                    sc.PRISM_TOOL_ARGUMENTS: json.dumps(
+                        request.tool_call.get("args") or {}, ensure_ascii=False
+                    ),
+                },
+            )
+            try:
+                result = handler(request)
+            except Exception as error:
+                record_error(span, error)
+                raise
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            sizes = [len(str(message.content)) for message in _tool_messages(result)]
+            set_attributes(
+                span,
+                {
+                    sc.PRISM_DURATION_MS: elapsed_ms,
+                    sc.PRISM_RESULT_SIZE: sum(sizes) if sizes else 0,
+                },
+            )
 
         for message in _tool_messages(result):
             logger.info(

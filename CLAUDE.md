@@ -480,6 +480,28 @@ dataclass 字段推出来，不另写键名清单 —— 否则又多一处会�
   不强制回传**，所以那是防御性的，不是修一个正在发生的 bug
 - model / base_url 在 `config/default.toml` 的 `[llm]`，只有 api_key 从环境变量读
 
+## 可观测性（改 `observability/tracing.py` 前必读）
+
+**两套并行、互不干扰**：日志是给人读的摘要（`PRISM_LOG_LEVEL`），trace 是给程序读的
+结构化过程（每个 LLM 调用、每次工具执行）。trace 用 OTel 写标准 OTLP JSON
+（JSONL），`FileSpanExporter` 是官方实现。
+
+- **不设环境变量就完全不初始化**：OTel 默认 tracer 是 no-op，业务代码里那些
+  `with tracer.start_as_current_span(...)` 照常写，不用 `if tracing_enabled` 分支。
+  两个开关：`PRISM_TRACE_FILE`（精确到文件，bench 驱动用）/ `PRISM_TRACE_DIR`（自动命名）
+- **属性名走 `observability/semconv.py`**：LLM 那几个用 GenAI 语义约定
+  （`gen_ai.usage.input_tokens` 等，Langfuse 的 OTLP 端点认这些名字），其余挂
+  `prism.` 前缀。**写字面量、不 import semconv 包** —— 那批属性还在 `_incubating`
+  命名空间，路径在版本间挪过；`test_genai_attribute_names_match_semconv` 是漂移守卫
+- **写出来的行是 OTLP 导出批次，不是单条 span**：
+  `{"resourceSpans":[{"scopeSpans":[{"spans":[…]}]}]}`，时间字段是
+  `startTimeUnixNano`/`endTimeUnixNano`，父子关系靠子 span 的 `parentSpanId`
+- **五类 span**：`prism_review`（根）→ `group_review`（每个组，包住审查循环）与
+  `reflection`（反思）与 `static_analysis`（在分组**之前**跑，所以只能挂在根上）；
+  `group_review` 底下是 `llm_call` / `tool_call`
+- `exit_reason` / `pending_hunks` 挂在 **`group_review`** 上而不是根 span：一次审查
+  有多个组，根本身没有单一的退出原因（设计文档把它们画在根上，多组时不成立）
+
 ## 日志
 
 两个模块分工明确：`observability/logging.py` 只管**怎么渲染**（`PrismHandler`），
@@ -577,6 +599,7 @@ github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`，实测装在
 | `03-添加工具和调用图/` | 15 | 16（跨组工具实现反馈）、17（**框架缺口清单**，台账） |
 | `04-添加静态审查/` | 18 | 19（静态分析实现反馈，含 golangci-lint v1→v2 的坑） |
 | `05-预算与止损/` | —— | 20（**审查约束清单**：五类闸的作用与 trade-off，含摘掉 max_rounds 的理由） |
+| `06-可观测性/` | 21 | 22（OTel 埋点实现反馈：OTLP JSONL 的真实形状、属性名漂移守卫） |
 
 - **设计文档冻结、永不回头改**；实现与它不符时**记进反馈文档**
   （唯一例外：反馈文档里写明「这条必须回改设计文档」的，如 13 号 §六 E1）

@@ -34,6 +34,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from opentelemetry import trace
+
 from prism.config.settings import settings
 from prism.models.ast import HunkWithSymbol
 from prism.models.static import (
@@ -45,8 +47,12 @@ from prism.models.static import (
     StaticFinding,
     StaticReport,
 )
+from prism.observability import semconv as sc
+from prism.observability.tracing import set_attributes
 
 logger = logging.getLogger(__name__)
+
+tracer = trace.get_tracer(__name__)
 
 GOLANGCI_LINT_BIN = "golangci-lint"
 
@@ -110,6 +116,35 @@ def analyze(
     Returns:
         StaticReport。任何一步失败都返回带 skip_reason 的空报告，不抛异常
     """
+    with tracer.start_as_current_span("static_analysis") as span:
+        report = _analyze(span, root, head_rev, reviewable, hunks)
+        set_attributes(
+            span,
+            {
+                sc.PRISM_FINDING_COUNT: len(report.findings),
+                sc.PRISM_RAW_FINDING_COUNT: report.raw_count,
+                sc.PRISM_SKIP_REASON: report.skip_reason,
+                sc.PRISM_DURATION_MS: int(report.elapsed_seconds * 1000),
+            },
+        )
+    return report
+
+
+def _analyze(
+    span: Any, root: Path, head_rev: str, reviewable: Sequence[str], hunks: Sequence[HunkWithSymbol]
+) -> StaticReport:
+    """跑一次静态分析（span 里那一段）。
+
+    Args:
+        span: 当前 span（用来记每个 linter 的条数）
+        root: 被审查仓库的根目录
+        head_rev: 被审查的版本
+        reviewable: 可审查文件的路径
+        hunks: 带归属符号的 hunk 列表
+
+    Returns:
+        StaticReport
+    """
     if not reviewable:
         logger.debug("静态分析跳过：没有可审查文件")
         return StaticReport()
@@ -123,6 +158,9 @@ def analyze(
         return StaticReport(skip_reason=str(exc))
 
     ordered = _order_and_number(_associate(findings, hunks))
+    # 每个 linter 一条属性（`prism.linter.<名字>`）：报告里要能直接看出哪一类问题多
+    for name, count in _counts_by_linter(ordered).items():
+        span.set_attribute(f"{sc.PRISM_LINTER_COUNT}.{name}", count)
     counts = _count_by_linter(ordered)
     # 两个数都要报：只看「可用发现」的话，「全被过滤掉了」与「工具没发现问题」
     # 长得一模一样
@@ -480,8 +518,23 @@ def _order_and_number(findings: Sequence[StaticFinding]) -> list[StaticFinding]:
     ]
 
 
+def _counts_by_linter(findings: Sequence[StaticFinding]) -> dict[str, int]:
+    """统计各 linter 的条数。
+
+    Args:
+        findings: 发现列表
+
+    Returns:
+        linter 名 → 条数
+    """
+    counts: dict[str, int] = {}
+    for item in findings:
+        counts[item.linter] = counts.get(item.linter, 0) + 1
+    return counts
+
+
 def _count_by_linter(findings: Sequence[StaticFinding]) -> str:
-    """统计各 linter 的条数，拼成日志用的一句话。
+    """把各 linter 的条数拼成日志用的一句话。
 
     Args:
         findings: 发现列表
@@ -489,7 +542,6 @@ def _count_by_linter(findings: Sequence[StaticFinding]) -> str:
     Returns:
         形如 ``gosec 3 / errcheck 2``；空列表时返回空串
     """
-    counts: dict[str, int] = {}
-    for item in findings:
-        counts[item.linter] = counts.get(item.linter, 0) + 1
-    return " / ".join(f"{name} {count}" for name, count in sorted(counts.items()))
+    return " / ".join(
+        f"{name} {count}" for name, count in sorted(_counts_by_linter(findings).items())
+    )

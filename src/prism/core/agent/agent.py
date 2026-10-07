@@ -25,6 +25,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
+from opentelemetry import trace
 
 from prism.config.settings import settings
 from prism.core.agent.budget import describe
@@ -49,6 +50,7 @@ from prism.core.agent.state import (
 from prism.core.grouping.packages import package_label
 from prism.core.guidance import templates as tpl
 from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
+from prism.core.guidance.tokens import estimate_tokens
 from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
@@ -59,9 +61,14 @@ from prism.models.cost import UsageTotals
 from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.models.static import StaticFinding
+from prism.observability import semconv as sc
 from prism.observability.llm_trace import ReviewTrace
+from prism.observability.tracing import set_attributes
 
 logger = logging.getLogger(__name__)
+
+# 每模块自己的 tracer：没配 tracing 时是 no-op，埋点处不需要分支判断
+tracer = trace.get_tracer(__name__)
 
 
 def build_tools() -> list[BaseTool]:
@@ -230,7 +237,26 @@ def run_review_agent(
     started = time.monotonic()
     agent = build_review_agent(model, compression or settings.compression)
     initial = initial_state(group, static_findings)
-    final, crashed = _run_graph(agent, initial, group, project_root, head_rev, diff_index or {})
+    with tracer.start_as_current_span("group_review") as span:
+        set_attributes(
+            span,
+            {
+                sc.PRISM_GROUP_ID: group.group_id,
+                sc.PRISM_PACKAGE_LABEL: package_label(group),
+                sc.PRISM_HUNK_COUNT: len(group.hunks),
+                # 起手提示词的实际大小（不是估算模型：量的是真渲染出来的那份文本）
+                sc.PRISM_TOKEN_ESTIMATE: estimate_tokens(str(initial["messages"][0].content)),
+            },
+        )
+        final, crashed = _run_graph(agent, initial, group, project_root, head_rev, diff_index or {})
+        set_attributes(
+            span,
+            {
+                sc.PRISM_EXIT_REASON: crashed or exit_reason_of(final),
+                sc.PRISM_ROUND_COUNT: final["round_count"],
+                sc.PRISM_PENDING_HUNKS: len(pending_ids(final["hunk_status"])),
+            },
+        )
 
     if crashed is None:
         exit_reason = exit_reason_of(final)
