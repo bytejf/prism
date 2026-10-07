@@ -397,8 +397,17 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
   「**默认答案是全部保留**」，「不算删除依据」那段是防过度删除的正面清单 ——
   两段都别删
 
-验证这条链路用 `tests/manual/calibrate_reflection.py`（手动跑，不是断言套件）：
-真实 diff + 混进去的假评论，量「该删的删没删、不该删的动没动」。**改提示词必跑。**
+验证这条链路有两个手动脚本（都不是断言套件），**改提示词必跑**：
+
+- `tests/manual/calibrate_reflection.py` —— 真实 diff + 混进去的**假**评论，量「该删的删没删、
+  不该删的动没动」（快，自己造数据）
+- `tests/manual/calibrate_reflection_bench.py` —— 用 **AACR-Bench 的真实标注**标定：
+  1505 条专家验证正确 + 640 条低质，按 PR 分组、评论跟着它所在的审查单元送进复核。
+  实测 Go 全量（22 PR / 245 行）：**误删 1.4%（2/140）、拦截 ~5%（3~4/61）**——
+  拦截率偏低是**设计使然**（我们只删「被 diff 直接推翻」的，数据集问的是「值不值得提」）；
+  误删那 2 条**两次运行完全相同且依据都是 Ground B**（可复现），其中一例暴露了
+  「措辞不精确但关切成立」会被 B 条误删（详见文档 23 号 §七点半）
+  跑法：`PRISM_BENCH_DATASET=/tmp/aacr.json uv run pytest tests/manual/calibrate_reflection_bench.py -s`
 
 ## 框架缺口（LangChain v1，都有实测依据）
 
