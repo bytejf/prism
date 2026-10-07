@@ -85,7 +85,7 @@ diff → 过滤 → hunk 归属符号 → 静态分析 → 分组+装箱   ← �
 |---|---|---|---|
 | `no_progress_exit_rounds = 8` | 转圈不干活（连续 8 轮没有 report_hunks） | `review_pacing` | `no_progress` |
 | 单组钱 / 时间（2 元 / 300 秒） | 一组跑飞 | `ReviewProgress.before_model` | `budget_cost` / `budget_time` |
-| 整条钱 / 时间（10 元 / 20 分钟） | 组数太多或前几组太贵 | `_run_groups` 的循环 | （停剩下的组） |
+| 整条钱 / 时间（10 元 / 20 分钟） | 组数太多或前几组太贵 | `_run_groups` 的调度 | （停剩下的组） |
 | 工具失败（连续 3 提醒 / 累计 5 退出） | 把预算烧在一直失败的调用上 | `ToolFailureBudget` | `tool_failures` |
 | `max_super_steps = 1400` | 图失控（**不该发生**） | `recursion_limit` | `recursion` |
 
@@ -110,6 +110,12 @@ diff → 过滤 → hunk 归属符号 → 静态分析 → 分组+装箱   ← �
 - **`stop_reason` 是单键、先写者胜**：同一轮有两个停手时，原因由中间件列表的顺序
   定（预算排在前）
 
+**并发（`[review].concurrency`，1..8，默认 1）与预算的关系**：并发决定「同时跑几组」，
+不改变「怎么汇总」。超预算时**已经在跑的那几组不打断**（打断会丢掉它们已审出的
+评论），只是不再提交新的 —— 所以并发度决定「超预算时多花了多少」，最坏多跑
+`concurrency - 1` 组。取值越界**硬报错**（不夹到边界：写了 16 跑出 8 还都不报错，
+正是本项目最不能忍的那类）。
+
 **为什么可以不要轮数上限**：实测小组 4/30 轮、大组 12/250 轮，余量 7~20 倍；
 换成预算后单组 2 元 ≈ 70~150 轮、300 秒 ≈ 50 轮，都比它紧。它原来的三个职责
 （转圈、慢烧、图失控）分别由 no_progress、预算、`recursion_limit` 接管。
@@ -117,6 +123,28 @@ diff → 过滤 → hunk 归属符号 → 静态分析 → 分组+装箱   ← �
 `recursion_limit` 取**绝对数**而不是「轮数 × 倍数」：实测 6.1 步/轮，乘出来的余量
 只有 15%，框架或我们多加一个钩子就会让它反过来先响 —— 而它响是我们的 bug，
 所以它只记 ERROR + 带缺口退出，绝不抛异常穿出去（用 `stream` 保住中途状态）。
+
+## 多组并发（改 `cli/main.py` 的 `_dispatch*` 前必读）
+
+`[review].concurrency` > 1 时用 `ThreadPoolExecutor`（**线程不是进程**：这活几乎全是
+等待 —— HTTP 与 git 子进程，GIL 在等待时释放），组级工作走同一个 `_run_one_group`，
+串行只是它的一个特例。两条不能动的：
+
+- **汇总一律按组序号排序**（`_GroupOutcome.index`）：并发跑完的顺序不确定，输出
+  顺序不能跟着它变。进度行按完成顺序打（带 `group-00N` 前缀），报告按序号
+- **`typer.echo` 只在调度线程里调**：`_run_one_group` 里一个字都不打 —— 否则并发时
+  多线程会把终端写花
+
+并发安全的前提是**每组自己造自己的东西**，别退回去共享：
+
+- 模型实例可以共享（`ReasoningEchoChatDeepSeek` 的改写是纯函数式的：只读 `self`
+  与入参，不改状态；httpx 客户端本身线程安全）
+- **中间件实例必须是每组一份**（框架缺口 S4）。`build_review_agent` 每组调一次，
+  所以 `ReviewTrace` / `ReviewProgress` / `ToolFailureBudget` 天然隔离 ——
+  这正是它们当初写成类式而不是模块级装饰器的原因
+- **`ReviewContext` 每组一份**：它内部缓存 `pygit2.Repository`，而 libgit2 的对象
+  不跨线程共享。别把 ReviewContext 提到 `_run_groups` 层面去复用
+- 模块级无状态的（`review_pacing` / `tool_call_dedup`）可以共享
 
 ## 状态与并发（最容易踩的一块）
 

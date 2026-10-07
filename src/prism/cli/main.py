@@ -79,7 +79,10 @@
 
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from functools import partial
 from importlib.metadata import version
 from itertools import groupby
 from pathlib import Path, PurePosixPath
@@ -108,7 +111,7 @@ from prism.core.static.analyzer import analyze, format_finding, select_for_group
 from prism.core.static.verify import verify_group
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import LOCATE_FAILED, Comment, ReviewStats
-from prism.models.cost import UsageTotals
+from prism.models.cost import CostConfig, UsageTotals
 from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.models.reflection import PotentialMiss
@@ -434,6 +437,139 @@ def _llm_or_exit() -> LLMClient:
         raise typer.Exit(code=1) from exc
 
 
+@dataclass(frozen=True)
+class _GroupOutcome:
+    """一个审查单元跑完之后交回给调度方的全部结果。
+
+    做成一个值对象是为了让**串行与并发用同一条实现**：单组怎么跑（定位 → 反思 →
+    校验）只有一份代码，调度方只决定「怎么调用它、什么时候打印」。这样
+    `concurrency = 1` 与并发在行为上的差别就只剩「谁先跑完」。
+
+    Attributes:
+        index: 组在列表里的序号（从 1 起）。**汇总时按它排序** —— 并发跑完的顺序
+            是不确定的，输出顺序不能跟着它变
+        group_id: 审查单元编号
+        comments: 本组保留的评论
+        misses: 疑似漏报信号
+        gaps: 没被引用的高优先级静态发现
+        usage: 本组用量（审查循环 + 反思）
+        exit_reason: 退出原因
+        round_count: 实际轮次
+        unlocated: 未定位评论数
+        removed: 被反思删掉的评论数
+        injected: 注入本组的静态发现数
+        referenced: 被引用的静态发现数
+        pending_hunks: 没审完的 hunk 数
+    """
+
+    index: int
+    group_id: str
+    comments: list[Comment]
+    misses: list[PotentialMiss]
+    gaps: list[StaticFinding]
+    usage: UsageTotals
+    exit_reason: str
+    round_count: int
+    unlocated: int
+    removed: int
+    injected: int
+    referenced: int
+    pending_hunks: int
+
+
+def _run_one_group(
+    index: int,
+    item: Group,
+    llm: LLMClient,
+    project_root: Path,
+    head_rev: str,
+    diff_index: Mapping[str, Diff],
+    static_report: StaticReport,
+) -> _GroupOutcome:
+    """跑一个审查单元：审查 → 定位 → 反思 → 后置校验。
+
+    **这是串行与并发共用的那一份实现**，里面不打印任何东西（打印归调度方，
+    否则并发时多线程会交错着写终端）。
+
+    Args:
+        index: 组在列表里的序号（从 1 起）
+        item: 审查单元
+        llm: LLM 客户端
+        project_root: 项目根目录
+        head_rev: 被审查的版本
+        diff_index: `路径 → Diff` 索引（**全量**，组内组外都有）
+        static_report: 静态分析结果
+
+    Returns:
+        本组的全部结果
+    """
+    # 挑选不做二次裁剪：**预算在分组那一步就执行完了**（装不下的 hunk 顺延到
+    # 下一组），这里再裁一次只会让「注入的」与「算过成本的」变成两批东西
+    injected = select_for_group(item.files, static_report.findings)
+    # 压缩配置直接用 settings 里那一份：它的 context_window 已经是从 [llm] 拼过来的
+    result = run_review_agent(
+        item,
+        llm.model,
+        str(project_root),
+        head_rev,
+        settings.compression,
+        diff_index,
+        injected,
+    )
+    located = locate_group(item, result.hunk_comments)
+    outcome = reflect(llm.model, item, located)
+    verdict = verify_group(injected, outcome.kept)
+    return _GroupOutcome(
+        index=index,
+        group_id=result.group_id,
+        comments=list(outcome.kept),
+        misses=list(outcome.misses),
+        gaps=list(verdict.unhandled_high),
+        # 反思的用量也要进总账：组级闸看不到它（那时循环已经结束了），而它每组一次
+        usage=add_usage(result.usage, outcome.usage),
+        exit_reason=result.exit_reason,
+        round_count=result.round_count,
+        # 未定位数是**定位**这一步的统计，与反思删掉了几条无关，所以按定位结果算
+        unlocated=sum(1 for comment in located if comment.locate_level == LOCATE_FAILED),
+        removed=len(outcome.removed),
+        injected=len(injected),
+        referenced=len(verdict.referenced),
+        pending_hunks=len(result.pending_hunk_ids),
+    )
+
+
+def _echo_group(item: Group, index: int) -> None:
+    """打印「开始跑这一组」。
+
+    Args:
+        item: 审查单元
+        index: 组序号（从 1 起）
+    """
+    typer.echo(
+        f"Processing Group {index}: {package_label(item)} "
+        f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
+    )
+
+
+def _echo_outcome(found: _GroupOutcome, costs: CostConfig) -> None:
+    """打印一组的产出与花费。
+
+    没审完的 hunk 必须报：不报的话「0 条评论」看起来就像「这段代码很干净」。
+
+    Args:
+        found: 本组结果
+        costs: 价格表
+    """
+    static_note = f", 静态发现={found.injected}(引用{found.referenced})" if found.injected else ""
+    gap_note = f", ⚠️ 未审 hunk={found.pending_hunks}" if found.pending_hunks else ""
+    typer.echo(
+        f"  {found.group_id} completed: {_plural(len(found.comments), 'comment')} "
+        f"(exit_reason={found.exit_reason}, 轮次={found.round_count}, "
+        f"未定位={found.unlocated}, 反思删除={found.removed}{static_note}{gap_note})"
+    )
+    typer.echo(f"    本组 {describe(found.usage, costs)}")
+
+
 def _run_groups(
     groups: list[Group],
     project_root: Path,
@@ -441,21 +577,22 @@ def _run_groups(
     diff_index: Mapping[str, Diff],
     static_report: StaticReport,
     started: float,
-) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding], int, int]:
-    """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位与反思。
+) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding], int, int, int]:
+    """跑完所有审查单元，每组跑完立刻定位与反思。
 
-    定位与反思都放在循环体里而不是等所有组跑完：设计文档的节奏就是
-    「每组审查完成 → 定位 → 反思」，而且反思是**每组一次 LLM 调用**，
-    它要的素材（本组 diff + 本组评论 + 定位元数据）只有在这里才齐。
+    定位与反思都放在单组里而不是等所有组跑完：设计文档的节奏就是「每组审查完成
+    → 定位 → 反思」，而反思是**每组一次 LLM 调用**，它要的素材（本组 diff +
+    本组评论 + 定位元数据）只有在那里才齐。
 
-    **每组只用一次模型调用完成复核**（不是每个文件一次），失败时原样保留
-    全部评论 —— 见 `core/reflection/reflect.py`。
-
-    静态发现的**挑选在这里做一次**（挑本组文件），注入与后置校验共用同一份结果。
+    **并发是「同时开几组」，不是「怎么汇总」**：`[review].concurrency`（1..8，
+    默认 1 即串行）决定同时在跑几组，汇总一律**按组序号**排序 —— 并发跑完的顺序
+    不确定，输出顺序不能跟着它变。串行与并发走的是同一个 `_run_one_group`，
+    差别只在调度：`concurrency = 1` 时是普通循环，一点线程开销都没有。
 
     **全局预算在这里执行**：每开一组之前先看总账（钱 + 时间），超了就停掉剩下的组。
-    组级预算管的是「一组跑飞」，全局预算管的是「组数太多或前面几组太贵」—— 两层
-    各管各的，缺一层就有一头漏。
+    并发下这条的语义要说清：**已经在跑的那几组不打断**（打断会丢掉它们已经审出的
+    评论），只是**不再提交新的组**。所以并发度会决定「超预算时多花了多少」——
+    最坏是多跑 `concurrency - 1` 组。
 
     Args:
         groups: 审查单元列表
@@ -469,83 +606,187 @@ def _run_groups(
 
     Returns:
         (保留的评论, 疑似漏报信号, 未被引用的高优先级静态发现,
-        因预算未跑的组数, 没审完的 hunk 数)。
+        因预算未跑的组数, 异常退出的组数, 没审完的 hunk 数)。
         评论含未定位的那些（带 locate_level 标记）
     """
     llm = _llm_or_exit()
+    concurrency = settings.review.concurrency
+    if concurrency > 1:
+        logger.info("并发审查：同时最多 %d 组", concurrency)
+    outcomes, failed = _dispatch(
+        groups, llm, project_root, head_rev, diff_index, static_report, started
+    )
+
     comments: list[Comment] = []
     misses: list[PotentialMiss] = []
     gaps: list[StaticFinding] = []
     total = UsageTotals()
-    skipped = 0
     pending_hunks = 0
-    for index, item in enumerate(groups, start=1):
-        # 开新组之前先看总账：超了就停掉剩下的组（**不是**只停这一组 ——
-        # 全局闸的意思就是「整条别再花下去了」）
-        stop = exceeded(
-            total,
-            time.monotonic() - started,
-            prices=settings.cost,
-            max_cost=settings.review.max_review_cost,
-            max_seconds=settings.review.max_review_seconds,
-        )
-        if stop is not None:
-            skipped = len(groups) - index + 1
-            logger.warning("整条 review 超预算（%s），停掉剩余 %d 组", stop, skipped)
-            typer.echo(
-                f"⚠️ 整条 review 超预算（{stop}）：累计 {describe(total, settings.cost)}，"
-                f"已用 {time.monotonic() - started:.0f} 秒 —— 剩余 {skipped} 组不再审查"
-            )
-            break
-
-        typer.echo(
-            f"Processing Group {index}: {package_label(item)} "
-            f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
-        )
-        # 挑选不做二次裁剪：**预算在分组那一步就执行完了**（装不下的 hunk 顺延到
-        # 下一组），这里再裁一次只会让「注入的」与「算过成本的」变成两批东西
-        injected = select_for_group(item.files, static_report.findings)
-        # 压缩配置直接用 settings 里那一份：它的 context_window 已经是从
-        # [llm] 拼过来的，这里不再自己算一遍
-        result = run_review_agent(
-            item,
-            llm.model,
-            str(project_root),
-            head_rev,
-            settings.compression,
-            diff_index,
-            injected,
-        )
-        located = locate_group(item, result.hunk_comments)
-        outcome = reflect(llm.model, item, located)
-        # 反思的用量也要进总账：组级闸看不到它（那时循环已经结束了），而它每组一次
-        group_usage = add_usage(result.usage, outcome.usage)
-        total = add_usage(total, group_usage)
-        comments.extend(outcome.kept)
-        misses.extend(outcome.misses)
-        pending_hunks += len(result.pending_hunk_ids)
-        verdict = verify_group(injected, outcome.kept)
-        gaps.extend(verdict.unhandled_high)
-        # 未定位数是**定位**这一步的统计，与反思删掉了几条无关，所以按
-        # 定位结果算
-        unlocated = sum(1 for comment in located if comment.locate_level == LOCATE_FAILED)
-        static_note = (
-            f", 静态发现={len(injected)}(引用{len(verdict.referenced)})" if injected else ""
-        )
-        # 没审完的 hunk 必须报：不报的话「0 条评论」看起来就像「这段代码很干净」
-        gap_note = (
-            f", ⚠️ 未审 hunk={len(result.pending_hunk_ids)}" if result.pending_hunk_ids else ""
-        )
-        typer.echo(
-            f"  {result.group_id} completed: {_plural(len(outcome.kept), 'comment')} "
-            f"(exit_reason={result.exit_reason}, 轮次={result.round_count}, "
-            f"未定位={unlocated}, 反思删除={len(outcome.removed)}"
-            f"{static_note}{gap_note})"
-        )
-        typer.echo(f"    本组 {describe(group_usage, settings.cost)}")
-    if not skipped:
+    for found in outcomes:
+        comments.extend(found.comments)
+        misses.extend(found.misses)
+        gaps.extend(found.gaps)
+        total = add_usage(total, found.usage)
+        pending_hunks += found.pending_hunks
+    skipped = len(groups) - len(outcomes) - failed
+    if not skipped and not failed:
         typer.echo(f"总计 {describe(total, settings.cost)}")
-    return comments, misses, gaps, skipped, pending_hunks
+    return comments, misses, gaps, skipped, failed, pending_hunks
+
+
+def _dispatch(
+    groups: list[Group],
+    llm: LLMClient,
+    project_root: Path,
+    head_rev: str,
+    diff_index: Mapping[str, Diff],
+    static_report: StaticReport,
+    started: float,
+) -> tuple[list[_GroupOutcome], int]:
+    """按并发度把组跑完，**按组序号**返回结果。
+
+    串行（`concurrency = 1`）走普通循环：不建线程池、不碰锁 —— 默认路径上一点
+    额外开销都不该有。并发走 `ThreadPoolExecutor`：**线程而不是进程**，因为这活
+    几乎全是等待（HTTP 调用 + git 子进程），GIL 在等待时会释放。
+
+    Args:
+        groups: 审查单元列表
+        llm: LLM 客户端
+        project_root: 项目根目录
+        head_rev: 被审查的版本
+        diff_index: `路径 → Diff` 索引
+        static_report: 静态分析结果
+        started: 整条命令的开始时刻
+
+    Returns:
+        (跑过的组的结果（按序号升序）, 异常退出的组数)。
+        **因预算没跑的**组两个都不在里面 —— 它由调用方按「组数 − 跑过 − 失败」算
+    """
+    concurrency = settings.review.concurrency
+    work = partial(
+        _run_one_group,
+        llm=llm,
+        project_root=project_root,
+        head_rev=head_rev,
+        diff_index=diff_index,
+        static_report=static_report,
+    )
+    if concurrency <= 1:
+        results: list[_GroupOutcome] = []
+        for index, item in enumerate(groups, start=1):
+            if _review_budget_stop(results, started, remaining=len(groups) - index + 1):
+                break
+            _echo_group(item, index)
+            found = work(index, item)
+            results.append(found)
+            _echo_outcome(found, settings.cost)
+        return results, 0
+
+    return _dispatch_concurrent(groups, work, started, concurrency)
+
+
+def _dispatch_concurrent(
+    groups: list[Group],
+    work: Callable[..., _GroupOutcome],
+    started: float,
+    concurrency: int,
+) -> tuple[list[_GroupOutcome], int]:
+    """并发跑组：池子填满就等，跑完一组先看总账、再决定要不要补下一组。
+
+    **预算每次提交前都查**（不是只在池子空了才查）：只在池子空时查的写法，会在
+    池子里一直有活的时候无限续提交 —— 那等于闸门不生效。
+
+    Args:
+        groups: 审查单元列表
+        work: 跑一组的函数
+        started: 整条命令的开始时刻
+        concurrency: 并发度
+
+    Returns:
+        (跑过的组的结果（按序号升序）, 异常退出的组数)
+    """
+    finished: list[_GroupOutcome] = []
+    failed = 0
+    stopped = False
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        running: dict[Future[_GroupOutcome], int] = {}
+        next_index = 1
+        while next_index <= len(groups) or running:
+            while not stopped and next_index <= len(groups) and len(running) < concurrency:
+                if _review_budget_stop(finished, started, remaining=len(groups) - next_index + 1):
+                    stopped = True
+                    break
+                item = groups[next_index - 1]
+                _echo_group(item, next_index)
+                running[pool.submit(work, next_index, item)] = next_index
+                next_index += 1
+            if not running:
+                break
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                del running[future]
+                found = _result_or_none(future)
+                if found is None:
+                    failed += 1
+                    continue
+                finished.append(found)
+                _echo_outcome(found, settings.cost)
+    finished.sort(key=lambda item: item.index)
+    return finished, failed
+
+
+def _result_or_none(future: Future[_GroupOutcome]) -> _GroupOutcome | None:
+    """取一个已完成的 future 的结果，异常时记 ERROR 并放弃这一组。
+
+    单组内部的异常已经在 `_run_graph` 与 `reflect` 里各自收口过；能漏到这里的
+    是编排层自己的错（比如定位/校验那一步）。**收口但不吞**：ERROR + 完整堆栈，
+    然后继续跑别的组 —— 一组出问题不该让整条 review 归零。
+
+    Args:
+        future: 已完成的 future
+
+    Returns:
+        结果；出异常时返回 None
+    """
+    try:
+        return future.result()
+    except Exception as exc:
+        logger.error("某一组异常退出，跳过它的结果：%s", exc, exc_info=exc)
+        return None
+
+
+def _review_budget_stop(finished: Sequence[_GroupOutcome], started: float, remaining: int) -> bool:
+    """整条 review 的预算闸：超了就打印一句并返回 True。
+
+    只统计**已经跑完**的组：并发下正在跑的那几组拦不住（打断它们会丢掉已经审出的
+    评论），所以这里决定的是「还要不要再开新的」。
+
+    Args:
+        finished: 已跑完的组
+        started: 整条命令的开始时刻
+        remaining: 还没提交的组数（打印给人看）
+
+    Returns:
+        该停时返回 True
+    """
+    total = UsageTotals()
+    for found in finished:
+        total = add_usage(total, found.usage)
+    stop = exceeded(
+        total,
+        time.monotonic() - started,
+        prices=settings.cost,
+        max_cost=settings.review.max_review_cost,
+        max_seconds=settings.review.max_review_seconds,
+    )
+    if stop is None:
+        return False
+    logger.warning("整条 review 超预算（%s），不再开新的组", stop)
+    typer.echo(
+        f"⚠️ 整条 review 超预算（{stop}）：累计 {describe(total, settings.cost)}，"
+        f"已用 {time.monotonic() - started:.0f} 秒 —— 剩余 {remaining} 组不再审查"
+    )
+    return True
 
 
 @app.command()
@@ -592,11 +833,11 @@ def review(
 
     # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
     if groups:
-        comments, misses, gaps, skipped_groups, pending_hunks = _run_groups(
+        comments, misses, gaps, skipped_groups, failed_groups, pending_hunks = _run_groups(
             groups, root, head, diff_index, static_report, started
         )
     else:
-        comments, misses, gaps, skipped_groups, pending_hunks = [], [], [], 0, 0
+        comments, misses, gaps, skipped_groups, failed_groups, pending_hunks = [], [], [], 0, 0, 0
     comments = sort_comments(comments)
 
     stats = ReviewStats(
@@ -607,6 +848,7 @@ def review(
         duration_seconds=time.monotonic() - started,
         skipped_groups=skipped_groups,
         pending_hunks=pending_hunks,
+        failed_groups=failed_groups,
     )
     typer.echo("")
     typer.echo(TerminalRenderer().render(comments, stats, misses, gaps))

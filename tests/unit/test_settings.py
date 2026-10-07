@@ -262,3 +262,31 @@ def test_error_message_names_the_file(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match=r"config\.toml"):
         load(bad)
+
+
+# ---------- 有取值范围的键 ----------
+
+
+def test_concurrency_default_is_serial() -> None:
+    """并发度默认 1（串行）—— 默认路径上不该有线程。"""
+    assert settings.review.concurrency == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "9", "16"])
+def test_concurrency_out_of_range_is_a_hard_error(tmp_path: Path, value: str) -> None:
+    """并发度越界**硬报错**，不静默夹到边界。
+
+    夹一下看起来更「友好」，但那正是本项目最不能忍的那类：写了 16、跑出来 8，
+    两者都不报错 —— 而「16 并发」与「8 并发」对 provider 限流是两回事。
+    """
+    path = write_config(tmp_path, with_line("concurrency = 1", f"concurrency = {value}"))
+
+    with pytest.raises(ValueError, match=r"concurrency 必须在 1\.\.8 之间"):
+        load(path)
+
+
+def test_concurrency_accepts_the_boundaries(tmp_path: Path) -> None:
+    """边界值本身是合法的（1 与 8 都收）。"""
+    for value in (1, 8):
+        path = write_config(tmp_path, with_line("concurrency = 1", f"concurrency = {value}"))
+        assert load(path).review.concurrency == value

@@ -4,6 +4,7 @@
 不碰 LLM 也不碰 git。
 """
 
+import threading
 import time
 from dataclasses import replace
 from importlib.metadata import version
@@ -18,6 +19,7 @@ from prism.config.settings import settings
 from prism.core.agent.state import MainLoopResult
 from prism.core.reflection.reflect import ReflectionOutcome
 from prism.models.ast import HunkWithSymbol, Symbol
+from prism.models.comment import Comment
 from prism.models.cost import UsageTotals
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
@@ -122,7 +124,7 @@ def test_run_groups_stops_when_review_cost_is_exceeded(
         replace(settings, review=replace(settings.review, max_review_cost=2.0)),
     )
 
-    comments, misses, gaps, skipped, _pending = main._run_groups(
+    comments, misses, gaps, skipped, _failed, _pending = main._run_groups(
         make_groups(4), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
@@ -150,7 +152,7 @@ def test_reflection_usage_counts_toward_the_review_budget(
         replace(settings, review=replace(settings.review, max_review_cost=1.0)),
     )
 
-    _comments, _misses, _gaps, skipped, _pending = main._run_groups(
+    _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
         make_groups(4), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
@@ -168,7 +170,7 @@ def test_run_groups_stops_on_review_time_budget(
         replace(settings, review=replace(settings.review, max_review_seconds=60.0)),
     )
 
-    _comments, _misses, _gaps, skipped, _pending = main._run_groups(
+    _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
         make_groups(3), tmp_path, "HEAD", {}, StaticReport(), time.monotonic() - 120.0
     )
 
@@ -182,7 +184,7 @@ def test_run_groups_reports_total_when_nothing_was_skipped(
     """没触发闸门时照常跑完，并打一行总计。"""
     ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=10))
 
-    _comments, _misses, _gaps, skipped, _pending = main._run_groups(
+    _comments, _misses, _gaps, skipped, _failed, _pending = main._run_groups(
         make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
@@ -209,10 +211,185 @@ def test_unfinished_hunks_are_counted_and_reported(
 
     monkeypatch.setattr(main, "run_review_agent", incomplete)
 
-    _comments, _misses, _gaps, skipped, pending = main._run_groups(
+    _comments, _misses, _gaps, skipped, _failed, pending = main._run_groups(
         make_groups(1), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert pending == 1
     assert skipped == 0
     assert "未审 hunk=1" in capsys.readouterr().out
+
+
+# ---------- 并发 ----------
+
+
+def set_concurrency(monkeypatch: pytest.MonkeyPatch, value: int) -> None:
+    """把并发度临时改掉。
+
+    Args:
+        monkeypatch: pytest 的 monkeypatch
+        value: 并发度
+    """
+    monkeypatch.setattr(
+        "prism.cli.main.settings",
+        replace(settings, review=replace(settings.review, concurrency=value)),
+    )
+
+
+def test_concurrency_actually_runs_groups_in_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """并发度 > 1 时，两组**真的同时在跑**。
+
+    用 `Barrier(2)` 而不是掐时间：掐时间的用例在慢机器上会假红，而屏障是精确的 ——
+    两组不同时进来，`wait` 就超时抛 `BrokenBarrierError`，那一组的结果会缺席。
+    """
+    barrier = threading.Barrier(2, timeout=3)
+    reached: list[str] = []
+    ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=1))
+
+    def rendezvous(group: Group, *_args: object, **_kwargs: object) -> MainLoopResult:
+        ran.append(group.group_id)
+        try:
+            barrier.wait()
+            reached.append(group.group_id)
+        except threading.BrokenBarrierError:
+            raise AssertionError("两组没有同时进入 —— 并发没生效") from None
+        return MainLoopResult(
+            group_id=group.group_id,
+            exit_reason="end_done",
+            round_count=1,
+            usage=UsageTotals(calls=1, output=1),
+        )
+
+    monkeypatch.setattr(main, "run_review_agent", rendezvous)
+    set_concurrency(monkeypatch, 2)
+
+    _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+        make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
+    )
+
+    assert sorted(reached) == ["group-001", "group-002"]
+    assert (skipped, failed) == (0, 0)
+
+
+def test_concurrent_results_are_ordered_by_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**汇总按组序号，不按跑完的顺序** —— 输出顺序不能跟着调度变。
+
+    让第 1 组故意慢一点（第 2 组先跑完），断言汇总顺序仍是 1、2。
+    """
+    ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=1))
+
+    def slow_first(group: Group, *_args: object, **_kwargs: object) -> MainLoopResult:
+        if group.group_id == "group-001":
+            time.sleep(0.15)
+        ran.append(group.group_id)
+        return MainLoopResult(
+            group_id=group.group_id,
+            exit_reason="end_done",
+            round_count=1,
+            usage=UsageTotals(calls=1, output=1),
+        )
+
+    monkeypatch.setattr(main, "run_review_agent", slow_first)
+
+    # 每条评论的正文带上它属于哪一组，这样断言顺序才有意义
+    def tag(_model: object, group: Group, *_args: object, **_kwargs: object) -> ReflectionOutcome:
+        return ReflectionOutcome(
+            kept=[
+                Comment(
+                    path="a.go",
+                    severity="low",
+                    category="x",
+                    content=group.group_id,
+                    existing_code="x",
+                    hunk_id="H-01",
+                    locate_level="hunk",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(main, "reflect", tag)
+    set_concurrency(monkeypatch, 2)
+
+    comments, *_rest = main._run_groups(
+        make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
+    )
+
+    assert ran == ["group-002", "group-001"], "第 2 组确实先跑完（前提）"
+    assert [item.content for item in comments] == ["group-001", "group-002"], "汇总按组序"
+
+
+def test_concurrency_keeps_every_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """并发跑完的组数与串行一致（并发不改变语义）。"""
+    for concurrency in (1, 3):
+        ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=1))
+        set_concurrency(monkeypatch, concurrency)
+
+        _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+            make_groups(5), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
+        )
+
+        assert ran == [f"group-{index:03d}" for index in range(1, 6)], f"并发度 {concurrency}"
+        assert (skipped, failed) == (0, 0)
+
+
+def test_concurrent_budget_stops_submitting_new_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """并发下超预算：**已经在跑的不打断，只是不再提交新的**。
+
+    所以并发度会决定「超预算时多花了多少」—— 最坏多跑 `concurrency - 1` 组。
+    """
+    ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=50_000))
+    set_concurrency(monkeypatch, 2)
+    monkeypatch.setattr(
+        "prism.cli.main.settings",
+        replace(
+            settings,
+            review=replace(settings.review, concurrency=2, max_review_cost=1.0),
+        ),
+    )
+
+    _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+        make_groups(6), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
+    )
+
+    assert ran == ["group-001", "group-002"], "前两组已提交、不打断；第三组起不再提交"
+    assert (skipped, failed) == (4, 0)
+
+
+def test_one_crashed_group_does_not_kill_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """编排层某一组抛异常：记 ERROR、跳过它，别的组照跑。
+
+    它与「因预算没跑」是两回事（一个是钱不够，一个是出错了），所以**分开计数** ——
+    合成一个数会让报告说错原因（同「丢弃日志说错原因，比丢东西本身更难发现」）。
+    """
+    ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=1))
+
+    def boom_on_second(group: Group, *_args: object, **_kwargs: object) -> MainLoopResult:
+        ran.append(group.group_id)
+        if group.group_id == "group-002":
+            msg = "编排层炸了"
+            raise RuntimeError(msg)
+        return MainLoopResult(
+            group_id=group.group_id,
+            exit_reason="end_done",
+            round_count=1,
+            usage=UsageTotals(calls=1, output=1),
+        )
+
+    monkeypatch.setattr(main, "run_review_agent", boom_on_second)
+    set_concurrency(monkeypatch, 3)
+
+    _comments, _misses, _gaps, skipped, failed, _pending = main._run_groups(
+        make_groups(3), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
+    )
+
+    assert ran == ["group-001", "group-002", "group-003"], "第三组照跑"
+    assert failed == 1
+    assert skipped == 0, "出错的组不能被算成「因预算没跑」"

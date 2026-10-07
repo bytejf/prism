@@ -51,6 +51,7 @@ DELETED_NOTE = "（已删除）"
 # 读者要在看评论之前就知道，而不是看完才补一句
 SKIPPED_GROUPS_NOTE = "⚠️ 因预算停止，还有 {count} 个审查单元未审"
 PENDING_HUNKS_NOTE = "⚠️ 有 {count} 个 hunk 没能审完（预算或其他中断拿掉了剩下的轮次）"
+FAILED_GROUPS_NOTE = "⚠️ 有 {count} 个审查单元异常退出（结果缺失，原因见日志的 ERROR）"
 
 # 徽章，如 [concurrency · high]
 BADGE_TEMPLATE = "[{category} · {severity}]"
@@ -157,6 +158,8 @@ class TerminalRenderer:
             lines.append(SKIPPED_GROUPS_NOTE.format(count=stats.skipped_groups))
         if stats.pending_hunks:
             lines.append(PENDING_HUNKS_NOTE.format(count=stats.pending_hunks))
+        if stats.failed_groups:
+            lines.append(FAILED_GROUPS_NOTE.format(count=stats.failed_groups))
         return "\n".join(lines)
 
     @staticmethod

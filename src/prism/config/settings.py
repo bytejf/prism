@@ -63,6 +63,7 @@ class ReviewSettings:
         tool_fail_remind: 工具连续失败到几次时追加硬提醒
         tool_fail_exit: 工具累计失败到几次时带缺口退出本组
         max_super_steps: LangGraph 的递归上限（最后一道，正常碰不到）
+        concurrency: 同时跑几个审查单元（1 = 串行）
     """
 
     no_progress_remind_rounds: tuple[int, ...]
@@ -76,6 +77,7 @@ class ReviewSettings:
     tool_fail_remind: int
     tool_fail_exit: int
     max_super_steps: int
+    concurrency: int
 
 
 @dataclass(frozen=True)
@@ -321,6 +323,29 @@ class _Section:
             raise self._fail(f"{key} 应为数值，实为 {type(value).__name__}")
         return float(value)
 
+    def bounded_count(self, key: str, *, low: int, high: int) -> int:
+        """读一个有取值范围的整数。
+
+        **越界直接报错，不夹到边界**：夹一下看起来更「友好」，但那正是本项目最
+        不能忍的那类 —— 用户写了 16、跑出来的是 8，两者都不报错。范围本身是契约
+        （配置注释里写了为什么），不该被静默改写。
+
+        Args:
+            key: 键名
+            low: 允许的最小值（含）
+            high: 允许的最大值（含）
+
+        Returns:
+            整数值
+
+        Raises:
+            ValueError: 缺失、类型不符或越界
+        """
+        value = self.count(key)
+        if not low <= value <= high:
+            raise self._fail(f"{key} 必须在 {low}..{high} 之间，实为 {value}")
+        return value
+
     def numbers(self, key: str) -> tuple[int, ...]:
         """读一个整数数组。
 
@@ -410,6 +435,7 @@ def load(path: Path = PATH) -> Settings:
         tool_fail_remind=review.count("tool_fail_remind"),
         tool_fail_exit=review.count("tool_fail_exit"),
         max_super_steps=review.count("max_super_steps"),
+        concurrency=review.bounded_count("concurrency", low=1, high=8),
     )
 
     cost = root.section("cost")

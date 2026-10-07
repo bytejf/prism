@@ -79,6 +79,8 @@ class ReviewStats:
             要报错那条）
         pending_hunks: 跑过但没审完的 hunk 数（预算/异常中断留下的缺口）。
             与 skipped_groups 同理：不报的话「0 条评论」看起来像「代码很干净」
+        failed_groups: 异常退出的审查单元数。**与 skipped_groups 分开**：一个是
+            「没跑」（钱不够），一个是「跑了但出错」（看日志），处置完全不同
     """
 
     base_branch: str
@@ -88,3 +90,4 @@ class ReviewStats:
     duration_seconds: float
     skipped_groups: int = 0
     pending_hunks: int = 0
+    failed_groups: int = 0
