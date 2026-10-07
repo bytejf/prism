@@ -301,7 +301,7 @@ def reflect(model: BaseChatModel, group: Group, comments: list[Comment]) -> Refl
         reason = f"{type(exc).__name__}: {exc}"
         logger.warning("反思 · 失败 · %s，已保留全部 %d 条", reason, len(comments))
         return ReflectionOutcome(kept=list(comments), failure=reason)
-    elapsed_ms = int((time.monotonic() - started) * 1000)
+    elapsed_seconds = time.monotonic() - started
 
     # 反思不压缩，所以直接扫终态消息最省事（审查循环那边不能这么干 —— 压缩会把
     # 历史删掉，账会漏，见 core/agent/budget.py 的说明）
@@ -318,12 +318,13 @@ def reflect(model: BaseChatModel, group: Group, comments: list[Comment]) -> Refl
     misses = list(final["misses"])
     kept = [item for item_id, item in numbered if item_id not in final["removals"]]
     logger.info(
-        "反思 · 完成 · %s · 删除 %d / 保留 %d（删除率 %.0f%%）· 耗时 %dms\n%s",
+        # 单位与别处统一成「秒」：静态分析、单组耗时都是秒，混着 ms 读起来要换算
+        "反思 · 完成 · %s · 删除 %d / 保留 %d（删除率 %.0f%%）· 耗时 %.1f 秒\n%s",
         group.group_id,
         len(removals),
         len(kept),
         len(removals) / len(comments) * 100,
-        elapsed_ms,
+        elapsed_seconds,
         fields(
             # 删评论是唯一有破坏性的动作，依据与指认全部留档
             (
