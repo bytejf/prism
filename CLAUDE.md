@@ -38,7 +38,7 @@ uvx pyright --pythonpath .venv/bin/python src/   # 第二个类型检查器，�
 ## 架构：三段流水线
 
 ```
-diff → 过滤 → hunk 归属符号 → 按包分组        ← 确定性，零 token
+diff → 过滤 → hunk 归属符号 → 静态分析 → 按包分组   ← 确定性，零 token
                                   ↓
                    每个「审查单元」跑一次 ReAct 循环   ← core/agent/
                                   ↓
@@ -47,8 +47,11 @@ diff → 过滤 → hunk 归属符号 → 按包分组        ← 确定性，�
                         排序 → 终端渲染             ← core/output/
 ```
 
-审查前四段各有一个 CLI 子命令（`diff` / `filter` / `hunk-map` / `group`），
-**它们是给人看的干跑入口**，用在花钱之前逐段核对范围，不是 `review` 的内部实现。
+审查前各段都有一个 CLI 子命令（`diff` / `filter` / `hunk-map` / `static` /
+`group`），**它们是给人看的干跑入口**，用在花钱之前逐段核对范围，不是 `review`
+的内部实现。静态分析夹在「hunk 归属符号」与「按包分组」之间：它的发现要按文件
+分桶进各组，而「关联到哪个 hunk」需要映射结果 —— 这一段**依赖外部二进制**
+`golangci-lint`（没装就跳过，见下）。
 
 所有子命令都要 `--path` 指定被审查仓库（**必填，不回落当前目录**：审查会花 token、
 会把代码发给外部 API，审错仓库的代价比多敲一个参数大）。`--base` / `--head`
@@ -171,6 +174,57 @@ pathspec（`fatal: outside repository`，英文 stderr 还带**本机绝对路�
 验证方式：`tests/unit/test_tools.py` 的「路径安全」一节（含 symlink 逃逸、
 NUL、`--` 挡住选项注入），变异 9/9（`/tmp/mutate_paths.py`）。
 
+## 静态分析（改 `core/static/` 前必读）
+
+golangci-lint 跑一次，发现**只当线索**：不进评论列表、不进定位、不参与排序，
+最终输出依旧只来自 LLM（设计 18 号 §2.1）。四步：**跑工具 → 解析 → 关联 hunk →
+按预算注入**，后置校验在每组审完后核对引用。
+
+- **跑的是被审查版本**。golangci-lint 只能分析工作区、读不了任意 rev，而
+  `file_read` / `code_search` 读的都是 `--head` —— 所以先
+  `git worktree add --detach <tmp> <head>` 检出、跑完删掉（实测 0.08s/次）。
+  别改成直接跑工作区：工作区停在别的分支时，报出来的行号与待审代码错位，
+  而错的行号比没有发现更坏。**GitHub CI 里这一步是免费的**：workflow 检出的
+  本来就是 PR 的版本（`golangci-lint-action` 也一样）
+- **失败一律降级，但「跳过」≠「没发现」**：没装 / 超时 / 退出码非 0 / stdout 不是
+  合法 JSON / 目标不是 Go 模块 → WARNING + `skip_reason`，审查照常继续。
+  CLI 与日志里两者**必须分开说** —— 合成一句「没有静态发现」会让「没装工具」
+  看起来像「代码很干净」（同 `file_read_diff` 索引为空要报错那条）
+- **只留可审查文件上的发现**：工具报的是整个仓库，我们按 reviewable 集合过滤。
+  没改动的文件的发现进来只会挤占 token 并诱导模型评论没改过的代码
+- **优先级按 linter 名映射**（`PRIORITY_BY_LINTER`），**不看工具自己的
+  `Severity`**：实测那个字段大面积为空（errcheck 全是 `""`，gosec 全是
+  `"medium"`，与规则严重性无关）。`typecheck` 关不掉（`--default=none` 也启用）、
+  它报的是编译错误，按 high 收
+- **不做 `--new-from-*`**：那是 CI 那套「只看改动的行」的口径。我们的口径是
+  「改过的**文件**里的发现全要」—— hunk 关联与 token 截断已经各兜了一道
+- **注入两处呈现**：独立成段列出（保住跨 hunk 的全局视角）+ hunk 上标
+  `static_hint="S-01"`（只标编号不标严重性）。**hunk 的展示顺序**按关联发现的
+  最高优先级排，**编号一律不动** —— 编号是报评论与查日志的坐标
+- **`_render_diff` 按有序字典分组，不是 `groupby`**：展示顺序重排之后「同文件的
+  hunk 相邻」不再天然成立，用 `groupby` 会让同一个文件渲染成两个 `<file>` 块
+- **预算是整条请求的**（`[static].max_prompt_tokens`，字符数 ÷ 2.5 估算）：超了
+  **从静态发现那头砍，diff 一个字都不砍**。一条都装不下时记 WARNING，
+  不能静默变成「这次没有静态发现」
+- **注入的挑选只算一次**（`_run_groups` 里），注入与后置校验共用同一批编号 ——
+  各算一次的话，预算边界上两条路会给出不同的集合
+- **后置校验按最终保留的评论算**（反思删掉的那条不算数），只对**高优先级**未处理
+  告警。设计 §2.11 的四条规则落地成三条：**不做「内容与某条发现相似 → 可能处理」
+  这个分桶**（golangci-lint 是英文、评论是中文，文本相似度实测退化成「全部算未处理」，
+  记在反馈文档里）
+- **提示词的三层弱化不能改回去**：「提示」而不是「发现」、「工具标记」而不是
+  「严重性」、中文「高优先」而不是 high/medium/low（避免与我们的 severity 混淆）。
+  主任务段是 6 条**「问自己」式**维度，不是例子 —— 例子会让模型只查那一种问题
+- 用了 v2 的 CLI（`--default=none` / `--output.json.path=stdout` /
+  `--path-mode=abs`），v1→v2 的差异（`gosimple` 并入 `staticcheck`、
+  stdout 里混着文本报告与统计摘要）都在 `analyzer.py` 的注释里
+
+验证：`tests/unit/test_static.py`（32 条，**不依赖真实二进制**，喂真实的 JSON
+载荷 + monkeypatch 造失败形态）；变异 15/15（`/tmp/mutate_static.py`，含
+「去掉 `--show-stats=false`」「不按可审查文件过滤」「编号乱排」这类）；
+真跑一次工具的场景在 `tests/manual/check_static.py`（现场搭一个 PR 新增的文件，
+里面的问题 gosec / errcheck 抓得住，约 13 秒）。
+
 ## 评论定位（改 `core/output/locate.py` 前必读）
 
 审查后第一步：把 LLM 报的评论挂到具体行号上。**零 LLM**，同一输入同一输出。
@@ -287,7 +341,7 @@ max_rounds = max(settings.review.min_rounds, n * settings.review.rounds_per_hunk
 
 | | 例子 |
 |---|---|
-| **进**（旋钮，配错了看得见） | 窗口、思考档位、压缩阈值、轮次公式、工具上限、日志级别 |
+| **进**（旋钮，配错了看得见） | 窗口、思考档位、压缩阈值、轮次公式、工具上限、静态分析的预算与超时、日志级别 |
 | **不进**（契约，配错了*看不见*） | 标签名 `<diff>` / `<review_status>`、`H-01` 编号格式、退出原因码、severity 排序、定位层级与失败原因码、提示词全文、过滤白名单、`REFETCHABLE_TOOLS` |
 
 把契约写进文件等于让它变成「可以配错的东西」，而配错的后果是静默失效。
@@ -359,6 +413,12 @@ PyCharm：Environment variables 填 `PRISM_LOG_LEVEL=INFO`，Additional Argument
 PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
 ```
 
+**外部二进制只有 golangci-lint 一个**（`go install
+github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`，实测装在
+`~/go/bin`）。它是**可选依赖**：没装时静态分析跳过、审查照常跑，所以单测里
+一条都不依赖它 —— 喂真实 JSON 载荷给解析层，用 monkeypatch 造失败形态。
+真跑一次工具的场景留给 `tests/manual/` 下的脚本。
+
 ## 设计文档
 
 在 `/Users/caojunfeng/Projects/golang/open-code-review/acr-min/`，**一个阶段一个目录**：
@@ -369,6 +429,7 @@ PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
 | `01-上下文压缩/` | 9 | 10（实现反馈）、11（设计取舍） |
 | `02-评论定位和反思/` | 12 | 13（定位）、14（反思） |
 | `03-添加工具和调用图/` | 15 | 16（跨组工具实现反馈）、17（**框架缺口清单**，台账） |
+| `04-添加静态审查/` | 18 | 19（静态分析实现反馈，含 golangci-lint v1→v2 的坑） |
 
 - **设计文档冻结、永不回头改**；实现与它不符时**记进反馈文档**
   （唯一例外：反馈文档里写明「这条必须回改设计文档」的，如 13 号 §六 E1）

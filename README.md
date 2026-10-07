@@ -11,6 +11,12 @@ Prism 用「确定性优先 + LLM 补充」的混合架构：能用规则判定�
 uv sync
 ```
 
+静态分析（可选）需要一个外部二进制，没装时这一步自动跳过、其余流程不受影响：
+
+```bash
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+```
+
 ## 快速开始
 
 ```bash
@@ -49,20 +55,21 @@ high: 4 | medium: 1 | low: 0
 
 ### 审查前流程（确定性，不调用 LLM）
 
-四个命令依次是流水线的下一个环节，可以逐个跑、逐个核对：
+几个命令依次是流水线的下一个环节，可以逐个跑、逐个核对：
 
 | 命令 | 功能 |
 |------|------|
 | `prism diff` | 加载并解析 diff，打印文件数 / hunk 数 / 增删行数 |
 | `prism filter` | 按规则过滤文件，打印可审查 / 跳过清单（含跳过原因） |
 | `prism hunk-map` | 把每个 hunk 归属到它重叠的函数 / 方法 |
+| `prism static` | 跑一次 golangci-lint，打印静态发现（编号 / 档位 / 位置 / 关联 hunk） |
 | `prism group` | 按包路径分组，输出即为送进 LLM 的「审查单元」 |
 
 ### 完整审查（调用 LLM）
 
 | 命令 | 功能 |
 |------|------|
-| `prism review` | diff → 过滤 → hunk 映射 → 分组 → LLM 审查 → 定位 → 反思 → 排序 → 终端渲染 |
+| `prism review` | diff → 过滤 → hunk 映射 → 静态分析 → 分组 → LLM 审查 → 定位 → 反思 → 排序 → 渲染 |
 
 所有命令都要 `--path` 指定被审查仓库，另有 `--base` / `--head`（默认
 `main` / `HEAD`）。完整命令清单与参数见 `prism --help`。
@@ -91,6 +98,10 @@ reserve_tokens = 20000       # 已用达到 (窗口 - 预留) 就压缩
 [review]
 min_rounds = 30
 rounds_per_hunk = 5
+
+[static]
+max_prompt_tokens = 12000    # 整条提示词的 token 上限；超了从静态发现那头砍
+timeout_seconds = 180        # golangci-lint / git 子进程超时
 
 [tools.file_read]
 max_lines = 500
@@ -124,6 +135,12 @@ max_lines = 500
 - **跨文件改动可查** —— 按包分组会把「改接口 + 改实现 + 改调用方」切成互不可见的
   审查单元，`file_read_diff` 让模型按需取其他文件的 diff，自己判断有没有同步适配。
   刻意**不做调用图分组**：实测调用图的噪音比 73%，而且错误的分组比不分组更糟
+- **静态发现只当线索，进不了输出** —— golangci-lint 的误报是常态（`gosec` 会标记
+  任何含 `Password` 字段的结构体，哪怕它已被掩码），所以它**只作为线索注入提示词**：
+  独立成段列出、每条标上关联的 hunk，每组的 hunk 再按它标出的优先级排展示顺序。
+  评论一律由 LLM 产出，确认成立就引用编号（`[S-01]`）；高优先级发现没人引用时，
+  在统计尾部提示人工核查。**分析跑在被审查版本上**（临时检出 head，读完即删），
+  与工具读源码是同一套坐标；工具没装 / 超时 / 跑挂都只跳过静态分析，审查照常
 - **工具参数是信任边界** —— 入参是模型给的，越界路径与 NUL 在我们这一侧就拦下
   （不再把 git 的英文 stderr 连同本机绝对路径回给模型）；工具体内抛的异常兜成一条
   工具结果，不让它炸掉整条 review
