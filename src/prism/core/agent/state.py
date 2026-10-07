@@ -28,6 +28,10 @@ EXIT_END_DONE = "end_done"
 EXIT_END_DONE_WITH_GAPS = "end_done_with_gaps"
 EXIT_MAX_ROUNDS = "max_rounds"
 EXIT_NO_PROGRESS = "no_progress"
+# 撞上 recursion_limit：**不该发生**（说明前面几道闸一个都没生效），带缺口退出
+EXIT_RECURSION = "recursion"
+# 图抛了别的异常：同样带缺口退出，不把整条 review 带走
+EXIT_ERROR = "error"
 
 
 @dataclass

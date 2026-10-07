@@ -19,7 +19,9 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
 from prism.config.settings import settings
@@ -27,6 +29,8 @@ from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.middleware import ReviewProgress, review_pacing, tool_error_guard
 from prism.core.agent.state import (
+    EXIT_ERROR,
+    EXIT_RECURSION,
     STATUS_PENDING,
     HunkStatus,
     MainLoopResult,
@@ -209,29 +213,18 @@ def run_review_agent(
     )
 
     agent = build_review_agent(model, max_rounds, compression or settings.compression)
-    # 出参 cast：不传 version 时框架走 `version="v1"` 那个 overload，
-    # 返回类型是 `dict[str, Any] | Any`，不认识 state_schema 里的自定义键。
-    # 不 cast，下面 `final["hunk_status"]` 就退化成 Any，这一层的检查等于没加。
-    final = cast(
-        ReviewState,
-        agent.invoke(
-            initial_state(group, max_rounds, static_findings),
-            context=ReviewContext(
-                project_root=project_root,
-                head_rev=head_rev,
-                diffs=diff_index or {},
-            ),
-            # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约
-            # 6.1 步（30 轮 = 182 步），旧手写图的 ×5 不够，取 ×7 留余量。
-            # 真正的终止保证是 ModelCallLimitMiddleware，这里只是防图跑飞。
-            config={"recursion_limit": max_rounds * 7 + 20},
-        ),
+    initial = initial_state(group, max_rounds, static_findings)
+    final, crashed = _run_graph(
+        agent, initial, group, project_root, head_rev, diff_index or {}, max_rounds
     )
 
-    exit_reason = exit_reason_of(final)
-    if exit_reason is None:
-        msg = "审查循环结束时读不出 exit_reason，退出判定有误"
-        raise ValueError(msg)
+    if crashed is None:
+        exit_reason = exit_reason_of(final)
+        if exit_reason is None:
+            msg = "审查循环结束时读不出 exit_reason，退出判定有误"
+            raise ValueError(msg)
+    else:
+        exit_reason = crashed
 
     hunk_status = final["hunk_status"]
     # 按 hunk 编号键控返回：CommentInput 不带 hunk_id，
@@ -256,3 +249,64 @@ def run_review_agent(
         hunk_comments=hunk_comments,
         pending_hunk_ids=pending,
     )
+
+
+def _run_graph(
+    agent: Agent,
+    initial: ReviewState,
+    group: Group,
+    project_root: str,
+    head_rev: str,
+    diff_index: Mapping[str, Diff],
+    max_rounds: int,
+) -> tuple[ReviewState, str | None]:
+    """跑一遍图，返回**最后看到的状态**与「异常退出原因」（正常结束时为 None）。
+
+    用 `stream(stream_mode="values")` 而不是 `invoke`：每一步都拿到一份完整状态，
+    于是**图崩了也能退回最后一个好状态**。这不是锦上添花 —— 渲染在整条 review 的
+    最后一步，一旦异常穿出去，已经审出来的评论会跟它一起没（`tool_error_guard`
+    修的是工具那一层，这是它外面那一层）。
+
+    两类异常都在这里收口：
+
+    - `GraphRecursionError`：`recursion_limit` 到了。**这是「不该发生」**：它响说明
+      前面几道闸（语义退出、预算、模型调用上限）一个都没生效，套的是我们自己的
+      bug，所以记 ERROR 带堆栈，而不是当普通退出
+    - 其余异常：同样收口成「带缺口退出」。**不吞** —— ERROR + 完整堆栈照记，
+      只是不让它把整条 review 带走
+
+    Args:
+        agent: 编译好的审查图
+        initial: 初始状态
+        group: 审查单元（只用于日志）
+        project_root: 项目根目录
+        head_rev: 被审查的版本
+        diff_index: `路径 → Diff` 索引
+        max_rounds: 单组最大轮次（用来推递归上限）
+
+    Returns:
+        (最后一份状态, 退出原因码)；正常结束时第二个元素为 None
+    """
+    context = ReviewContext(project_root=project_root, head_rev=head_rev, diffs=diff_index)
+    # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约 6.1 步
+    # （30 轮 = 182 步），取 ×7 留余量。真正的终止保证是 ModelCallLimitMiddleware，
+    # 这里只是防图跑飞。
+    # 标注成 RunnableConfig 不是装饰：裸 dict 字面量会被推成 `dict[str, int]`，
+    # `stream` 的四个 overload 会全都不匹配（`invoke` 那边碰巧不挑）。这也是框架
+    # 的签名缺口，记在 17 号台账里
+    config: RunnableConfig = {"recursion_limit": max_rounds * 7 + 20}
+    final: ReviewState = initial
+    try:
+        for chunk in agent.stream(initial, context=context, config=config, stream_mode="values"):
+            final = cast(ReviewState, chunk)
+    except GraphRecursionError as exc:
+        logger.error(
+            "审查 %s 撞上 recursion_limit（这是不该发生的一类，说明前几道闸没生效）",
+            group.group_id,
+            exc_info=exc,
+        )
+        return final, EXIT_RECURSION
+    except Exception as exc:
+        logger.error("审查 %s 抛异常，按带缺口退出处理", group.group_id, exc_info=exc)
+        return final, EXIT_ERROR
+    return final, None

@@ -8,6 +8,7 @@ Protocol 已经接不上了。
 """
 
 import logging
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast, override
@@ -19,6 +20,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
 from langchain_core.tools import tool as langchain_tool
+from langgraph.errors import GraphRecursionError
 from pydantic import Field
 
 from prism.config.settings import settings
@@ -27,8 +29,10 @@ from prism.core.agent.middleware import end_done_reset, should_exit, update_no_r
 from prism.core.agent.state import (
     EXIT_END_DONE,
     EXIT_END_DONE_WITH_GAPS,
+    EXIT_ERROR,
     EXIT_MAX_ROUNDS,
     EXIT_NO_PROGRESS,
+    EXIT_RECURSION,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
     STATUS_PENDING,
@@ -854,3 +858,123 @@ def test_parallel_tool_calls_all_get_a_result_when_one_fails(
     second_request = "\n".join(str(message.content) for message in llm.calls[1])
     assert "工具内部执行失败" in second_request, "炸掉的那条要有回执"
     assert "     1: package main" in second_request, "没炸的那条结果也要在（a.go 内容带行号）"
+
+
+# ---------- 图崩了也不能丢结果 ----------
+
+
+class CrashingGraph:
+    """假图：先把「审了一个 hunk」演进状态，再抛指定的异常。
+
+    真的等 `recursion_limit` 触发要跑几百步，而这条路径的语义与步数无关 ——
+    用假图才能确定性地验「异常不会带走已审出的评论」。
+    """
+
+    def __init__(self, error: Exception, *, chunks: int = 1) -> None:
+        """记下要抛的异常。
+
+        Args:
+            error: 抛出的异常
+            chunks: 抛异常前先吐几份状态（0 表示一开始就炸）
+        """
+        self._error = error
+        self._chunks = chunks
+
+    def stream(self, state: ReviewState, **_kwargs: Any) -> Iterator[ReviewState]:
+        """模拟 `agent.stream(...)`：吐若干份状态之后抛异常。
+
+        Args:
+            state: 初始状态
+
+        Yields:
+            推进过的状态（第一个 hunk 标记完成并带一条评论）
+
+        Raises:
+            Exception: 构造时传入的异常
+        """
+        for _ in range(self._chunks):
+            status = dict(state["hunk_status"])
+            first = sorted(status)[0]
+            status[first] = replace(
+                status[first],
+                status=STATUS_DONE,
+                comments=[
+                    CommentInput(
+                        severity="high", category="bug", content="必须活下来", existing_code="x"
+                    )
+                ],
+            )
+            yield cast(ReviewState, {**state, "hunk_status": status})
+        raise self._error
+
+
+def install_crashing_graph(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, chunks: int = 1
+) -> None:
+    """把 `build_review_agent` 换成只返回假图的工厂。
+
+    Args:
+        monkeypatch: pytest 的 monkeypatch
+        error: 假图要抛的异常
+        chunks: 抛异常前先吐几份状态
+    """
+    monkeypatch.setattr(
+        "prism.core.agent.agent.build_review_agent",
+        lambda *_args, **_kwargs: CrashingGraph(error, chunks=chunks),
+    )
+
+
+def test_graph_recursion_keeps_partial_results(
+    project_root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """图撞上 recursion_limit 时带缺口退出，**已审出的评论与状态都留住**。
+
+    之前它会以 `GraphRecursionError` 穿出去，整条 review 跟着一起没（渲染在最后
+    一步）—— 这条守的就是那个回归。
+    """
+    install_crashing_graph(monkeypatch, GraphRecursionError("Recursion limit of 25 reached"))
+
+    result = run_review_agent(
+        make_group(["H-01", "H-02"]), ScriptedChatModel(responses=[]), project_root
+    )
+
+    assert result.exit_reason == EXIT_RECURSION
+    assert result.pending_hunk_ids == ["H-02"], "已经审完的 hunk 不该退回去"
+    assert [c.content for c in result.hunk_comments["H-01"]] == ["必须活下来"]
+
+
+def test_graph_error_keeps_partial_results(
+    project_root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """图抛别的异常时同样带缺口退出 —— 收口但不吞（ERROR + 堆栈照记）。"""
+    install_crashing_graph(monkeypatch, RuntimeError("框架内部炸了"))
+
+    result = run_review_agent(make_group(["H-01"]), ScriptedChatModel(responses=[]), project_root)
+
+    assert result.exit_reason == EXIT_ERROR
+    assert [c.content for c in result.hunk_comments["H-01"]] == ["必须活下来"]
+
+
+def test_graph_crashed_before_any_state_still_exits_cleanly(
+    project_root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一份状态都没吐出来就崩：退回初始状态，仍然是干净退出而不是抛异常。"""
+    install_crashing_graph(monkeypatch, RuntimeError("第一步就炸"), chunks=0)
+
+    result = run_review_agent(make_group(["H-01"]), ScriptedChatModel(responses=[]), project_root)
+
+    assert result.exit_reason == EXIT_ERROR
+    assert result.pending_hunk_ids == ["H-01"]
+
+
+def test_recursion_error_is_logged_as_error(
+    project_root: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """recursion_limit 是「不该发生」的一类，日志级别必须是 ERROR。"""
+    install_crashing_graph(monkeypatch, GraphRecursionError("Recursion limit of 25 reached"))
+
+    with caplog.at_level("ERROR"):
+        run_review_agent(make_group(["H-01"]), ScriptedChatModel(responses=[]), project_root)
+
+    assert "recursion_limit" in caplog.text
+    assert "不该发生" in caplog.text
