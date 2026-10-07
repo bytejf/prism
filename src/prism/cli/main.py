@@ -441,7 +441,7 @@ def _run_groups(
     diff_index: Mapping[str, Diff],
     static_report: StaticReport,
     started: float,
-) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding], int]:
+) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding], int, int]:
     """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位与反思。
 
     定位与反思都放在循环体里而不是等所有组跑完：设计文档的节奏就是
@@ -468,7 +468,8 @@ def _run_groups(
             于是「20 分钟」读起来就是「这条命令最长跑多久」，含静态分析
 
     Returns:
-        (保留的评论, 疑似漏报信号, 未被引用的高优先级静态发现, 因预算未跑的组数)。
+        (保留的评论, 疑似漏报信号, 未被引用的高优先级静态发现,
+        因预算未跑的组数, 没审完的 hunk 数)。
         评论含未定位的那些（带 locate_level 标记）
     """
     llm = _llm_or_exit()
@@ -477,6 +478,7 @@ def _run_groups(
     gaps: list[StaticFinding] = []
     total = UsageTotals()
     skipped = 0
+    pending_hunks = 0
     for index, item in enumerate(groups, start=1):
         # 开新组之前先看总账：超了就停掉剩下的组（**不是**只停这一组 ——
         # 全局闸的意思就是「整条别再花下去了」）
@@ -521,6 +523,7 @@ def _run_groups(
         total = add_usage(total, group_usage)
         comments.extend(outcome.kept)
         misses.extend(outcome.misses)
+        pending_hunks += len(result.pending_hunk_ids)
         verdict = verify_group(injected, outcome.kept)
         gaps.extend(verdict.unhandled_high)
         # 未定位数是**定位**这一步的统计，与反思删掉了几条无关，所以按
@@ -529,15 +532,20 @@ def _run_groups(
         static_note = (
             f", 静态发现={len(injected)}(引用{len(verdict.referenced)})" if injected else ""
         )
+        # 没审完的 hunk 必须报：不报的话「0 条评论」看起来就像「这段代码很干净」
+        gap_note = (
+            f", ⚠️ 未审 hunk={len(result.pending_hunk_ids)}" if result.pending_hunk_ids else ""
+        )
         typer.echo(
             f"  {result.group_id} completed: {_plural(len(outcome.kept), 'comment')} "
             f"(exit_reason={result.exit_reason}, 轮次={result.round_count}, "
-            f"未定位={unlocated}, 反思删除={len(outcome.removed)}{static_note})"
+            f"未定位={unlocated}, 反思删除={len(outcome.removed)}"
+            f"{static_note}{gap_note})"
         )
         typer.echo(f"    本组 {describe(group_usage, settings.cost)}")
     if not skipped:
         typer.echo(f"总计 {describe(total, settings.cost)}")
-    return comments, misses, gaps, skipped
+    return comments, misses, gaps, skipped, pending_hunks
 
 
 @app.command()
@@ -584,11 +592,11 @@ def review(
 
     # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
     if groups:
-        comments, misses, gaps, skipped_groups = _run_groups(
+        comments, misses, gaps, skipped_groups, pending_hunks = _run_groups(
             groups, root, head, diff_index, static_report, started
         )
     else:
-        comments, misses, gaps, skipped_groups = [], [], [], 0
+        comments, misses, gaps, skipped_groups, pending_hunks = [], [], [], 0, 0
     comments = sort_comments(comments)
 
     stats = ReviewStats(
@@ -598,6 +606,7 @@ def review(
         comments_count=len(comments),
         duration_seconds=time.monotonic() - started,
         skipped_groups=skipped_groups,
+        pending_hunks=pending_hunks,
     )
     typer.echo("")
     typer.echo(TerminalRenderer().render(comments, stats, misses, gaps))

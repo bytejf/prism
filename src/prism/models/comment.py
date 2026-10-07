@@ -77,6 +77,8 @@ class ReviewStats:
         skipped_groups: 因预算没跑的审查单元数。**必须报出来** —— 少审了几个组
             与「那些组没问题」在输出上长得一模一样（同 file_read_diff 索引为空
             要报错那条）
+        pending_hunks: 跑过但没审完的 hunk 数（预算/异常中断留下的缺口）。
+            与 skipped_groups 同理：不报的话「0 条评论」看起来像「代码很干净」
     """
 
     base_branch: str
@@ -85,3 +87,4 @@ class ReviewStats:
     comments_count: int
     duration_seconds: float
     skipped_groups: int = 0
+    pending_hunks: int = 0

@@ -3,8 +3,9 @@
 整个 Main 循环交给 LangChain v1 的 `create_agent`：
 
 - **模型节点 / 工具节点 / 循环边** —— 框架内置，不再手写 StateGraph
-- **轮次上限** —— 框架的 `ModelCallLimitMiddleware`
-- **语义退出、进度快照、纯文本提醒** —— `middleware.py` 里的两个钩子
+- **退出与止损** —— 语义退出（审完 / 无产出）、钱与时间预算、工具失败预算，
+  全在 `middleware.py` 里；`recursion_limit` 是最后一道（防图失控，正常碰不到）
+- **进度快照、纯文本提醒** —— 同样在这两个钩子里
 - **静态上下文** —— `context_schema`，按次传入
 - **审查状态** —— `state_schema`，跟着 checkpoint 走
 
@@ -16,7 +17,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -41,7 +42,6 @@ from prism.core.agent.state import (
     MainLoopResult,
     ReviewState,
     exit_reason_of,
-    max_rounds_for,
     pending_ids,
 )
 from prism.core.grouping.packages import package_label
@@ -86,14 +86,11 @@ def build_tools() -> list[BaseTool]:
 Agent = CompiledStateGraph[ReviewState, ReviewContext, ReviewState, ReviewState]
 
 
-def build_review_agent(
-    model: BaseChatModel, max_rounds: int, compression: CompressionConfig | None = None
-) -> Agent:
+def build_review_agent(model: BaseChatModel, compression: CompressionConfig | None = None) -> Agent:
     """组装审查 Agent。
 
     Args:
         model: LangChain ChatModel
-        max_rounds: 单组最大模型调用次数（框架的 ModelCallLimitMiddleware 执行）
         compression: 压缩配置；传 None 表示本组不压缩（测试里常用）
 
     Returns:
@@ -124,8 +121,6 @@ def build_review_agent(
                         Compressor(model, compression) if compression is not None else None
                     ),
                     review_pacing,
-                    # 轮次上限：框架自带，不用自己数
-                    ModelCallLimitMiddleware(run_limit=max_rounds, exit_behavior="end"),
                     # 兜住工具异常 + 给「失败」本身设预算。
                     # 放最内侧（倒数第二个）：ReviewTrace 在它外面，于是失败的那次
                     # 调用照样有一条带耗时的 tool 日志，日志形态不因失败而变
@@ -142,9 +137,7 @@ def build_review_agent(
     )
 
 
-def initial_state(
-    group: Group, max_rounds: int, static_findings: Sequence[StaticFinding] = ()
-) -> ReviewState:
+def initial_state(group: Group, static_findings: Sequence[StaticFinding] = ()) -> ReviewState:
     """构造审查循环的初始状态。
 
     提示词文本在 `guidance/templates.py` 里整块书写：
@@ -154,7 +147,6 @@ def initial_state(
 
     Args:
         group: 审查单元
-        max_rounds: 单组最大模型调用次数
         static_findings: 注入本组的静态发现（已按 token 预算裁过），
             由 `static.analyzer.select_for_group` 按文件挑出（额度在分组那一步已经算过）
 
@@ -173,7 +165,6 @@ def initial_state(
             for item in group.hunks
         },
         round_count=0,
-        max_rounds=max_rounds,
         no_report_rounds=0,
         end_done_count=0,
         end_done_mark=0,
@@ -214,21 +205,17 @@ def run_review_agent(
     Raises:
         ValueError: 图结束时读不出退出原因
     """
-    max_rounds = max_rounds_for(len(group.hunks))
     logger.info(
-        "开始审查 %s（%s，%d 个文件，%d 个 hunk，上限 %d 轮）",
+        "开始审查 %s（%s，%d 个文件，%d 个 hunk）",
         group.group_id,
         package_label(group),
         len(group.files),
         len(group.hunks),
-        max_rounds,
     )
 
-    agent = build_review_agent(model, max_rounds, compression or settings.compression)
-    initial = initial_state(group, max_rounds, static_findings)
-    final, crashed = _run_graph(
-        agent, initial, group, project_root, head_rev, diff_index or {}, max_rounds
-    )
+    agent = build_review_agent(model, compression or settings.compression)
+    initial = initial_state(group, static_findings)
+    final, crashed = _run_graph(agent, initial, group, project_root, head_rev, diff_index or {})
 
     if crashed is None:
         exit_reason = exit_reason_of(final)
@@ -271,7 +258,6 @@ def _run_graph(
     project_root: str,
     head_rev: str,
     diff_index: Mapping[str, Diff],
-    max_rounds: int,
 ) -> tuple[ReviewState, str | None]:
     """跑一遍图，返回**最后看到的状态**与「异常退出原因」（正常结束时为 None）。
 
@@ -295,19 +281,20 @@ def _run_graph(
         project_root: 项目根目录
         head_rev: 被审查的版本
         diff_index: `路径 → Diff` 索引
-        max_rounds: 单组最大轮次（用来推递归上限）
 
     Returns:
         (最后一份状态, 退出原因码)；正常结束时第二个元素为 None
     """
     context = ReviewContext(project_root=project_root, head_rev=head_rev, diffs=diff_index)
-    # LangGraph 的递归上限按 super-step 算。实测 create_agent 每轮约 6.1 步
-    # （30 轮 = 182 步），取 ×7 留余量。真正的终止保证是 ModelCallLimitMiddleware，
-    # 这里只是防图跑飞。
+    # LangGraph 的递归上限按 super-step 算（实测 create_agent 每轮约 6.1 步）。
+    # **这是最后一道，正常永远碰不到** —— 终止保证来自语义退出与预算。取一个宽松的
+    # 绝对数而不是按轮数乘：乘出来的余量只有 15%（6.1 vs 7），框架或我们多加一个
+    # 钩子就会让它反过来先响，而它响是异常路径。
+    #
     # 标注成 RunnableConfig 不是装饰：裸 dict 字面量会被推成 `dict[str, int]`，
     # `stream` 的四个 overload 会全都不匹配（`invoke` 那边碰巧不挑）。这也是框架
     # 的签名缺口，记在 17 号台账里
-    config: RunnableConfig = {"recursion_limit": max_rounds * 7 + 20}
+    config: RunnableConfig = {"recursion_limit": settings.review.max_super_steps}
     final: ReviewState = initial
     try:
         for chunk in agent.stream(initial, context=context, config=config, stream_mode="values"):

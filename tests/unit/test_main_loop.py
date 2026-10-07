@@ -42,7 +42,6 @@ from prism.core.agent.state import (
     EXIT_END_DONE,
     EXIT_END_DONE_WITH_GAPS,
     EXIT_ERROR,
-    EXIT_MAX_ROUNDS,
     EXIT_NO_PROGRESS,
     EXIT_RECURSION,
     STATUS_DONE,
@@ -51,7 +50,6 @@ from prism.core.agent.state import (
     HunkStatus,
     ReviewState,
     exit_reason_of,
-    max_rounds_for,
     pending_ids,
 )
 from prism.core.agent.status import build_review_status
@@ -258,14 +256,6 @@ def project_root(tmp_path: Path) -> str:
 # ---------- 纯函数 ----------
 
 
-def test_max_rounds_for_uses_documented_formula() -> None:
-    """测试 max_rounds = max(30, hunk 数 × 5)。"""
-    assert max_rounds_for(0) == 30
-    assert max_rounds_for(6) == 30
-    assert max_rounds_for(7) == 35
-    assert max_rounds_for(20) == 100
-
-
 def test_update_no_report_rounds_resets_on_progress_tools() -> None:
     """测试 report_hunks / end_done 重置计数。"""
     assert update_no_report_rounds(4, [{"name": "report_hunks"}]) == 0
@@ -378,13 +368,11 @@ def test_initial_state_builds_user_message_and_round_budget(project_root: str) -
 
     system 段不在这里 —— 它交给 `create_agent(system_prompt=...)`。
     """
-    max_rounds = max_rounds_for(2)
-    state = initial_state(make_group(["H-01", "H-02"]), max_rounds)
+    state = initial_state(make_group(["H-01", "H-02"]))
 
     assert len(state["messages"]) == 1
     assert state["messages"][0].type == "human"
     assert state["round_count"] == 0
-    assert state["max_rounds"] == 30
     assert state["no_report_rounds"] == 0
     assert state["end_done_count"] == 0
     assert pending_ids(state["hunk_status"]) == ["H-01", "H-02"]
@@ -490,23 +478,6 @@ def test_diff_index_reaches_the_tool(project_root: str) -> None:
     second_request = "\n".join(str(message.content) for message in llm.calls[1])
     assert "@@ -1,1 +1,1 @@" in second_request
     assert "+new()" in second_request
-
-
-def test_main_loop_exits_on_max_rounds(project_root: str) -> None:
-    """测试达到最大轮次退出。
-
-    每轮都调 report_hunks 把 no_report_rounds 压回 0，
-    保证触发的是 max_rounds 而不是 no_progress。
-    轮次上限现在由框架的 ModelCallLimitMiddleware 执行。
-    """
-    max_rounds = max_rounds_for(1)
-    llm = ScriptedChatModel(
-        responses=[report_call(["H-01"], complete=False) for _ in range(max_rounds)]
-    )
-
-    result = run_review_agent(make_group(["H-01"]), llm, project_root)
-    assert result.exit_reason == EXIT_MAX_ROUNDS
-    assert result.round_count == max_rounds
 
 
 def test_main_loop_exits_on_no_progress(project_root: str) -> None:
@@ -1099,7 +1070,7 @@ def test_end_done_wins_over_budget() -> None:
 
     否则用户会看到一个**假的缺口** —— 明明全审完了，输出却说「因预算停止」。
     """
-    state = initial_state(make_group(["H-01"]), 30)
+    state = initial_state(make_group(["H-01"]))
     state["end_done_count"] = 1
     state["stop_reason"] = STOP_COST
     state["hunk_status"] = {"H-01": HunkStatus(hunk_id="H-01", status=STATUS_DONE)}
@@ -1195,10 +1166,10 @@ def test_duplicate_read_is_not_executed_end_to_end(project_root: str) -> None:
     llm = ScriptedChatModel(
         responses=[read_call("c1"), read_call("c2"), report_call(["H-01"]), done_call("c3")],
     )
-    agent = build_review_agent(llm, max_rounds=10)
+    agent = build_review_agent(llm)
 
     final = agent.invoke(
-        initial_state(make_group(["H-01"]), 10),
+        initial_state(make_group(["H-01"])),
         context=ReviewContext(project_root=project_root, head_rev=""),
     )
     reads = {
@@ -1221,10 +1192,10 @@ def test_report_hunks_is_never_deduped(project_root: str) -> None:
             done_call("c3"),
         ]
     )
-    agent = build_review_agent(llm, max_rounds=10)
+    agent = build_review_agent(llm)
 
     final = agent.invoke(
-        initial_state(make_group(["H-01"]), 10),
+        initial_state(make_group(["H-01"])),
         context=ReviewContext(project_root=project_root, head_rev=""),
     )
     reports = [
@@ -1296,10 +1267,10 @@ def test_consecutive_failures_escalate_the_message(project_root: str, exploding:
             done_call(),
         ]
     )
-    agent = build_review_agent(llm, max_rounds=10)
+    agent = build_review_agent(llm)
 
     final = agent.invoke(
-        initial_state(make_group(["H-01"]), 10),
+        initial_state(make_group(["H-01"])),
         context=ReviewContext(project_root=project_root, head_rev=""),
     )
     results = {
@@ -1316,10 +1287,10 @@ def test_total_failures_stop_the_group(project_root: str, exploding: None) -> No
     """累计失败到上限 → 本组带缺口退出，而不是一路烧到预算见底。"""
     # 5 次失败（默认 tool_fail_exit）之后，第 6 轮开始前就该停
     llm = ScriptedChatModel(responses=[explode_call(f"c{index}") for index in range(5)])
-    agent = build_review_agent(llm, max_rounds=20)
+    agent = build_review_agent(llm)
 
     final = agent.invoke(
-        initial_state(make_group(["H-01"]), 20),
+        initial_state(make_group(["H-01"])),
         context=ReviewContext(project_root=project_root, head_rev=""),
     )
 
@@ -1344,10 +1315,10 @@ def test_success_resets_the_streak_but_not_the_total(project_root: str, explodin
             done_call(),
         ]
     )
-    agent = build_review_agent(llm, max_rounds=20)
+    agent = build_review_agent(llm)
 
     final = agent.invoke(
-        initial_state(make_group(["H-01"]), 20),
+        initial_state(make_group(["H-01"])),
         context=ReviewContext(project_root=project_root, head_rev=""),
     )
     results = {
@@ -1368,10 +1339,10 @@ def test_parallel_failures_each_count(project_root: str, exploding: None) -> Non
     但用例要求它真的算准。
     """
     llm = ScriptedChatModel(responses=[parallel_explode_call(f"r{index}") for index in range(3)])
-    agent = build_review_agent(llm, max_rounds=20)
+    agent = build_review_agent(llm)
 
     final = agent.invoke(
-        initial_state(make_group(["H-01"]), 20),
+        initial_state(make_group(["H-01"])),
         context=ReviewContext(project_root=project_root, head_rev=""),
     )
 

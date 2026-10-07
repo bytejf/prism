@@ -7,7 +7,7 @@
 
     from prism.config.settings import settings
 
-    max_rounds = max(settings.review.min_rounds, n * settings.review.rounds_per_hunk)
+    max_group_cost = settings.review.max_group_cost
 
 ## 优先级
 
@@ -52,8 +52,6 @@ class ReviewSettings:
     """审查循环的轮次与节奏。
 
     Attributes:
-        min_rounds: 单组最少给的轮次
-        rounds_per_hunk: 每个 hunk 追加的轮次
         no_progress_remind_rounds: 连续无产出到这些轮次时注入提醒
         no_progress_exit_rounds: 连续无产出到该轮次强制退出
         max_rejections: end_done 被拒绝的上限，超过就接受并带缺口退出
@@ -64,10 +62,9 @@ class ReviewSettings:
         max_review_seconds: 整条 review 的时长上限（秒）
         tool_fail_remind: 工具连续失败到几次时追加硬提醒
         tool_fail_exit: 工具累计失败到几次时带缺口退出本组
+        max_super_steps: LangGraph 的递归上限（最后一道，正常碰不到）
     """
 
-    min_rounds: int
-    rounds_per_hunk: int
     no_progress_remind_rounds: tuple[int, ...]
     no_progress_exit_rounds: int
     max_rejections: int
@@ -78,6 +75,7 @@ class ReviewSettings:
     max_review_seconds: float
     tool_fail_remind: int
     tool_fail_exit: int
+    max_super_steps: int
 
 
 @dataclass(frozen=True)
@@ -401,8 +399,6 @@ def load(path: Path = PATH) -> Settings:
 
     review = root.section("review")
     review_settings = ReviewSettings(
-        min_rounds=review.count("min_rounds"),
-        rounds_per_hunk=review.count("rounds_per_hunk"),
         no_progress_remind_rounds=review.numbers("no_progress_remind_rounds"),
         no_progress_exit_rounds=review.count("no_progress_exit_rounds"),
         max_rejections=review.count("max_rejections"),
@@ -413,6 +409,7 @@ def load(path: Path = PATH) -> Settings:
         max_review_seconds=review.number("max_review_seconds"),
         tool_fail_remind=review.count("tool_fail_remind"),
         tool_fail_exit=review.count("tool_fail_exit"),
+        max_super_steps=review.count("max_super_steps"),
     )
 
     cost = root.section("cost")

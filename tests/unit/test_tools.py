@@ -115,7 +115,6 @@ def make_state(*hunk_ids: str) -> ReviewState:
         end_done_mark=0,
         round_count=0,
         stop_reason="",
-        max_rounds=30,
         no_report_rounds=0,
         end_done_count=0,
         group=None,  # type: ignore[typeddict-item]

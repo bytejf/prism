@@ -140,8 +140,8 @@ def test_load_maps_every_value() -> None:
         settings.compression.max_consecutive_failures == compression_raw["max_consecutive_failures"]
     )
 
-    assert settings.review.min_rounds == review_raw["min_rounds"]
-    assert settings.review.rounds_per_hunk == review_raw["rounds_per_hunk"]
+    assert settings.review.max_group_tokens == review_raw["max_group_tokens"]
+    assert settings.review.max_super_steps == review_raw["max_super_steps"]
     assert settings.review.no_progress_exit_rounds == review_raw["no_progress_exit_rounds"]
     assert settings.review.max_rejections == review_raw["max_rejections"]
     # toml 数组读进来是 list，配置里存成 tuple
@@ -250,13 +250,15 @@ def test_wrong_element_type_in_array_is_rejected(tmp_path: Path) -> None:
 
 def test_error_message_names_the_file(tmp_path: Path) -> None:
     """测试：报错里带文件名 —— 同时写了好几份配置时，得知道是哪一份错了。"""
-    path = write_config(tmp_path, with_line("min_rounds = 30", "min_rounds = 0"))
+    path = write_config(tmp_path, with_line("max_super_steps = 1400", "max_super_steps = 0"))
 
-    # min_rounds = 0 本身合法，这里只借它确认错误信息带文件名的那条路径
-    assert load(path).review.min_rounds == 0
+    # max_super_steps = 0 本身合法，这里只借它确认错误信息带文件名的那条路径
+    assert load(path).review.max_super_steps == 0
     bad = write_config(
         tmp_path,
-        with_line("min_rounds = 30", "min_rounds = 0").replace("min_rounds = 0", "min_round = 0"),
+        with_line("max_super_steps = 1400", "max_super_steps = 0").replace(
+            "max_super_steps = 0", "max_super_step = 0"
+        ),
     )
     with pytest.raises(ValueError, match=r"config\.toml"):
         load(bad)

@@ -40,7 +40,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
 from prism.core.agent.agent import initial_state, run_review_agent
-from prism.core.agent.state import ReviewState, max_rounds_for, pending_ids
+from prism.core.agent.state import ReviewState, pending_ids
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
@@ -248,7 +248,7 @@ def test_debug_full_pipeline() -> None:
     # dump_state 里能看到完整的送审内容：审查范围 / 审查要求 / 报告节奏 / 结束审查
     # 想调其他组就改这个下标
     first_group = groups[0]
-    state = initial_state(first_group, max_rounds_for(len(first_group.hunks)))
+    state = initial_state(first_group)
     print(
         f"\n[5] 状态组装: {len(state['messages'])} 条初始消息，"
         f"{len(state['hunk_status'])} 个待审 hunk"

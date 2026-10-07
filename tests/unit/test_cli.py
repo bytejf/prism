@@ -122,7 +122,7 @@ def test_run_groups_stops_when_review_cost_is_exceeded(
         replace(settings, review=replace(settings.review, max_review_cost=2.0)),
     )
 
-    comments, misses, gaps, skipped = main._run_groups(
+    comments, misses, gaps, skipped, _pending = main._run_groups(
         make_groups(4), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
@@ -150,7 +150,7 @@ def test_reflection_usage_counts_toward_the_review_budget(
         replace(settings, review=replace(settings.review, max_review_cost=1.0)),
     )
 
-    _comments, _misses, _gaps, skipped = main._run_groups(
+    _comments, _misses, _gaps, skipped, _pending = main._run_groups(
         make_groups(4), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
@@ -168,7 +168,7 @@ def test_run_groups_stops_on_review_time_budget(
         replace(settings, review=replace(settings.review, max_review_seconds=60.0)),
     )
 
-    _comments, _misses, _gaps, skipped = main._run_groups(
+    _comments, _misses, _gaps, skipped, _pending = main._run_groups(
         make_groups(3), tmp_path, "HEAD", {}, StaticReport(), time.monotonic() - 120.0
     )
 
@@ -182,10 +182,37 @@ def test_run_groups_reports_total_when_nothing_was_skipped(
     """没触发闸门时照常跑完，并打一行总计。"""
     ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=10))
 
-    _comments, _misses, _gaps, skipped = main._run_groups(
+    _comments, _misses, _gaps, skipped, _pending = main._run_groups(
         make_groups(2), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
     assert ran == ["group-001", "group-002"]
     assert skipped == 0
     assert "总计" in capsys.readouterr().out
+
+
+def test_unfinished_hunks_are_counted_and_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """没审完的 hunk 要一路传到输出 —— 「0 条评论」不能看起来像「代码很干净」。"""
+    ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=10))
+
+    def incomplete(group: Group, *_args: object, **_kwargs: object) -> MainLoopResult:
+        ran.append(group.group_id)
+        return MainLoopResult(
+            group_id=group.group_id,
+            exit_reason="budget_cost",
+            round_count=2,
+            usage=UsageTotals(calls=1, output=10),
+            pending_hunk_ids=["H-01"],
+        )
+
+    monkeypatch.setattr(main, "run_review_agent", incomplete)
+
+    _comments, _misses, _gaps, skipped, pending = main._run_groups(
+        make_groups(1), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
+    )
+
+    assert pending == 1
+    assert skipped == 0
+    assert "未审 hunk=1" in capsys.readouterr().out

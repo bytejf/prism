@@ -28,7 +28,6 @@ STATUS_DONE = "done"
 # 退出原因取值
 EXIT_END_DONE = "end_done"
 EXIT_END_DONE_WITH_GAPS = "end_done_with_gaps"
-EXIT_MAX_ROUNDS = "max_rounds"
 EXIT_NO_PROGRESS = "no_progress"
 # 撞上 recursion_limit：**不该发生**（说明前面几道闸一个都没生效），带缺口退出
 EXIT_RECURSION = "recursion"
@@ -100,8 +99,7 @@ class ReviewState(AgentState):
 
     Attributes:
         hunk_status: hunk 状态表（hunk_id → HunkStatus）。并行写按 key 合并
-        round_count: 已完成的模型调用轮次
-        max_rounds: 最大轮次
+        round_count: 已完成的模型调用轮次（**只是观测数据**，不再参与退出判定）
         no_report_rounds: 连续无产出的轮次数
         end_done_count: 上次有进展以来 end_done 被调用的次数（拒绝机制用）
         end_done_mark: 上次重置时已完成的 hunk 数，用来判断「有没有新进展」
@@ -114,7 +112,6 @@ class ReviewState(AgentState):
 
     hunk_status: Annotated[dict[str, HunkStatus], merge_hunk_status]
     round_count: int
-    max_rounds: int
     no_report_rounds: int
     end_done_count: int
     end_done_mark: int
@@ -165,28 +162,14 @@ def end_done_verdict(end_done_count: int, pending: list[str]) -> tuple[bool, lis
     return end_done_count > settings.review.max_rejections, pending
 
 
-def max_rounds_for(hunk_count: int) -> int:
-    """按 hunk 数计算最大轮次。
-
-    两个数都来自配置的 `[review]`。
-
-    Args:
-        hunk_count: 本组 hunk 数
-
-    Returns:
-        max(min_rounds, hunk 数 × rounds_per_hunk)
-    """
-    return max(
-        settings.review.min_rounds,
-        hunk_count * settings.review.rounds_per_hunk,
-    )
-
-
 def exit_reason_of(state: ReviewState) -> str | None:
     """从**终态**读出退出原因，而不是一路传递。
 
     这样 `exit_reason` 不必进 state —— 它是终态的一个纯函数，好测也好读。
-    优先级与旧的 check_exit 一致：end_done 裁决 → 轮次耗尽 → 连续无产出。
+    顺序：**end_done 裁决 → 预算 → 工具失败 → 连续无产出**。
+
+    顺序是有讲究的：审完了就是审完了（不该报成「因预算停止」而给用户一个假缺口），
+    而预算比「连续无产出」更值得报 —— 后者往往只是前者的表象。
 
     Args:
         state: 循环结束时的状态
@@ -206,9 +189,6 @@ def exit_reason_of(state: ReviewState) -> str | None:
         return EXIT_BUDGET_TIME
     if state["stop_reason"] == STOP_TOOL_FAILURES:
         return EXIT_TOOL_FAILURES
-
-    if state["round_count"] >= state["max_rounds"]:
-        return EXIT_MAX_ROUNDS
 
     if state["no_report_rounds"] >= settings.review.no_progress_exit_rounds:
         return EXIT_NO_PROGRESS

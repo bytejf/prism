@@ -11,7 +11,8 @@
 
 职责划分：
 
-- 轮次上限交给框架的 `ModelCallLimitMiddleware`（它就是干这个的）
+- 止损交给**预算**（钱 / 时间 / 工具失败），不按轮数数 —— 轮数是代理指标，
+  同一轮的成本能差几十倍（见 `budget.py`）
 - 本模块只管**语义退出**：end_done 裁决、连续无产出、纯文本不停机
 """
 
@@ -146,7 +147,7 @@ def end_done_reset(state: ReviewState) -> dict[str, Any]:
 def should_exit(state: ReviewState, *, end_done_count: int | None = None) -> bool:
     """语义退出判定。
 
-    轮次上限**不在这里** —— 那是 `ModelCallLimitMiddleware` 的职责。
+    资源止损（钱 / 时间 / 工具失败）**不在这里** —— 那是各自中间件的职责。
     本函数只答「审查这件事本身结束了吗」。
 
     Args:

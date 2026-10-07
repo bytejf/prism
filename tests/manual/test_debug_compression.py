@@ -91,7 +91,7 @@ from langchain_core.messages import BaseMessage
 from prism.config.settings import settings
 from prism.core.agent.agent import build_review_agent, initial_state
 from prism.core.agent.context import ReviewContext
-from prism.core.agent.state import ReviewState, max_rounds_for, pending_ids
+from prism.core.agent.state import ReviewState, pending_ids
 from prism.core.ast.mapper import map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
@@ -228,15 +228,13 @@ def test_debug_compression(one_file_repo: Path) -> None:
     assert len(groups) == 1, "只放了一个文件，应当只有一个审查单元"
 
     group = groups[0]
-    max_rounds = max_rounds_for(len(group.hunks))
-    state = initial_state(group, max_rounds)
+    state = initial_state(group)
     logger.info(
         "审查单元 %s：%s，%d 个文件，%d 个 hunk，上限 %d 轮",
         group.group_id,
         group.package_path,
         len(group.files),
         len(group.hunks),
-        max_rounds,
     )
     logger.info("首条消息（指导 + diff）共 %d 字符", len(str(state["messages"][0].content)))
 
@@ -253,7 +251,7 @@ def test_debug_compression(one_file_repo: Path) -> None:
     )
 
     model = LLMClient(settings.llm).model
-    agent = build_review_agent(model, max_rounds, config)
+    agent = build_review_agent(model, config)
 
     # ── 循环：断在这里可以 step into 中间件与工具 ─────────────────────
     final = cast(
@@ -261,7 +259,9 @@ def test_debug_compression(one_file_repo: Path) -> None:
         agent.invoke(
             state,
             context=ReviewContext(project_root=str(one_file_repo), head_rev=HEAD_BRANCH),
-            config={"recursion_limit": max_rounds * 7 + 20},
+            # 调试脚本里把递归上限放小：这个脚本就是要逼出压缩那一轮，跑飞了
+            # 反而慢
+            config={"recursion_limit": 400},
         ),
     )
 

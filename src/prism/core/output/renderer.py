@@ -50,6 +50,7 @@ DELETED_NOTE = "（已删除）"
 # 因预算停组的提示。**放在头部而不是尾注**：它改变的是「这份报告覆盖了多少」，
 # 读者要在看评论之前就知道，而不是看完才补一句
 SKIPPED_GROUPS_NOTE = "⚠️ 因预算停止，还有 {count} 个审查单元未审"
+PENDING_HUNKS_NOTE = "⚠️ 有 {count} 个 hunk 没能审完（预算或其他中断拿掉了剩下的轮次）"
 
 # 徽章，如 [concurrency · high]
 BADGE_TEMPLATE = "[{category} · {severity}]"
@@ -154,6 +155,8 @@ class TerminalRenderer:
         ]
         if stats.skipped_groups:
             lines.append(SKIPPED_GROUPS_NOTE.format(count=stats.skipped_groups))
+        if stats.pending_hunks:
+            lines.append(PENDING_HUNKS_NOTE.format(count=stats.pending_hunks))
         return "\n".join(lines)
 
     @staticmethod
