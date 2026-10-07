@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from prism.models.compression import CompressionConfig
+from prism.models.cost import CostConfig
 from prism.models.llm import API_KEY_ENV, LLMConfig
 
 # 配置本体。与 `__file__` 同级 —— 走 editable 安装时是 `src/prism/config/`，
@@ -57,6 +58,10 @@ class ReviewSettings:
         no_progress_exit_rounds: 连续无产出到该轮次强制退出
         max_rejections: end_done 被拒绝的上限，超过就接受并带缺口退出
         max_group_tokens: 单个审查组的提示词预算（估算 token），分组按它装箱
+        max_group_cost: 单组花费上限（元）
+        max_group_seconds: 单组时长上限（秒）
+        max_review_cost: 整条 review 的花费上限（元）
+        max_review_seconds: 整条 review 的时长上限（秒）
     """
 
     min_rounds: int
@@ -65,6 +70,10 @@ class ReviewSettings:
     no_progress_exit_rounds: int
     max_rejections: int
     max_group_tokens: int
+    max_group_cost: float
+    max_group_seconds: float
+    max_review_cost: float
+    max_review_seconds: float
 
 
 @dataclass(frozen=True)
@@ -136,6 +145,7 @@ class Settings:
     Attributes:
         llm: 模型、端点与窗口
         compression: 压缩阈值。`context_window` 来自 `[llm]`，不重复写在 toml 里
+        cost: 每百万 token 的价格
         review: 审查循环的轮次与节奏
         static: 静态分析的超时
         tools: 工具限制
@@ -144,6 +154,7 @@ class Settings:
 
     llm: LLMConfig
     compression: CompressionConfig
+    cost: CostConfig
     review: ReviewSettings
     static: StaticSettings
     tools: ToolsSettings
@@ -161,6 +172,7 @@ class Settings:
 SCHEMA: dict[str, tuple[type, frozenset[str]]] = {
     "llm": (LLMConfig, frozenset({"api_key", "temperature"})),
     "compression": (CompressionConfig, frozenset({"context_window"})),
+    "cost": (CostConfig, frozenset()),
     "review": (ReviewSettings, frozenset()),
     "static": (StaticSettings, frozenset()),
     "log": (LogSettings, frozenset()),
@@ -287,6 +299,26 @@ class _Section:
             raise self._fail(f"{key} 应为整数，实为 {type(value).__name__}")
         return value
 
+    def number(self, key: str) -> float:
+        """读一个数（整数或小数都收，统一成 float）。
+
+        预算与价格这类值天然是小数（2.0 元、0.5 元/百万）。**不接 `bool`** ——
+        `true` 会静默变成 1.0，跟 `count` 那边是同一个坑。
+
+        Args:
+            key: 键名
+
+        Returns:
+            浮点值
+
+        Raises:
+            ValueError: 缺失或类型不符
+        """
+        value = self._raw(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise self._fail(f"{key} 应为数值，实为 {type(value).__name__}")
+        return float(value)
+
     def numbers(self, key: str) -> tuple[int, ...]:
         """读一个整数数组。
 
@@ -371,6 +403,17 @@ def load(path: Path = PATH) -> Settings:
         no_progress_exit_rounds=review.count("no_progress_exit_rounds"),
         max_rejections=review.count("max_rejections"),
         max_group_tokens=review.count("max_group_tokens"),
+        max_group_cost=review.number("max_group_cost"),
+        max_group_seconds=review.number("max_group_seconds"),
+        max_review_cost=review.number("max_review_cost"),
+        max_review_seconds=review.number("max_review_seconds"),
+    )
+
+    cost = root.section("cost")
+    cost_config = CostConfig(
+        cache_hit=cost.number("cache_hit"),
+        cache_miss=cost.number("cache_miss"),
+        output=cost.number("output"),
     )
 
     static = root.section("static")
@@ -391,6 +434,7 @@ def load(path: Path = PATH) -> Settings:
     return Settings(
         llm=llm_config,
         compression=compression_config,
+        cost=cost_config,
         review=review_settings,
         static=static_settings,
         tools=ToolsSettings(file_read=file_read_settings, code_search=code_search_settings),

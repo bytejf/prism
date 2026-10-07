@@ -74,6 +74,9 @@ class ReviewStats:
         files_count: 文件数
         comments_count: 评论数
         duration_seconds: 耗时（秒）
+        skipped_groups: 因预算没跑的审查单元数。**必须报出来** —— 少审了几个组
+            与「那些组没问题」在输出上长得一模一样（同 file_read_diff 索引为空
+            要报错那条）
     """
 
     base_branch: str
@@ -81,3 +84,4 @@ class ReviewStats:
     files_count: int
     comments_count: int
     duration_seconds: float
+    skipped_groups: int = 0

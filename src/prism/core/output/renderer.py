@@ -47,6 +47,10 @@ SEPARATOR_TEMPLATE = "─── {path}:{span}{note} ───"
 # 当前文件里找是找不到的 —— 不标的话读者会以为定位错了
 DELETED_NOTE = "（已删除）"
 
+# 因预算停组的提示。**放在头部而不是尾注**：它改变的是「这份报告覆盖了多少」，
+# 读者要在看评论之前就知道，而不是看完才补一句
+SKIPPED_GROUPS_NOTE = "⚠️ 因预算停止，还有 {count} 个审查单元未审"
+
 # 徽章，如 [concurrency · high]
 BADGE_TEMPLATE = "[{category} · {severity}]"
 
@@ -142,14 +146,15 @@ class TerminalRenderer:
         Returns:
             头部文本
         """
-        return "\n".join(
-            (
-                HEADER_TITLE,
-                f"审查范围：merge-base({stats.base_branch}, {stats.head_sha})..{stats.head_sha}",
-                f"文件数：{stats.files_count} | 评论数：{stats.comments_count}"
-                f" | 耗时：{stats.duration_seconds:.1f}s",
-            )
-        )
+        lines = [
+            HEADER_TITLE,
+            f"审查范围：merge-base({stats.base_branch}, {stats.head_sha})..{stats.head_sha}",
+            f"文件数：{stats.files_count} | 评论数：{stats.comments_count}"
+            f" | 耗时：{stats.duration_seconds:.1f}s",
+        ]
+        if stats.skipped_groups:
+            lines.append(SKIPPED_GROUPS_NOTE.format(count=stats.skipped_groups))
+        return "\n".join(lines)
 
     @staticmethod
     def _render_comment(comment: Comment) -> str:

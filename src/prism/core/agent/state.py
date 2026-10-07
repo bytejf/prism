@@ -12,6 +12,8 @@ from typing import Annotated
 from langchain.agents.middleware import AgentState
 
 from prism.config.settings import settings
+from prism.core.agent.budget import STOP_COST
+from prism.models.cost import UsageTotals
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
 
@@ -32,6 +34,10 @@ EXIT_NO_PROGRESS = "no_progress"
 EXIT_RECURSION = "recursion"
 # 图抛了别的异常：同样带缺口退出，不把整条 review 带走
 EXIT_ERROR = "error"
+# 超预算：钱 / 时间。**这是主约束**（轮数只是兜底），两个原因分开记，
+# 因为处置不同 —— 花钱超了要调价格表或提示词，时间超了要看单次延迟
+EXIT_BUDGET_COST = "budget_cost"
+EXIT_BUDGET_TIME = "budget_time"
 
 
 @dataclass
@@ -97,6 +103,8 @@ class ReviewState(AgentState):
         end_done_count: 上次有进展以来 end_done 被调用的次数（拒绝机制用）
         end_done_mark: 上次重置时已完成的 hunk 数，用来判断「有没有新进展」
         group: 当前审查单元
+        usage: 累计用量（**按轮增量累加**，不能最后扫消息：压缩会把历史删掉）
+        budget_stop: 因预算停下的原因（``cost`` / ``time``），没超时为 ""
     """
 
     hunk_status: Annotated[dict[str, HunkStatus], merge_hunk_status]
@@ -106,6 +114,8 @@ class ReviewState(AgentState):
     end_done_count: int
     end_done_mark: int
     group: Group
+    usage: UsageTotals
+    budget_stop: str
 
 
 def pending_ids(hunk_status: dict[str, HunkStatus]) -> list[str]:
@@ -180,8 +190,15 @@ def exit_reason_of(state: ReviewState) -> str | None:
         退出原因；三个条件都不满足时返回 None（正常不该发生，由调用方报错）
     """
     pending = pending_ids(state["hunk_status"])
+    # 顺序：**审完了就是审完了** —— 让预算把一个已完成的组标成「因预算停止」，
+    # 是给用户一个假的缺口
     if state["end_done_count"] > 0 and end_done_verdict(state["end_done_count"], pending)[0]:
         return EXIT_END_DONE_WITH_GAPS if pending else EXIT_END_DONE
+
+    if state["budget_stop"] == STOP_COST:
+        return EXIT_BUDGET_COST
+    if state["budget_stop"]:
+        return EXIT_BUDGET_TIME
 
     if state["round_count"] >= state["max_rounds"]:
         return EXIT_MAX_ROUNDS
@@ -201,6 +218,7 @@ class MainLoopResult:
 
     Attributes:
         group_id: 审查单元编号
+        usage: 本组用量（含审查循环；反思的用量另加在调用方）
         exit_reason: 退出原因
         round_count: 实际跑了多少轮
         hunk_comments: hunk 编号 → 该 hunk 收集到的评论（按编号排序）
@@ -212,6 +230,7 @@ class MainLoopResult:
     round_count: int
     hunk_comments: dict[str, list[CommentInput]] = field(default_factory=dict)
     pending_hunk_ids: list[str] = field(default_factory=list)
+    usage: UsageTotals = field(default_factory=UsageTotals)
 
     @property
     def comments(self) -> list[CommentInput]:

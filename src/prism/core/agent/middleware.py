@@ -16,6 +16,7 @@
 """
 
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -30,6 +31,12 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command
 
 from prism.config.settings import settings
+from prism.core.agent.budget import (
+    add_usage,
+    describe,
+    exceeded,
+    usage_of_message,
+)
 from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
@@ -39,6 +46,7 @@ from prism.core.agent.state import (
     pending_ids,
 )
 from prism.core.agent.status import build_review_status
+from prism.models.cost import UsageTotals
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +94,27 @@ def update_no_report_rounds(current: int, tool_calls: Sequence[Mapping[str, Any]
     if names & PROGRESS_TOOL_NAMES:
         return 0
     return current + 1
+
+
+def _round_usage(messages: Sequence[BaseMessage]) -> UsageTotals:
+    """取**本轮**那一条 AI 消息的用量。
+
+    增量累加而不是最后扫一遍消息列表：压缩会把历史消息从列表里删掉，扫出来的账
+    是漏的（实测大组一次能压 2 次）。这里取最后一条消息 —— `after_model` 就在模型
+    刚返回、工具还没跑的时候，尾部必然是本轮那一条。
+
+    Args:
+        messages: 消息列表
+
+    Returns:
+        本轮用量；尾部不是 AI 消息时返回空用量
+    """
+    if not messages:
+        return UsageTotals()
+    last = messages[-1]
+    if not isinstance(last, AIMessage):
+        return UsageTotals()
+    return usage_of_message(last)
 
 
 def end_done_reset(state: ReviewState) -> dict[str, Any]:
@@ -179,6 +208,11 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         """
         super().__init__()
         self._compressor = compressor
+        # 本组的起点。预算里的「时长」从这里算 —— 实例是每组新建的（见类 docstring），
+        # 所以这个时间戳天然是「本组开始」
+        self._started = time.monotonic()
+        # 「拿不到用量」只警告一次：每轮都喊会把日志淹掉，而根因是同一个
+        self._warned_missing_usage = False
 
     def before_model(
         self, state: ReviewState, runtime: Runtime[ReviewContext]
@@ -198,6 +232,10 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         """
         updates: dict[str, Any] = {}
 
+        # 告警与判定分开：告警每次都要有机会发生（它说的是「成本闸可能失效」），
+        # 而判定只在真要停的时候才用得上
+        self._warn_if_usage_missing(state)
+
         reset = end_done_reset(state)
         if reset:
             logger.debug("新审完 hunk，重置 end_done 纠正机会")
@@ -208,6 +246,12 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         if should_exit(state, end_done_count=end_done_count):
             logger.info("退出：end_done 或连续无产出已达阈值")
             return {**updates, "jump_to": "end"}
+
+        # **语义退出优先于预算**：审完了就是审完了 —— 让预算把一个已完成的组标成
+        # 「因预算停止」，是给用户一个假的缺口。预算管的是「还没完但不能再花了」
+        verdict = self._budget_verdict(state)
+        if verdict is not None:
+            return {**updates, "budget_stop": verdict, "jump_to": "end"}
 
         # **退出判定要在压缩之前**：这一轮就要收尾了还去压一遍历史，是白烧一次
         # 完整的摘要请求（实测踩到过 —— end_done 已经调完的那一轮仍然压了一次）
@@ -222,6 +266,58 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
                 ]
 
         return updates or None
+
+    def _warn_if_usage_missing(self, state: ReviewState) -> None:
+        """拿不到用量时警告一次（每组一次）。
+
+        成本闸完全依赖 `usage_metadata`，而它是提供商给的。缺了它，钱那一档就永远
+        不响 —— 那是「不报错的错链路」，必须让它在日志里可见。警告放在判定**之外**：
+        就算本组马上要因为别的原因退出，这件事也该被记下来。
+
+        Args:
+            state: 当前状态
+        """
+        if not state["usage"].missing or self._warned_missing_usage:
+            return
+        self._warned_missing_usage = True
+        logger.warning(
+            "有 %d 次调用拿不到用量，成本只能算下界；本组的花费闸可能失效，"
+            "兜底的是时间闸与 recursion_limit",
+            state["usage"].missing,
+        )
+
+    def _budget_verdict(self, state: ReviewState) -> str | None:
+        """判预算：超了返回原因码，没超返回 None。
+
+        **钱和时间都要看**：用量拿不到时钱这条会失效（那时只有时间能兜），
+        时间则永远在涨。所以这不是「双保险」，是两条各自会单独失效的判据。
+
+        Args:
+            state: 当前状态
+
+        Returns:
+            `STOP_COST` / `STOP_TIME` / None
+        """
+        usage = state["usage"]
+        elapsed = time.monotonic() - self._started
+        verdict = exceeded(
+            usage,
+            elapsed,
+            prices=settings.cost,
+            max_cost=settings.review.max_group_cost,
+            max_seconds=settings.review.max_group_seconds,
+        )
+        if verdict is None:
+            return None
+        logger.warning(
+            "本组超预算（%s）：%s · 已用 %.0f 秒 · 预算 %.3f 元 / %.0f 秒",
+            verdict,
+            describe(usage, settings.cost),
+            elapsed,
+            settings.review.max_group_cost,
+            settings.review.max_group_seconds,
+        )
+        return verdict
 
 
 # `can_jump_to` 的读取路径是 `getattr(middleware.__class__, "before_model").__can_jump_to__`
@@ -250,6 +346,7 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     updates: dict[str, Any] = {
         "round_count": state["round_count"] + 1,
         "no_report_rounds": no_report,
+        "usage": add_usage(state["usage"], _round_usage(state["messages"])),
     }
 
     if calls:

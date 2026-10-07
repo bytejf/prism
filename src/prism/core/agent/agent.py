@@ -48,6 +48,7 @@ from prism.core.tools.file_read import file_read
 from prism.core.tools.file_read_diff import file_read_diff
 from prism.core.tools.report_hunks import report_hunks
 from prism.models.compression import CompressionConfig
+from prism.models.cost import UsageTotals
 from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.models.static import StaticFinding
@@ -168,6 +169,8 @@ def initial_state(
         end_done_count=0,
         end_done_mark=0,
         group=group,
+        usage=UsageTotals(),
+        budget_stop="",
     )
 
 
@@ -248,6 +251,7 @@ def run_review_agent(
         round_count=final["round_count"],
         hunk_comments=hunk_comments,
         pending_hunk_ids=pending,
+        usage=final["usage"],
     )
 
 

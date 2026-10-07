@@ -64,6 +64,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 
+from prism.core.agent.budget import usage_of
 from prism.core.guidance import templates as tpl
 from prism.core.guidance.builder import build_diff_block
 from prism.core.reflection.state import (
@@ -73,6 +74,7 @@ from prism.core.reflection.state import (
 )
 from prism.core.reflection.tools import report_incorrect_comments
 from prism.models.comment import Comment
+from prism.models.cost import UsageTotals
 from prism.models.grouping import Group
 from prism.models.reflection import PotentialMiss
 from prism.observability.llm_trace import ReviewTrace, fields
@@ -102,12 +104,15 @@ class ReflectionOutcome:
         removed: 被去掉的评论及其依据（审计用）
         misses: 疑似漏报信号。独立字段，不进 `kept`
         failure: 失败原因；没失败为 None
+        usage: 本次反思的用量。**全局预算要把它算进去** —— 组级闸只看得到审查
+            循环（它在反思之前就结束了），只算循环会漏掉每组一次的这笔钱
     """
 
     kept: list[Comment]
     removed: list[Removal] = field(default_factory=list)
     misses: list[PotentialMiss] = field(default_factory=list)
     failure: str | None = None
+    usage: UsageTotals = field(default_factory=UsageTotals)
 
 
 class ReflectionCompletion(AgentMiddleware[ReflectionState, ReflectionContext, Any]):
@@ -291,12 +296,16 @@ def reflect(model: BaseChatModel, group: Group, comments: list[Comment]) -> Refl
         return ReflectionOutcome(kept=list(comments), failure=reason)
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
+    # 反思不压缩，所以直接扫终态消息最省事（审查循环那边不能这么干 —— 压缩会把
+    # 历史删掉，账会漏，见 core/agent/budget.py 的说明）
+    usage = usage_of(final["messages"])
+
     # 受理过才算成功。**只看这个**，不看「模型有没有调过工具」：调过但每次都被
     # 退回的，与一次都没调的，对我们来说是同一件事 —— 手上没有可信结论
     if not final["reported"]:
         reason = "模型没交出可受理的结论（未调用工具，或反复被退回）"
         logger.warning("反思 · 失败 · %s，已保留全部 %d 条", reason, len(comments))
-        return ReflectionOutcome(kept=list(comments), failure=reason)
+        return ReflectionOutcome(kept=list(comments), failure=reason, usage=usage)
 
     removals = sorted(final["removals"].values(), key=lambda item: item.comment_id)
     misses = list(final["misses"])
@@ -323,4 +332,4 @@ def reflect(model: BaseChatModel, group: Group, comments: list[Comment]) -> Refl
             ),
         ),
     )
-    return ReflectionOutcome(kept=kept, removed=removals, misses=misses)
+    return ReflectionOutcome(kept=kept, removed=removals, misses=misses, usage=usage)

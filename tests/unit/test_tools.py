@@ -39,6 +39,7 @@ from prism.core.tools.file_read import file_read
 from prism.core.tools.file_read_diff import file_read_diff
 from prism.core.tools.paths import check_relative_path
 from prism.core.tools.report_hunks import report_hunks
+from prism.models.cost import UsageTotals
 from prism.observability.llm_trace import _describe_tool
 
 CONTEXT_WITHOUT_ROOT = ReviewContext(project_root="")
@@ -113,10 +114,12 @@ def make_state(*hunk_ids: str) -> ReviewState:
         },
         end_done_mark=0,
         round_count=0,
+        budget_stop="",
         max_rounds=30,
         no_report_rounds=0,
         end_done_count=0,
         group=None,  # type: ignore[typeddict-item]
+        usage=UsageTotals(),
     )
 
 

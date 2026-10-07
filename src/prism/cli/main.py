@@ -89,6 +89,7 @@ import typer
 
 from prism.config.settings import settings
 from prism.core.agent.agent import run_review_agent
+from prism.core.agent.budget import add_usage, describe, exceeded
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import build_diff_index, load_diffs
 from prism.core.filter.rules import filter_files
@@ -107,6 +108,7 @@ from prism.core.static.analyzer import analyze, format_finding, select_for_group
 from prism.core.static.verify import verify_group
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import LOCATE_FAILED, Comment, ReviewStats
+from prism.models.cost import UsageTotals
 from prism.models.diff import Diff
 from prism.models.grouping import Group
 from prism.models.reflection import PotentialMiss
@@ -438,7 +440,8 @@ def _run_groups(
     head_rev: str,
     diff_index: Mapping[str, Diff],
     static_report: StaticReport,
-) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding]]:
+    started: float,
+) -> tuple[list[Comment], list[PotentialMiss], list[StaticFinding], int]:
     """串行跑完所有审查单元（V1 不做并发），每组跑完立刻定位与反思。
 
     定位与反思都放在循环体里而不是等所有组跑完：设计文档的节奏就是
@@ -448,9 +451,11 @@ def _run_groups(
     **每组只用一次模型调用完成复核**（不是每个文件一次），失败时原样保留
     全部评论 —— 见 `core/reflection/reflect.py`。
 
-    静态发现的**挑选在这里做一次**（挑本组文件 + 按 token 预算截断），注入与
-    后置校验共用同一份结果 —— 各算一次的话，预算边界上两条路会给出不同的集合，
-    校验出来的「未处理」也就不再是模型实际看到的那批。
+    静态发现的**挑选在这里做一次**（挑本组文件），注入与后置校验共用同一份结果。
+
+    **全局预算在这里执行**：每开一组之前先看总账（钱 + 时间），超了就停掉剩下的组。
+    组级预算管的是「一组跑飞」，全局预算管的是「组数太多或前面几组太贵」—— 两层
+    各管各的，缺一层就有一头漏。
 
     Args:
         groups: 审查单元列表
@@ -459,16 +464,38 @@ def _run_groups(
         diff_index: `路径 → Diff` 索引，每组都要传 —— 它是**全量**的，
             组内组外都有，`file_read_diff` 靠它看别的包改了什么
         static_report: 静态分析结果（可能是被跳过的那份）
+        started: 整条命令的开始时刻（`time.monotonic()`）。全局的时间预算从它算，
+            于是「20 分钟」读起来就是「这条命令最长跑多久」，含静态分析
 
     Returns:
-        (保留的评论, 疑似漏报信号, 未被引用的高优先级静态发现)。
+        (保留的评论, 疑似漏报信号, 未被引用的高优先级静态发现, 因预算未跑的组数)。
         评论含未定位的那些（带 locate_level 标记）
     """
     llm = _llm_or_exit()
     comments: list[Comment] = []
     misses: list[PotentialMiss] = []
     gaps: list[StaticFinding] = []
+    total = UsageTotals()
+    skipped = 0
     for index, item in enumerate(groups, start=1):
+        # 开新组之前先看总账：超了就停掉剩下的组（**不是**只停这一组 ——
+        # 全局闸的意思就是「整条别再花下去了」）
+        stop = exceeded(
+            total,
+            time.monotonic() - started,
+            prices=settings.cost,
+            max_cost=settings.review.max_review_cost,
+            max_seconds=settings.review.max_review_seconds,
+        )
+        if stop is not None:
+            skipped = len(groups) - index + 1
+            logger.warning("整条 review 超预算（%s），停掉剩余 %d 组", stop, skipped)
+            typer.echo(
+                f"⚠️ 整条 review 超预算（{stop}）：累计 {describe(total, settings.cost)}，"
+                f"已用 {time.monotonic() - started:.0f} 秒 —— 剩余 {skipped} 组不再审查"
+            )
+            break
+
         typer.echo(
             f"Processing Group {index}: {package_label(item)} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
@@ -489,6 +516,9 @@ def _run_groups(
         )
         located = locate_group(item, result.hunk_comments)
         outcome = reflect(llm.model, item, located)
+        # 反思的用量也要进总账：组级闸看不到它（那时循环已经结束了），而它每组一次
+        group_usage = add_usage(result.usage, outcome.usage)
+        total = add_usage(total, group_usage)
         comments.extend(outcome.kept)
         misses.extend(outcome.misses)
         verdict = verify_group(injected, outcome.kept)
@@ -504,7 +534,10 @@ def _run_groups(
             f"(exit_reason={result.exit_reason}, 轮次={result.round_count}, "
             f"未定位={unlocated}, 反思删除={len(outcome.removed)}{static_note})"
         )
-    return comments, misses, gaps
+        typer.echo(f"    本组 {describe(group_usage, settings.cost)}")
+    if not skipped:
+        typer.echo(f"总计 {describe(total, settings.cost)}")
+    return comments, misses, gaps, skipped
 
 
 @app.command()
@@ -551,9 +584,11 @@ def review(
 
     # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
     if groups:
-        comments, misses, gaps = _run_groups(groups, root, head, diff_index, static_report)
+        comments, misses, gaps, skipped_groups = _run_groups(
+            groups, root, head, diff_index, static_report, started
+        )
     else:
-        comments, misses, gaps = [], [], []
+        comments, misses, gaps, skipped_groups = [], [], [], 0
     comments = sort_comments(comments)
 
     stats = ReviewStats(
@@ -562,6 +597,7 @@ def review(
         files_count=len(reviewable),
         comments_count=len(comments),
         duration_seconds=time.monotonic() - started,
+        skipped_groups=skipped_groups,
     )
     typer.echo("")
     typer.echo(TerminalRenderer().render(comments, stats, misses, gaps))

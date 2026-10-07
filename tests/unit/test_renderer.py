@@ -95,6 +95,7 @@ def make_stats(
     head_sha: str = "HEAD",
     files_count: int = 3,
     comments_count: int = 5,
+    skipped_groups: int = 0,
 ) -> ReviewStats:
     """构造测试用 ReviewStats。
 
@@ -103,6 +104,7 @@ def make_stats(
         head_sha: head 版本
         files_count: 文件数
         comments_count: 评论数
+        skipped_groups: 因预算没跑的审查单元数
 
     Returns:
         ReviewStats 对象
@@ -113,6 +115,7 @@ def make_stats(
         files_count=files_count,
         comments_count=comments_count,
         duration_seconds=1.5,
+        skipped_groups=skipped_groups,
     )
 
 
@@ -403,3 +406,24 @@ def test_static_gaps_come_after_misses() -> None:
 
     assert output.index("=== 疑似漏报") < output.index("=== 静态发现未处理")
     assert output.index("=== 静态发现未处理") < output.index("=== 统计 ===")
+
+
+def test_skipped_groups_note_appears_in_the_header() -> None:
+    """因预算没跑的组要在**头部**报出来。
+
+    少审几个组与「那些组没问题」在输出上长得一模一样 —— 不报就等于把「没覆盖」
+    说成了「没问题」（同 file_read_diff 索引为空要报错那条）。
+    """
+    output = TerminalRenderer().render([make_comment()], make_stats(skipped_groups=3))
+
+    assert "因预算停止" in output
+    assert "3 个审查单元未审" in output
+    # 头部：在第一条评论之前
+    assert output.index("因预算停止") < output.index("agent.go")
+
+
+def test_no_skipped_note_when_all_groups_ran() -> None:
+    """没停组时不留那句话。"""
+    output = TerminalRenderer().render([make_comment()], make_stats())
+
+    assert "未审" not in output

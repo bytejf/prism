@@ -25,8 +25,11 @@ from pydantic import Field
 
 from prism.config.settings import settings
 from prism.core.agent.agent import build_tools, initial_state, run_review_agent
+from prism.core.agent.budget import STOP_COST
 from prism.core.agent.middleware import end_done_reset, should_exit, update_no_report_rounds
 from prism.core.agent.state import (
+    EXIT_BUDGET_COST,
+    EXIT_BUDGET_TIME,
     EXIT_END_DONE,
     EXIT_END_DONE_WITH_GAPS,
     EXIT_ERROR,
@@ -38,6 +41,7 @@ from prism.core.agent.state import (
     STATUS_PENDING,
     HunkStatus,
     ReviewState,
+    exit_reason_of,
     max_rounds_for,
     pending_ids,
 )
@@ -48,6 +52,16 @@ from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
+
+# 一次调用的用量：输入 1000（命中 800 / 未命中 200）、输出 100。
+# 数字取得好算：按默认价格（未命中 4 元/百万、命中 0.5、输出 12）一次调用
+# = (200*4 + 800*0.5 + 100*12) / 1e6 = 0.0024 元
+USAGE_METADATA: dict[str, Any] = {
+    "input_tokens": 1000,
+    "output_tokens": 100,
+    "total_tokens": 1100,
+    "input_token_details": {"cache_read": 800},
+}
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -132,13 +146,17 @@ def ai_text(content: str = "（无工具调用）") -> AIMessage:
     return AIMessage(content=content)
 
 
-def ai_call(name: str, args: dict[str, Any], call_id: str = "call-1") -> AIMessage:
+def ai_call(
+    name: str, args: dict[str, Any], call_id: str = "call-1", *, usage: bool = True
+) -> AIMessage:
     """构造带单个 tool_call 的响应。
 
     Args:
         name: 工具名
         args: 工具参数
         call_id: 调用 ID
+        usage: 是否带上用量元数据。默认带 —— 真实模型都会回，而预算那条路
+            完全依赖它（不带就等于测「拿不到用量」那条分支）
 
     Returns:
         AIMessage
@@ -146,6 +164,7 @@ def ai_call(name: str, args: dict[str, Any], call_id: str = "call-1") -> AIMessa
     return AIMessage(
         content="",
         tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}],
+        usage_metadata=USAGE_METADATA if usage else None,
     )
 
 
@@ -161,19 +180,22 @@ def read_call(call_id: str = "call-1") -> AIMessage:
     return ai_call("file_read", {"path": "a.go", "start_line": 1, "end_line": 2}, call_id)
 
 
-def report_call(hunk_ids: list[str], complete: bool = True, call_id: str = "call-r") -> AIMessage:
+def report_call(
+    hunk_ids: list[str], complete: bool = True, call_id: str = "call-r", *, usage: bool = True
+) -> AIMessage:
     """构造一次 report_hunks 调用。
 
     Args:
         hunk_ids: 要报告的 hunk 编号
         complete: 是否标记完成
         call_id: 调用 ID
+        usage: 是否带用量元数据
 
     Returns:
         AIMessage
     """
     reports = [{"hunk_id": hunk_id, "complete": complete, "comments": []} for hunk_id in hunk_ids]
-    return ai_call("report_hunks", {"reports": reports}, call_id)
+    return ai_call("report_hunks", {"reports": reports}, call_id, usage=usage)
 
 
 def done_call(call_id: str = "call-d") -> AIMessage:
@@ -978,3 +1000,99 @@ def test_recursion_error_is_logged_as_error(
 
     assert "recursion_limit" in caplog.text
     assert "不该发生" in caplog.text
+
+
+# ---------- 预算 ----------
+
+
+def tiny_budget(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
+    """把单组预算压到极小，用来确定性地触发闸门。
+
+    Args:
+        monkeypatch: pytest 的 monkeypatch
+        **overrides: 要覆盖的预算键（如 ``max_group_cost=0.001``）
+    """
+    review = replace(settings.review, **overrides)
+    monkeypatch.setattr("prism.core.agent.middleware.settings", replace(settings, review=review))
+
+
+def test_cost_budget_stops_the_group_and_keeps_comments(
+    project_root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """花费超预算 → 带缺口退出，**这一轮之前审出的评论照样留住**。
+
+    值压得极小（1e-9 元）是刻意的：一轮的用量就够越过它，于是「闸门在第 2 轮
+    之前生效」这件事与具体价格无关。
+    """
+    tiny_budget(monkeypatch, max_group_cost=1e-9)
+    llm = ScriptedChatModel(responses=[report_call(["H-01"])])
+
+    result = run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_BUDGET_COST
+    assert result.round_count == 1, "第 2 轮之前就该停，不该再调模型"
+    assert result.usage.calls == 1
+    assert result.usage.cache_hit == 800, "命中与未命中要分开记，单价差一个数量级"
+    assert result.pending_hunk_ids == ["H-02"]
+
+
+def test_time_budget_stops_before_any_model_call(
+    project_root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """时长超预算 → 一轮都不跑（时间从这一组开始时就在涨）。"""
+    tiny_budget(monkeypatch, max_group_seconds=1e-9)
+    llm = ScriptedChatModel(responses=[])
+
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_BUDGET_TIME
+    assert result.round_count == 0
+    assert llm.calls == [], "时间闸在模型调用之前生效"
+    assert result.pending_hunk_ids == ["H-01"]
+
+
+def test_budget_not_hit_leaves_normal_exit(
+    project_root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """预算宽松时不影响正常退出 —— 闸门不能变成常驻行为。"""
+    llm = ScriptedChatModel(responses=[report_call(["H-01"]), done_call()])
+
+    result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert result.exit_reason == EXIT_END_DONE
+    assert result.usage.calls == 2
+
+
+def test_missing_usage_is_counted_not_silently_zero(
+    project_root: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """拿不到用量时记进 `missing` 并**警告一次** —— 否则成本闸会静默失效。
+
+    这不是假想的降级路径：成本闸完全依赖 `usage_metadata`，而它是提供商给的。
+    缺了它，钱那一档就永远不响，只剩时间闸与 recursion_limit。
+    """
+    tiny_budget(monkeypatch, max_group_cost=1e-9)
+    llm = ScriptedChatModel(
+        responses=[report_call(["H-01"], call_id="c1", usage=False), done_call()]
+    )
+
+    with caplog.at_level("WARNING"):
+        result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert result.usage.missing == 1, "拿不到用量要计数，不能当成零"
+    assert result.usage.calls == 1, "只有带回用量的那次调用算进成本"
+    assert result.exit_reason == EXIT_END_DONE, "算不出钱就不该按钱停"
+    assert "拿不到用量" in caplog.text
+
+
+def test_end_done_wins_over_budget() -> None:
+    """审完了就是审完了：`end_done` 已被受理时，退出原因不该报成预算。
+
+    否则用户会看到一个**假的缺口** —— 明明全审完了，输出却说「因预算停止」。
+    """
+    state = initial_state(make_group(["H-01"]), 30)
+    state["end_done_count"] = 1
+    state["budget_stop"] = STOP_COST
+    state["hunk_status"] = {"H-01": HunkStatus(hunk_id="H-01", status=STATUS_DONE)}
+
+    assert exit_reason_of(state) == EXIT_END_DONE
