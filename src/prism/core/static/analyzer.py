@@ -31,7 +31,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from opentelemetry import trace
@@ -151,7 +151,12 @@ def _analyze(
 
     try:
         with head_tree(root, head_rev) as tree:
-            payload, elapsed = _run_linter(tree)
+            packages = _packages(reviewable, tree)
+            if not packages:
+                msg = "改动文件所在的目录在检出里都不存在（都被删了？）"
+                logger.warning("静态分析跳过：%s", msg)
+                return StaticReport(skip_reason=msg)
+            payload, elapsed = _run_linter(tree, packages)
             findings, raw_count = _parse(payload, tree, reviewable)
     except _AnalysisError as exc:
         logger.warning("静态分析跳过：%s", exc)
@@ -278,11 +283,12 @@ def _git(root: Path, args: list[str]) -> str:
     return completed.stdout
 
 
-def _run_linter(tree: Path) -> tuple[dict[str, Any], float]:
-    """在给定目录里跑 golangci-lint，返回解析后的 JSON 与耗时。
+def _run_linter(tree: Path, packages: Sequence[str]) -> tuple[dict[str, Any], float]:
+    """在给定目录里跑 golangci-lint，**只分析指定的包**。
 
     Args:
         tree: 要分析的目录
+        packages: 要分析的包目录（相对 tree）；`.` 表示根目录
 
     Returns:
         (JSON 对象, 耗时秒数)
@@ -311,6 +317,10 @@ def _run_linter(tree: Path) -> tuple[dict[str, Any], float]:
         # 绝对路径：相对路径的基准是 golangci-lint 内部推的，在 worktree 里会变成
         # `../../../tmp/xxx` 这种。相对化我们自己按分析目录做，那个是确定的
         "--path-mode=abs",
+        # **只分析改动的包**（见 `_packages`）：不传的话默认是 `./...`，
+        # 整仓跑。实测在一个 78MB 的 Go 仓库上，只改了 1 个文件却花掉 77.5 秒
+        # （占整条审查的 61%），报出 597 条、按可审查文件过滤后**一条可用都没有**
+        *(_package_args(packages)),
     ]
     timeout = settings.static.timeout_seconds
     started = time.monotonic()
@@ -343,6 +353,38 @@ def _run_linter(tree: Path) -> tuple[dict[str, Any], float]:
         msg = "golangci-lint 输出不是 JSON 对象"
         raise _AnalysisError(msg)
     return payload, elapsed
+
+
+def _packages(reviewable: Sequence[str], tree: Path) -> list[str]:
+    """改动文件所在的**包目录**（去重、排序、只留检出里真的存在的）。
+
+    一个 Go 包 = 一个目录，所以「改动的包」就是改动文件所在目录的集合。
+    只留存在的：文件被整体删除时那个目录可能就没了，把它交给 golangci-lint 会让
+    整次分析失败（而我们本来就没有可分析的东西）。
+
+    Args:
+        reviewable: 可审查文件的路径
+        tree: 分析目录（用来判断目录在不在）
+
+    Returns:
+        相对分析目录的包目录列表；没有可分析的包时返回空列表
+    """
+    dirs = sorted({str(PurePosixPath(path).parent) for path in reviewable})
+    return [item for item in dirs if (tree / item).is_dir()]
+
+
+def _package_args(packages: Sequence[str]) -> list[str]:
+    """把包目录转成 golangci-lint 的参数形态。
+
+    `./internal/ls` 这种写法是它认的（`.` 表示当前包）；根目录直接用 `.`。
+
+    Args:
+        packages: 包目录（相对分析目录）
+
+    Returns:
+        命令行参数
+    """
+    return ["." if item == "." else f"./{item}" for item in packages]
 
 
 def _parse(

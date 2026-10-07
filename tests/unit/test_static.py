@@ -343,7 +343,7 @@ def test_missing_binary_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(subprocess, "run", boom)
     with pytest.raises(analyzer._AnalysisError, match="找不到 golangci-lint"):
-        analyzer._run_linter(tree)
+        analyzer._run_linter(tree, ["."])
 
 
 def test_timeout_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -355,7 +355,7 @@ def test_timeout_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(subprocess, "run", boom)
     with pytest.raises(analyzer._AnalysisError, match="超时"):
-        analyzer._run_linter(tree)
+        analyzer._run_linter(tree, ["."])
 
 
 def test_nonzero_exit_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -373,7 +373,7 @@ def test_nonzero_exit_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         ),
     )
     with pytest.raises(analyzer._AnalysisError, match="退出码 7"):
-        analyzer._run_linter(tree)
+        analyzer._run_linter(tree, ["."])
 
 
 def test_broken_json_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -383,7 +383,7 @@ def test_broken_json_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         subprocess, "run", lambda *a, **k: fake_run(stdout='{"Issues":[]}\n1 issues:\n')
     )
     with pytest.raises(analyzer._AnalysisError, match="不是合法 JSON"):
-        analyzer._run_linter(tree)
+        analyzer._run_linter(tree, ["."])
 
 
 def test_analyze_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,7 +428,7 @@ def test_command_flags_are_the_ones_we_measured(
         return fake_run(stdout=payload())
 
     monkeypatch.setattr(subprocess, "run", capture)
-    analyzer._run_linter(_tree_with_one_go_file(tmp_path))
+    analyzer._run_linter(_tree_with_one_go_file(tmp_path), ["."])
 
     command = seen["command"]
     assert command[0] == "golangci-lint"
@@ -577,3 +577,58 @@ def test_verify_only_counts_kept_comments() -> None:
     findings = [make_finding("S-01")]
     assert verify_group(findings, []).unhandled_count == 1
     assert verify_group(findings, [make_comment("[S-01] 成立")]).unhandled_count == 0
+
+
+# ---------- 只分析改动的包 ----------
+
+
+def test_packages_are_the_dirs_of_changed_files(tmp_path: Path) -> None:
+    """改动的包 = 改动文件所在目录的集合（去重、排序）。"""
+    tree = tmp_path / "tree"
+    (tree / "internal/ls").mkdir(parents=True)
+    (tree / "internal/core").mkdir(parents=True)
+
+    packages = analyzer._packages(
+        ["internal/ls/a.go", "internal/ls/b.go", "internal/core/c.go"], tree
+    )
+
+    assert packages == ["internal/core", "internal/ls"]
+
+
+def test_packages_drops_missing_dirs(tmp_path: Path) -> None:
+    """目录在检出里不存在就不给它（整体删除的文件）—— 交给 linter 会让整次分析失败。"""
+    tree = tmp_path / "tree"
+    (tree / "keep").mkdir(parents=True)
+
+    assert analyzer._packages(["keep/a.go", "gone/b.go"], tree) == ["keep"]
+
+
+def test_packages_handles_root_files(tmp_path: Path) -> None:
+    """根目录下的文件 → `.`（Go 的根包）。"""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+
+    assert analyzer._packages(["main.go"], tree) == ["."]
+    assert analyzer._package_args(["."]) == ["."]
+    assert analyzer._package_args(["internal/ls"]) == ["./internal/ls"]
+
+
+def test_linter_is_scoped_to_the_changed_packages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """命令行要带上改动包，**不能让它默认 `./...` 跑全仓**。
+
+    实测代价：78MB 的 Go 仓库只改了 1 个文件，全仓跑 77.5 秒（占整条审查 61%）、
+    597 条发现里可用 0 条。
+    """
+    seen: dict[str, list[str]] = {}
+
+    def capture(command: list[str], **kwargs: Any) -> Any:
+        seen["command"] = command
+        return fake_run(stdout=payload())
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    analyzer._run_linter(_tree_with_one_go_file(tmp_path), ["internal/ls", "."])
+
+    command = seen["command"]
+    assert command[-2:] == ["./internal/ls", "."], "包参数要加在最后"
