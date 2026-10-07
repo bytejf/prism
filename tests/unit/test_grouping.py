@@ -20,6 +20,7 @@ from prism.core.grouping.packages import (
     fixed_prompt_tokens,
     group_by_package,
     group_tokens,
+    package_label,
     package_path,
 )
 from prism.core.guidance.builder import build_diff_block, build_static_block
@@ -63,18 +64,21 @@ def make_hunk_with_symbol(
 
 
 def test_group_by_package() -> None:
-    """测试按包分组。"""
+    """测试预算足够时，同一条列队上的 hunk 合成一组（包只决定顺序）。"""
     hunks = [
         make_hunk_with_symbol("internal/agent/agent.go"),
         make_hunk_with_symbol("internal/agent/preview.go"),
         make_hunk_with_symbol("internal/diff/resolver.go"),
     ]
     groups = group_by_package(hunks)
-    assert len(groups) == 2
-    assert groups[0].package_path == "internal/agent"
-    assert len(groups[0].files) == 2
-    assert groups[1].package_path == "internal/diff"
-    assert len(groups[1].files) == 1
+
+    assert len(groups) == 1, "三个 hunk 远没装满预算，就该是一组"
+    assert groups[0].files == [
+        "internal/agent/agent.go",
+        "internal/agent/preview.go",
+        "internal/diff/resolver.go",
+    ]
+    assert groups[0].package_path == "internal/agent", "package_path 记的是首片所在的包"
 
 
 def test_package_path_from_file_path() -> None:
@@ -84,24 +88,36 @@ def test_package_path_from_file_path() -> None:
     assert package_path("a/b/c/d.go") == "a/b/c"
 
 
-def test_root_files_form_their_own_group() -> None:
-    """测试根目录下的文件单独成组。"""
-    groups = group_by_package(
-        [make_hunk_with_symbol("main.go"), make_hunk_with_symbol("internal/a.go")]
-    )
-    assert [g.package_path for g in groups] == [ROOT_PACKAGE, "internal"]
-
-
-def test_group_ids_are_sequential_by_package_order() -> None:
-    """测试分组 ID 按包路径升序连续分配。"""
-    hunks = [
-        make_hunk_with_symbol("internal/tool/registry.go"),
-        make_hunk_with_symbol("internal/agent/agent.go"),
-        make_hunk_with_symbol("internal/diff/resolver.go"),
-    ]
+def test_root_files_come_first_in_the_row() -> None:
+    """测试根目录下的文件排在列队最前面（根包 `.` 的排序位置）。"""
+    hunks = [make_hunk_with_symbol("main.go"), make_hunk_with_symbol("internal/a.go")]
     groups = group_by_package(hunks)
-    assert [g.package_path for g in groups] == ["internal/agent", "internal/diff", "internal/tool"]
-    assert [g.group_id for g in groups] == ["group-001", "group-002", "group-003"]
+    ordered = [item.file_path for group in groups for item in group.hunks]
+    assert ordered == ["main.go", "internal/a.go"]
+
+
+def test_group_ids_are_sequential_and_packages_stay_ordered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """测试编号连续，且**包在组之间非递减**（列队不被装箱打乱）。
+
+    预算小到一组只装得下一个包时，组内的包路径就不是单值了 —— 所以这里断言的是
+    顺序而不是「一组一个包」。
+    """
+    hunks = [
+        pad_hunk(make_hunk_with_symbol("internal/tool/registry.go"), 30),
+        pad_hunk(make_hunk_with_symbol("internal/agent/agent.go"), 30),
+        pad_hunk(make_hunk_with_symbol("internal/diff/resolver.go"), 30),
+    ]
+    budget(monkeypatch, 2000)
+    groups = group_by_package(hunks)
+
+    assert len(groups) >= 2, "这个预算下必须拆开，否则测不到跨组顺序"
+    assert [g.group_id for g in groups] == [
+        f"group-{index:03d}" for index in range(1, len(groups) + 1)
+    ]
+    packages = [package_path(item.file_path) for group in groups for item in group.hunks]
+    assert packages == sorted(packages), "包顺序不能被装箱打乱"
 
 
 def test_hunks_sorted_by_file_then_line() -> None:
@@ -193,15 +209,16 @@ def test_pre_review_pipeline_groups_by_package(two_package_repo: Path) -> None:
     assert len(mapped) == 3
 
     groups = group_by_package(mapped)
-    assert [g.package_path for g in groups] == [".", "internal/alpha", "internal/beta"]
-    assert [g.group_id for g in groups] == ["group-001", "group-002", "group-003"]
+    ordered = [item.file_path for group in groups for item in group.hunks]
+    assert ordered == ["main.go", "internal/alpha/a.go", "internal/beta/b.go"]
+    assert [g.group_id for g in groups] == [
+        f"group-{index:03d}" for index in range(1, len(groups) + 1)
+    ]
 
-    alpha = next(g for g in groups if g.package_path == "internal/alpha")
-    assert alpha.files == ["internal/alpha/a.go"]
-    assert alpha.hunks[0].symbol.name == "Run"
-
-    root = next(g for g in groups if g.package_path == ".")
-    assert root.files == ["main.go"]
+    every_hunk = [item for group in groups for item in group.hunks]
+    assert len(every_hunk) == len(mapped), "装箱不重不漏"
+    alpha = next(item for item in every_hunk if item.file_path == "internal/alpha/a.go")
+    assert alpha.symbol.name == "Run"
 
 
 # ---------- token 预算与装箱 ----------
@@ -241,11 +258,11 @@ def pad_hunk(hunk: HunkWithSymbol, lines: int) -> HunkWithSymbol:
     return replace(hunk, part=part)
 
 
-def test_small_packages_are_not_merged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """预算只用来向下切，不用来向上并 —— 小包不合并。
+def test_small_packages_merge_into_one_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """预算够就一路合并 —— **切与并是同一条规则的两个方向**。
 
-    合并会更省（固定开销 1111 token/组），但会让 `package_path` 不再是单值，
-    也让每个组的主题变糊。「一个审查单元 = 一个包」是既有契约。
+    包只决定顺序（同包的挨在一起），组边界只由预算决定。合并省下的是固定开销
+    （实测 1111 token/组）与每次的反思调用。
     """
     budget(monkeypatch, 10**6)
     groups = group_by_package(
@@ -255,7 +272,15 @@ def test_small_packages_are_not_merged(monkeypatch: pytest.MonkeyPatch) -> None:
             make_hunk_with_symbol("c/c.go"),
         ]
     )
-    assert [item.package_path for item in groups] == ["a", "b", "c"]
+    assert len(groups) == 1
+    assert [item.file_path for item in groups[0].hunks] == ["a/a.go", "b/b.go", "c/c.go"]
+    assert package_label(groups[0]) == "a → c", "跨包的组要能一眼看出来"
+
+
+def test_package_label_of_a_single_package_group() -> None:
+    """组只含一个包时，标签就是那个包名（不显示箭头）。"""
+    groups = group_by_package([make_hunk_with_symbol("internal/agent/agent.go")])
+    assert package_label(groups[0]) == "internal/agent"
 
 
 def test_oversized_package_splits_into_consecutive_groups(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,7 +294,7 @@ def test_oversized_package_splits_into_consecutive_groups(monkeypatch: pytest.Mo
     groups = group_by_package(hunks)
 
     assert len(groups) > 1, "这个包必须被拆开，否则这条用例没测到切分"
-    assert {item.package_path for item in groups} == {"big"}
+    assert {package_path(item.file_path) for group in groups for item in group.hunks} == {"big"}
     assert [item.hunk_id for group in groups for item in group.hunks] == [
         f"H-{index:02d}" for index in range(1, 7)
     ]

@@ -35,6 +35,7 @@ from prism.core.agent.state import (
     max_rounds_for,
     pending_ids,
 )
+from prism.core.grouping.packages import package_label
 from prism.core.guidance import templates as tpl
 from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
 from prism.core.tools.code_search import code_search
@@ -201,7 +202,7 @@ def run_review_agent(
     logger.info(
         "开始审查 %s（%s，%d 个文件，%d 个 hunk，上限 %d 轮）",
         group.group_id,
-        group.package_path,
+        package_label(group),
         len(group.files),
         len(group.hunks),
         max_rounds,

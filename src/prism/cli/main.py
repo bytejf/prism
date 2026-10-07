@@ -92,7 +92,12 @@ from prism.core.agent.agent import run_review_agent
 from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_symbols
 from prism.core.diff.loader import build_diff_index, load_diffs
 from prism.core.filter.rules import filter_files
-from prism.core.grouping.packages import fixed_prompt_tokens, group_by_package, group_tokens
+from prism.core.grouping.packages import (
+    fixed_prompt_tokens,
+    group_by_package,
+    group_tokens,
+    package_label,
+)
 from prism.core.llm.client import LLMClient
 from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
@@ -345,7 +350,7 @@ def group(
         total = tokens + fixed_prompt_tokens()
         over = "  ⚠️ 超过预算" if total > budget else ""
         header = (
-            f"Group {index}: {item.package_path} "
+            f"Group {index}: {package_label(item)} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')}, "
             f"约 {total}/{budget} token){over}"
         )
@@ -465,7 +470,7 @@ def _run_groups(
     gaps: list[StaticFinding] = []
     for index, item in enumerate(groups, start=1):
         typer.echo(
-            f"Processing Group {index}: {item.package_path} "
+            f"Processing Group {index}: {package_label(item)} "
             f"({_plural(len(item.files), 'file')}, {_plural(len(item.hunks), 'hunk')})"
         )
         # 挑选不做二次裁剪：**预算在分组那一步就执行完了**（装不下的 hunk 顺延到
