@@ -217,8 +217,8 @@ pathspec（`fatal: outside repository`，英文 stderr 还带**本机绝对路�
   读的是 blob 内容，软链接本身就是一段文本，天然不跟随
 - **评论的 `path` 模型改不了**：`report_hunks` 只收 `existing_code`，path 由
   `hunk_id` 查出来。这是一处**结构上**的防护，别为了「方便」让它自己填路径
-- 工具体内的异常**由 `tool_error_guard` 兜**（见框架缺口表）：整组不因为它崩，
-  但也不是静默 —— ERROR + 完整堆栈
+- 工具体内的异常**由 `ToolFailureBudget` 兜**（见框架缺口表与「预算与止损」）：
+  整组不因为它崩，但也不是静默 —— ERROR + 完整堆栈，并按连续/累计失败计数
 
 验证方式：`tests/unit/test_tools.py` 的「路径安全」一节（含 symlink 逃逸、
 NUL、`--` 挡住选项注入），变异 9/9（`/tmp/mutate_paths.py`）。
@@ -250,9 +250,9 @@ NUL、`--` 挡住选项注入），变异 9/9（`/tmp/mutate_paths.py`）。
 - **预算是唯一的分组依据**，别再加「按包封口」这类边界：合并本来就是省钱的
   （固定开销 1111 token/组 + 一次反思调用都摊薄了），加的边界只会让它更碎
 
-**预算管不到的地方**：一组的 hunk 越多，那一次会话也越长（`max_rounds` 是按 hunk
-数给的），而会话长度没有别的上限（压缩触发点在 1M 窗口的 98%）。20k 的预算约束的是
-**起手提示词**，不是会话。要收紧得另加一个「单组 hunk 数上限」，加之前先看实测。
+**预算管不到的地方**：一组的 hunk 越多，那一次会话也越长，而 20k 约束的是
+**起手提示词**、不是会话。会话长度由钱/时间预算兜住（见「预算与止损」），
+不必再加「单组 hunk 数上限」—— 实测 50 hunk 一组只跑 12 轮、约 0.35 元。
 
 `prism group` 会**顺带跑一次静态分析**：静态发现参与预算，不跑它，干跑出来的分组
 与真审时的不一样，那就失去核对的意义了。输出里每组带 `约 N/20000 token`，
@@ -386,7 +386,7 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 | **`@tool(args_schema=...)` 会让 `runtime: ToolRuntime[...]` 注入失效** —— 显式给了 args_schema，框架就不再从函数签名推导，`runtime` 从 `get_input_schema()` 里消失，调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。**五个工具全吃 runtime，所以全都不能用 `args_schema`** | 一律不给 `args_schema`。嵌套结构（`report_hunks` 的 `reports`）靠**类型注解**表达，一样能出嵌套 schema |
 | `parse_docstring=True` + `args_schema=` 一起给时，工具描述会**静默变成参数模型的 docstring** | 同上：不给 `args_schema`。另注意**参数模型的 docstring 本身也会进 schema**，所以要写成给模型看的话，设计理由用 `#` 注释 |
 | 工具定义**入站**还要过一道转换：`convert_to_openai_tool` 会剥掉所有 `title`、剥掉参数顶层的 `description`、把 `$defs` + `$ref` **内联展开** | 日志与对账一律用 `convert_to_openai_tool(tool)["function"]`，别拿 `tool_call_schema.model_json_schema()`（那是转换前的，`report_hunks` 两份差 2000 vs 1279 字节） |
-| `ToolNode` 的默认兜底 **`_default_handle_tool_errors` 只把 `ToolInvocationError` 转成工具结果，最后一行是 `raise e`** —— 工具里任何一个意外异常都会穿过图、穿过 `run_review_agent`，把**整条 review 带走**（后面所有组不跑，前面审出来的评论也一起没，CLI 最后才渲染） | 注册 `tool_error_guard`（`middleware.py` 的 `wrap_tool_call`），放中间件链**最内侧**：ERROR + 堆栈记全，回给模型一句「换一种方式」，日志的 tool 行照样在（`ReviewTrace` 在它外侧） |
+| `ToolNode` 的默认兜底 **`_default_handle_tool_errors` 只把 `ToolInvocationError` 转成工具结果，最后一行是 `raise e`** —— 工具里任何一个意外异常都会穿过图、穿过 `run_review_agent`，把**整条 review 带走**（后面所有组不跑，前面审出来的评论也一起没，CLI 最后才渲染） | 注册 `ToolFailureBudget`（`middleware.py` 的类式中间件，原来叫 `tool_error_guard`），放中间件链**最内侧**：ERROR + 堆栈记全，回给模型一句「换一种方式」，日志的 tool 行照样在（`ReviewTrace` 在它外侧） |
 | `recursion_limit` 按 **super-step** 算，`create_agent` 实测每轮约 **6.1** 步 | `[review].max_super_steps`，取宽松绝对数（按轮数乘的余量只有 15%） |
 | `stream()` 的 `config` 必须是 `RunnableConfig` 类型：裸 dict 字面量被推成 `dict[str, int]`，四个 overload 全不匹配（`invoke` 那边碰巧不挑） | 标注类型后调用 |
 | **思考模式下不能强制 `tool_choice`** —— `with_structured_output` 的 `function_calling` / `json_schema` 两条路都靠强制，实测直接 `400 Thinking mode does not support this tool_choice`；`json_mode` 另要提示词里出现 "json" 且只保证合法 JSON、不保证 schema | 单次结构化调用也走 `bind_tools(tool_choice="auto")`（审查循环本来就没强制过），回参自己用 Pydantic 校验 —— 见 `core/reflection/reflect.py` |

@@ -502,7 +502,7 @@ class ToolFailureBudget(AgentMiddleware[ReviewState, ReviewContext, Any]):
 
     两件事做在一处，因为它们读的是同一份计数：
 
-    1. **兜异常**（原来 `tool_error_guard` 的活）：框架默认的兜底只认
+    1. **兜异常**（原来 `tool_error_guard` 的活，现在并入这里）：框架默认的兜底只认
        `ToolInvocationError`，其余原样 re-raise
        （`langgraph.prebuilt.tool_node._default_handle_tool_errors` 最后一行就是
        `raise e`）。于是工具里任何一个意外异常都会穿过图、穿过 `run_review_agent`，
