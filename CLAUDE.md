@@ -64,11 +64,59 @@ diff → 过滤 → hunk 归属符号 → 静态分析 → 分组+装箱   ← �
 （`jump_to` 的优先级高于经典退出判定）。
 
 - `middleware.py` 的 `review_progress`（`before_model`）—— 追加进度快照、判定语义退出
-- `middleware.py` 的 `review_pacing`（`after_model`）—— 记轮次、纯文本时注入提醒
-- 轮次上限交给框架的 `ModelCallLimitMiddleware`，别自己数
+  与预算
+- `middleware.py` 的 `review_pacing`（`after_model`）—— 记轮次、累加用量、
+  纯文本时注入提醒
+- **轮数不是约束**（摘掉了，理由见下面「预算与止损」）
 
 **时序**：`after_model` 在**工具执行之前**跑，`before_model` 在**工具执行之后**跑。
 要看「工具跑完的状态」必须用 `before_model`。
+
+## 预算与止损（改 `budget.py` / `middleware.py` 前必读）
+
+**约束用资源本身表达**：钱与时间，不数轮。实测一次审查的成本构成是
+**输出 54% / 未命中输入 35% / 命中输入 11%**，而同一轮的成本能差几十倍
+（一轮 `out 23` 调 end_done，另一轮 `out 1555` 报 7 条评论 + 366 思考 token）——
+轮数是代理指标，数不出来这个差别。
+
+五道闸，**各管一类，日志里必须能分清是哪一道响**：
+
+| 闸 | 管什么 | 落点 | 退出原因 |
+|---|---|---|---|
+| `no_progress_exit_rounds = 8` | 转圈不干活（连续 8 轮没有 report_hunks） | `review_pacing` | `no_progress` |
+| 单组钱 / 时间（2 元 / 300 秒） | 一组跑飞 | `ReviewProgress.before_model` | `budget_cost` / `budget_time` |
+| 整条钱 / 时间（10 元 / 20 分钟） | 组数太多或前几组太贵 | `_run_groups` 的循环 | （停剩下的组） |
+| 工具失败（连续 3 提醒 / 累计 5 退出） | 把预算烧在一直失败的调用上 | `ToolFailureBudget` | `tool_failures` |
+| `max_super_steps = 1400` | 图失控（**不该发生**） | `recursion_limit` | `recursion` |
+
+四条不能动的规矩：
+
+- **语义退出优先于预算**：审完了就是审完了。让预算把一个已完成的组标成「因预算
+  停止」，是给用户一个假的缺口（`exit_reason_of` 的顺序就是这个意思）
+- **拿不到 `usage_metadata` 不算零**：记进 `UsageTotals.missing` 并警告一次 ——
+  成本闸完全依赖它，缺了它就是「不报错的错链路」，那时只剩时间闸与 recursion
+- **上限填 0 表示不限制**，不是「立刻停」：配错的最坏结果是少一道闸，而不是所有
+  review 一开局就停
+- **任何闸触发都带缺口退出，且把缺口报出来**：`MainLoopResult.pending_hunk_ids`
+  一路传到 `ReviewStats.pending_hunks`，在报告头部写「有 N 个 hunk 没能审完」。
+  不报的话「评论数：0」看起来就像「这段代码很干净」
+
+三处容易写错的细节：
+
+- **用量要按轮增量累加**（`review_pacing` 里加进 `state["usage"]`），不能最后扫
+  消息列表 —— 压缩会把历史消息删掉，账会漏。反思那边不压缩，扫终态即可
+- **反思的用量也算进全局账**：组级闸看不到它（那时循环已经结束），漏了会系统性
+  低估「每组一次反思调用」
+- **`stop_reason` 是单键、先写者胜**：同一轮有两个停手时，原因由中间件列表的顺序
+  定（预算排在前）
+
+**为什么可以不要轮数上限**：实测小组 4/30 轮、大组 12/250 轮，余量 7~20 倍；
+换成预算后单组 2 元 ≈ 70~150 轮、300 秒 ≈ 50 轮，都比它紧。它原来的三个职责
+（转圈、慢烧、图失控）分别由 no_progress、预算、`recursion_limit` 接管。
+
+`recursion_limit` 取**绝对数**而不是「轮数 × 倍数」：实测 6.1 步/轮，乘出来的余量
+只有 15%，框架或我们多加一个钩子就会让它反过来先响 —— 而它响是我们的 bug，
+所以它只记 ERROR + 带缺口退出，绝不抛异常穿出去（用 `stream` 保住中途状态）。
 
 ## 状态与并发（最容易踩的一块）
 
@@ -331,7 +379,7 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 
 | 缺口 | 处置 |
 |---|---|
-| `create_agent` 的 `middleware` 参数只填了 `AgentMiddleware` 三个类型参数中的两个（漏 `ResponseT`），连它自带的 `ModelCallLimitMiddleware` 都过不了 mypy | `cast`，注释写明是框架签名问题 |
+| `create_agent` 的 `middleware` 参数只填了 `AgentMiddleware` 三个类型参数中的两个（漏 `ResponseT`），连它自带的 `ModelCallLimitMiddleware` 都过不了 mypy（那张图还在用） | `cast`，注释写明是框架签名问题 |
 | 四个 overload 都不把 `state_schema` / `context_schema` 串进返回类型，推出来是 `AgentState[Any]` / `Any` —— `invoke` 的 `context=` 传错也不报错 | `agent.py` 手写 `Agent` 别名（**比框架推出来的更精确**）+ 出参 `cast` |
 | `@wrap_model_call` / `@wrap_tool_call` 装饰**模块级函数**时，返回的中间件实例是**全局共享**的 | 用**类式中间件**，每组审查由 `build_review_agent` 造一个实例，跨轮次状态才不会串到下一组 |
 | `@tool` 的 **`parse_docstring` 默认 False** —— docstring 里 `Args:` 的参数说明**一个字都到不了模型** | 五个工具统一 `@tool(parse_docstring=True, description="…")`：描述走 `description=`、参数说明走 docstring 的 `Args:` |
@@ -339,7 +387,8 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 | `parse_docstring=True` + `args_schema=` 一起给时，工具描述会**静默变成参数模型的 docstring** | 同上：不给 `args_schema`。另注意**参数模型的 docstring 本身也会进 schema**，所以要写成给模型看的话，设计理由用 `#` 注释 |
 | 工具定义**入站**还要过一道转换：`convert_to_openai_tool` 会剥掉所有 `title`、剥掉参数顶层的 `description`、把 `$defs` + `$ref` **内联展开** | 日志与对账一律用 `convert_to_openai_tool(tool)["function"]`，别拿 `tool_call_schema.model_json_schema()`（那是转换前的，`report_hunks` 两份差 2000 vs 1279 字节） |
 | `ToolNode` 的默认兜底 **`_default_handle_tool_errors` 只把 `ToolInvocationError` 转成工具结果，最后一行是 `raise e`** —— 工具里任何一个意外异常都会穿过图、穿过 `run_review_agent`，把**整条 review 带走**（后面所有组不跑，前面审出来的评论也一起没，CLI 最后才渲染） | 注册 `tool_error_guard`（`middleware.py` 的 `wrap_tool_call`），放中间件链**最内侧**：ERROR + 堆栈记全，回给模型一句「换一种方式」，日志的 tool 行照样在（`ReviewTrace` 在它外侧） |
-| `recursion_limit` 按 **super-step** 算，`create_agent` 实测每轮约 **6.1** 步 | `max_rounds * 7 + 20` |
+| `recursion_limit` 按 **super-step** 算，`create_agent` 实测每轮约 **6.1** 步 | `[review].max_super_steps`，取宽松绝对数（按轮数乘的余量只有 15%） |
+| `stream()` 的 `config` 必须是 `RunnableConfig` 类型：裸 dict 字面量被推成 `dict[str, int]`，四个 overload 全不匹配（`invoke` 那边碰巧不挑） | 标注类型后调用 |
 | **思考模式下不能强制 `tool_choice`** —— `with_structured_output` 的 `function_calling` / `json_schema` 两条路都靠强制，实测直接 `400 Thinking mode does not support this tool_choice`；`json_mode` 另要提示词里出现 "json" 且只保证合法 JSON、不保证 schema | 单次结构化调用也走 `bind_tools(tool_choice="auto")`（审查循环本来就没强制过），回参自己用 Pydantic 校验 —— 见 `core/reflection/reflect.py` |
 
 **不使用已废弃的 API**（尤其 `langchain-classic` 包）；其余尽量用框架，别自己重造。
@@ -366,7 +415,7 @@ v1 的「框架味」在 **`langchain` 包**（agents / middleware），不在 `
 ```python
 from prism.config.settings import settings
 
-max_rounds = max(settings.review.min_rounds, n * settings.review.rounds_per_hunk)
+max_cost = settings.review.max_group_cost
 ```
 
 优先级 `环境变量 > default.toml`；唯一走环境变量的是 `DEEPSEEK_API_KEY`（密钥不落盘）。
@@ -376,7 +425,7 @@ max_rounds = max(settings.review.min_rounds, n * settings.review.rounds_per_hunk
 
 | | 例子 |
 |---|---|
-| **进**（旋钮，配错了看得见） | 窗口、思考档位、压缩阈值、轮次公式、工具上限、分组的 token 预算、静态分析超时、日志级别 |
+| **进**（旋钮，配错了看得见） | 窗口、思考档位、压缩阈值、**钱/时间的预算与价格表**、工具失败阈值、工具上限、分组的 token 预算、静态分析超时、日志级别 |
 | **不进**（契约，配错了*看不见*） | 标签名 `<diff>` / `<review_status>`、`H-01` 编号格式、退出原因码、severity 排序、定位层级与失败原因码、提示词全文、过滤白名单、`REFETCHABLE_TOOLS` |
 
 把契约写进文件等于让它变成「可以配错的东西」，而配错的后果是静默失效。
@@ -465,6 +514,7 @@ github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`，实测装在
 | `02-评论定位和反思/` | 12 | 13（定位）、14（反思） |
 | `03-添加工具和调用图/` | 15 | 16（跨组工具实现反馈）、17（**框架缺口清单**，台账） |
 | `04-添加静态审查/` | 18 | 19（静态分析实现反馈，含 golangci-lint v1→v2 的坑） |
+| `05-预算与止损/` | —— | 20（**审查约束清单**：五类闸的作用与 trade-off，含摘掉 max_rounds 的理由） |
 
 - **设计文档冻结、永不回头改**；实现与它不符时**记进反馈文档**
   （唯一例外：反馈文档里写明「这条必须回改设计文档」的，如 13 号 §六 E1）
