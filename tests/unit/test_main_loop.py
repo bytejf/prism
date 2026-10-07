@@ -16,7 +16,7 @@ from typing import Any, cast, override
 import pytest
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
 from langchain_core.tools import tool as langchain_tool
@@ -24,9 +24,18 @@ from langgraph.errors import GraphRecursionError
 from pydantic import Field
 
 from prism.config.settings import settings
-from prism.core.agent.agent import build_tools, initial_state, run_review_agent
-from prism.core.agent.budget import STOP_COST
-from prism.core.agent.middleware import end_done_reset, should_exit, update_no_report_rounds
+from prism.core.agent.agent import build_review_agent, build_tools, initial_state, run_review_agent
+from prism.core.agent.budget import STOP_COST, STOP_TOOL_FAILURES
+from prism.core.agent.context import ReviewContext
+from prism.core.agent.middleware import (
+    DUPLICATE_CALL_MESSAGE,
+    end_done_reset,
+    should_exit,
+    update_no_report_rounds,
+)
+from prism.core.agent.middleware import (
+    _executed_before as executed_before,
+)
 from prism.core.agent.state import (
     EXIT_BUDGET_COST,
     EXIT_BUDGET_TIME,
@@ -1092,7 +1101,280 @@ def test_end_done_wins_over_budget() -> None:
     """
     state = initial_state(make_group(["H-01"]), 30)
     state["end_done_count"] = 1
-    state["budget_stop"] = STOP_COST
+    state["stop_reason"] = STOP_COST
     state["hunk_status"] = {"H-01": HunkStatus(hunk_id="H-01", status=STATUS_DONE)}
 
     assert exit_reason_of(state) == EXIT_END_DONE
+
+
+# ---------- 重复调用不执行 ----------
+
+
+def tool_message(call_id: str, content: str) -> ToolMessage:
+    """造一条工具结果消息。
+
+    Args:
+        call_id: 对应的调用 ID
+        content: 结果内容
+
+    Returns:
+        ToolMessage
+    """
+    return ToolMessage(content=content, tool_call_id=call_id)
+
+
+def test_executed_before_detects_a_live_repeat() -> None:
+    """同样的调用 + 结果还在上下文里 → 判为重复。"""
+    history = [
+        ai_call("file_read", {"path": "a.go"}, "c1"),
+        tool_message("c1", "     1: package main"),
+    ]
+
+    assert executed_before(history, "file_read", {"path": "a.go"}, exclude_id="c2")
+
+
+def test_cleared_result_allows_a_refetch() -> None:
+    """结果被压缩清成占位符 → **允许重新取**。
+
+    这条是刻意留的口子：不然模型永远拿不回被清掉的内容，而「可重新获取」正是
+    压缩清理那一步的承诺（`REFETCHABLE_TOOLS`）。
+    """
+    history = [
+        ai_call("file_read", {"path": "a.go"}, "c1"),
+        tool_message("c1", "[内容已清理：原为 file_read(path=a.go)，可重新获取]"),
+    ]
+
+    assert not executed_before(history, "file_read", {"path": "a.go"}, exclude_id="c2")
+
+
+def test_different_args_are_not_a_repeat() -> None:
+    """参数不同就是另一次调用（换个行范围重读是合法的）。"""
+    history = [
+        ai_call("file_read", {"path": "a.go", "start_line": 1, "end_line": 2}, "c1"),
+        tool_message("c1", "     1: package main"),
+    ]
+
+    assert not executed_before(
+        history, "file_read", {"path": "a.go", "start_line": 3, "end_line": 9}, exclude_id="c2"
+    )
+
+
+def test_current_call_does_not_count_itself() -> None:
+    """当前这一次调用自己不算「执行过」—— 它就在历史那条 AI 消息里。"""
+    history = [ai_call("file_read", {"path": "a.go"}, "c1")]
+
+    assert not executed_before(history, "file_read", {"path": "a.go"}, exclude_id="c1")
+
+
+def test_replayed_history_does_not_suppress_its_own_call() -> None:
+    """同一份历史被重放（本次调用的 id 与结果都已经在里面）时，不能把自己判成重复。
+
+    正常流程里「当前调用」的结果还没产生，所以 `alive` 那道筛子已经挡掉了它 ——
+    但是一旦历史被重放（checkpoint 恢复、工具节点重跑），同一条 AI 消息会带着
+    自己的结果再次出现。那时如果不按 id 排除掉本次调用，就会出现「历史里有结果，
+    但这次的调用根本没执行」——模型拿到「已做过」却没有新结果。
+    """
+    history = [
+        ai_call("file_read", {"path": "a.go"}, "c1"),
+        tool_message("c1", "     1: package main"),
+        ai_call("file_read", {"path": "a.go"}, "c1"),
+    ]
+
+    assert not executed_before(history, "file_read", {"path": "a.go"}, exclude_id="c1")
+
+
+def test_result_not_yet_returned_is_not_a_repeat() -> None:
+    """调用发出去了、结果还没回来（并行那一步）→ 不算重复。"""
+    history = [ai_call("file_read", {"path": "a.go"}, "c1")]
+
+    assert not executed_before(history, "file_read", {"path": "a.go"}, exclude_id="c9")
+
+
+def test_duplicate_read_is_not_executed_end_to_end(project_root: str) -> None:
+    """端到端：模型连着两轮读同一个文件的同一个范围，第二次不再执行。"""
+    llm = ScriptedChatModel(
+        responses=[read_call("c1"), read_call("c2"), report_call(["H-01"]), done_call("c3")],
+    )
+    agent = build_review_agent(llm, max_rounds=10)
+
+    final = agent.invoke(
+        initial_state(make_group(["H-01"]), 10),
+        context=ReviewContext(project_root=project_root, head_rev=""),
+    )
+    reads = {
+        m.tool_call_id: str(m.content)
+        for m in final["messages"]
+        if isinstance(m, ToolMessage) and m.tool_call_id in {"c1", "c2"}
+    }
+
+    assert len(reads) == 2, "两次调用都要有结果（一次真读、一次说明）"
+    assert "package main" in reads["c1"], "第一次真的读了文件"
+    assert DUPLICATE_CALL_MESSAGE.splitlines()[0] in reads["c2"], "第二次被拦下，没再读一遍"
+
+
+def test_report_hunks_is_never_deduped(project_root: str) -> None:
+    """`report_hunks` 有副作用，不在去重白名单里 —— 同样的报告要能报两次。"""
+    llm = ScriptedChatModel(
+        responses=[
+            report_call(["H-01"], call_id="c1"),
+            report_call(["H-01"], call_id="c2"),
+            done_call("c3"),
+        ]
+    )
+    agent = build_review_agent(llm, max_rounds=10)
+
+    final = agent.invoke(
+        initial_state(make_group(["H-01"]), 10),
+        context=ReviewContext(project_root=project_root, head_rev=""),
+    )
+    reports = [
+        str(m.content)
+        for m in final["messages"]
+        if isinstance(m, ToolMessage) and m.tool_call_id in {"c1", "c2"}
+    ]
+
+    assert len(reports) == 2, "两次一模一样的报告都要真的执行"
+    assert not any(DUPLICATE_CALL_MESSAGE.splitlines()[0] in text for text in reports)
+
+
+# ---------- 工具失败预算 ----------
+
+
+def parallel_explode_call(call_id: str) -> AIMessage:
+    """构造一轮里两条都必炸的调用。
+
+    **每轮都要新建对象**：LangChain 的消息带 id，同一个对象重复塞进状态会被
+    `add_messages` 按 id 去重（第一版用例就是复用了同一个对象，于是后两轮的
+    消息没进历史）。
+
+    Args:
+        call_id: 这一轮的调用 ID 前缀
+
+    Returns:
+        AIMessage
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "exploding_tool",
+                "args": {"path": "a"},
+                "id": f"{call_id}-1",
+                "type": "tool_call",
+            },
+            {
+                "name": "exploding_tool",
+                "args": {"path": "b"},
+                "id": f"{call_id}-2",
+                "type": "tool_call",
+            },
+        ],
+        usage_metadata=USAGE_METADATA,
+    )
+
+
+def explode_call(call_id: str = "c-e") -> AIMessage:
+    """构造一次必炸的工具调用。
+
+    Args:
+        call_id: 调用 ID
+
+    Returns:
+        AIMessage
+    """
+    return ai_call("exploding_tool", {"path": "x"}, call_id)
+
+
+def test_consecutive_failures_escalate_the_message(project_root: str, exploding: None) -> None:
+    """连续失败到阈值后，工具结果里追加一句更硬的提醒。"""
+    llm = ScriptedChatModel(
+        responses=[
+            explode_call("c0"),
+            explode_call("c1"),
+            explode_call("c2"),
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+    agent = build_review_agent(llm, max_rounds=10)
+
+    final = agent.invoke(
+        initial_state(make_group(["H-01"]), 10),
+        context=ReviewContext(project_root=project_root, head_rev=""),
+    )
+    results = {
+        m.tool_call_id: str(m.content)
+        for m in final["messages"]
+        if isinstance(m, ToolMessage) and m.tool_call_id.startswith("c")
+    }
+
+    assert "连续失败" not in results["c0"], "第 1 次只是普通报错"
+    assert "连续失败 3 次" in results["c2"], "到阈值才追加劝退那句"
+
+
+def test_total_failures_stop_the_group(project_root: str, exploding: None) -> None:
+    """累计失败到上限 → 本组带缺口退出，而不是一路烧到预算见底。"""
+    # 5 次失败（默认 tool_fail_exit）之后，第 6 轮开始前就该停
+    llm = ScriptedChatModel(responses=[explode_call(f"c{index}") for index in range(5)])
+    agent = build_review_agent(llm, max_rounds=20)
+
+    final = agent.invoke(
+        initial_state(make_group(["H-01"]), 20),
+        context=ReviewContext(project_root=project_root, head_rev=""),
+    )
+
+    assert final["stop_reason"] == STOP_TOOL_FAILURES
+    assert not final["hunk_status"]["H-01"].comments, "没有产出也不该被算成审过"
+    assert final["round_count"] < 20, "是失败预算叫停的，不是轮次上限"
+
+
+def test_success_resets_the_streak_but_not_the_total(project_root: str, exploding: None) -> None:
+    """中途成功一次 → **连续**计数清零，**累计**计数不动。
+
+    两个问题不同：连续问「这个工具是不是坏了」，累计问「这一组烧了多少」。
+    """
+    llm = ScriptedChatModel(
+        responses=[
+            explode_call("c0"),
+            explode_call("c1"),
+            read_call("c2"),  # 成功
+            explode_call("c3"),
+            explode_call("c4"),
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+    agent = build_review_agent(llm, max_rounds=20)
+
+    final = agent.invoke(
+        initial_state(make_group(["H-01"]), 20),
+        context=ReviewContext(project_root=project_root, head_rev=""),
+    )
+    results = {
+        m.tool_call_id: str(m.content)
+        for m in final["messages"]
+        if isinstance(m, ToolMessage) and m.tool_call_id.startswith("c")
+    }
+
+    # 累计 4 次（c0/c1/c3/c4），但中间成功过 → 连续最多 2 次，够不到提醒阈值 3
+    assert "连续失败" not in results["c4"]
+    assert "不再重复执行" not in results["c2"], "这次是成功读到文件"
+
+
+def test_parallel_failures_each_count(project_root: str, exploding: None) -> None:
+    """同一个 super-step 里的并行失败要各算一次。
+
+    计数在同一个实例上、由多个线程改 —— 漏记的后果是闸门晚响（方向安全），
+    但用例要求它真的算准。
+    """
+    llm = ScriptedChatModel(responses=[parallel_explode_call(f"r{index}") for index in range(3)])
+    agent = build_review_agent(llm, max_rounds=20)
+
+    final = agent.invoke(
+        initial_state(make_group(["H-01"]), 20),
+        context=ReviewContext(project_root=project_root, head_rev=""),
+    )
+
+    # 3 轮 × 2 个 = 6 次失败 > 上限 5 → 第 3 轮之后停
+    assert final["stop_reason"] == STOP_TOOL_FAILURES
+    assert final["round_count"] == 3

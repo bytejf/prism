@@ -16,6 +16,7 @@
 """
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -24,6 +25,7 @@ from langchain.agents.middleware import (
     AgentMiddleware,
     ToolCallRequest,
     after_model,
+    hook_config,
     wrap_tool_call,
 )
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -32,12 +34,13 @@ from langgraph.types import Command
 
 from prism.config.settings import settings
 from prism.core.agent.budget import (
+    STOP_TOOL_FAILURES,
     add_usage,
     describe,
     exceeded,
     usage_of_message,
 )
-from prism.core.agent.compression import Compressor
+from prism.core.agent.compression import REFETCHABLE_TOOLS, Compressor, is_cleared
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
     ReviewState,
@@ -251,7 +254,12 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         # 「因预算停止」，是给用户一个假的缺口。预算管的是「还没完但不能再花了」
         verdict = self._budget_verdict(state)
         if verdict is not None:
-            return {**updates, "budget_stop": verdict, "jump_to": "end"}
+            # 先写者胜：同一轮里若别的停手也写了原因，保留先写的那个
+            return {
+                **updates,
+                "stop_reason": state["stop_reason"] or verdict,
+                "jump_to": "end",
+            }
 
         # **退出判定要在压缩之前**：这一轮就要收尾了还去压一遍历史，是白烧一次
         # 完整的摘要请求（实测踩到过 —— end_done 已经调完的那一轮仍然压了一次）
@@ -374,50 +382,237 @@ TOOL_ERROR_MESSAGE = (
     "不要用同样的参数重试。"
 )
 
+# 连续失败到阈值时追加的一句。措辞要比上面更硬 —— 上一句是「建议」，这一句是
+# 「你已经照着重试了几次，别再试了」
+TOOL_FAILURE_ESCALATION = (
+    "\n⚠️ 这个工具在本组已经**连续失败 {streak} 次**：不要再试它了，换成别的工具或直接报告已有结论。"
+)
+
+
+# 重复调用时回给模型的话。**要给出路**：它可能真的想再看一眼那段代码 ——
+# 那就换个范围读（不同的参数不会被拦），或者用已有的结论继续
+DUPLICATE_CALL_MESSAGE = (
+    "这个调用你已经做过，结果就在上文（没有被压缩清理），不再重复执行。\n"
+    "要重新看，请换一个行范围或换一个搜索词；否则请基于已有结果继续。"
+)
+
 
 # 模块级函数式中间件（同 review_pacing）。它是**无状态**的，所以共享一个实例没问题；
 # 换参数值也一样：它只读不改。
 @wrap_tool_call
-def tool_error_guard(
+def tool_call_dedup(
     request: ToolCallRequest,
     handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
 ) -> ToolMessage | Command[Any]:
-    """把工具抛出的异常兜成一条工具结果，别让它炸掉整组审查。
+    """参数完全相同的**只读**调用不重复执行。
 
-    **为什么必须有这一层**：框架默认的兜底只认 `ToolInvocationError`（模型传错
-    参数类型时框架自己抛的那类），其余异常原样 re-raise
-    （`langgraph.prebuilt.tool_node._default_handle_tool_errors` 最后一行就是
-    `raise e`）。于是工具里任何一个意外异常 —— 子进程参数非法、pygit2 抛了
-    `KeyError` 之外的错、配置读错 —— 都会穿过图、穿过 `run_review_agent`，
-    把**整条 review 带走**：后面所有组不会再跑，前面已经审出来的评论也一起没
-    （CLI 是最后才渲染的）。
+    不是启发式：我们的三个读工具（`file_read` / `code_search` / `file_read_diff`）
+    读的都是被审查版本的 blob 与内存里的 diff 索引，**一次审查内不变**，所以
+    「同样的参数必然同样的结果」是可以证明的。重复执行纯属浪费 —— 既花一次输出，
+    又把一份一模一样的内容再加进上下文。
 
-    实测过：`code_search(file_pattern="a\0b")` 让 `subprocess` 抛 `ValueError`，
-    `run_review_agent` 直接把异常抛出来。参数校验（`core/tools/paths.py`）现在
-    把这一条堵住了，但堵的是那一个输入，不是这一**类**。
+    三条边界：
 
-    **不是静默兜底**：异常按 ERROR 记完整堆栈。回给模型的是「换一种方式」而不是
-    让它重试同一套参数 —— 同样的参数必然再炸一次，白烧一轮。
-
-    位置放在中间件链**最内侧**（`build_review_agent` 里排在最后）：`ReviewTrace`
-    在外侧，于是这次调用照样有一条「tool · 轮次=N · 执行 Xms · 结果 M 字符」，
-    日志的形态不因为失败而变样。
+    - **只在白名单里生效**（`REFETCHABLE_TOOLS`）：`report_hunks` / `end_done`
+      有副作用，重复调用是两回事
+    - **结果已被压缩清掉时允许重读**：那时上文里只剩占位符，拦下来就等于让模型
+      永远拿不回那段内容
+    - 同一条 AI 消息里的**当前**调用不算「已经执行过」（按调用 id 排除），
+      否则每个调用都会把自己当成重复
 
     Args:
         request: 工具调用请求
-        handler: 真正的工具调用
+        handler: 真正的执行链
 
     Returns:
-        工具返回；抛异常时返回一条说明性的 ToolMessage
+        工具结果；重复调用时返回一句说明，不执行
     """
-    try:
+    name = str(request.tool_call.get("name") or "")
+    if name not in REFETCHABLE_TOOLS:
         return handler(request)
-    # 这里是最后一道网，宽except 是有意的（见 docstring）
-    except Exception as exc:
-        logger.exception("工具 %s 抛异常，转成工具结果继续", request.tool_call["name"])
-        return ToolMessage(
-            content=TOOL_ERROR_MESSAGE.format(kind=type(exc).__name__, detail=exc),
-            tool_call_id=request.tool_call["id"],
-            # status="error"：工具结果自身标记失败，模型与日志都能一眼看出来
-            status="error",
+
+    args = request.tool_call.get("args") or {}
+    messages = _messages_of(request.state)
+    if not _executed_before(
+        messages, name, args, exclude_id=str(request.tool_call.get("id") or "")
+    ):
+        return handler(request)
+
+    logger.info("跳过重复调用：%s（同样的参数，结果还在上下文里）", name)
+    return ToolMessage(
+        content=DUPLICATE_CALL_MESSAGE,
+        tool_call_id=str(request.tool_call.get("id") or ""),
+    )
+
+
+def _messages_of(state: Any) -> list[BaseMessage]:
+    """从工具请求的状态里取消息列表。
+
+    `ToolCallRequest.state` 的静态类型是 `dict | list | BaseModel`，我们的图状态
+    是 dict。取不到时返回空列表 —— 宁可不去重，也不要在这里抛异常。
+
+    Args:
+        state: 图状态
+
+    Returns:
+        消息列表
+    """
+    if isinstance(state, dict):
+        messages = state.get("messages")
+        if isinstance(messages, list):
+            return list(messages)
+    return []
+
+
+def _executed_before(
+    messages: Sequence[BaseMessage], name: str, args: Mapping[str, Any], *, exclude_id: str
+) -> bool:
+    """历史里有没有一次「同样的调用，且结果还在」？
+
+    Args:
+        messages: 消息历史
+        name: 工具名
+        args: 本次参数
+        exclude_id: 要排除的调用 id（当前这一次自己）
+
+    Returns:
+        有过时返回 True
+    """
+    # 结果还在的调用 id（占位符不算 —— 那表示内容已被清掉，允许重新取）
+    alive = {
+        str(message.tool_call_id)
+        for message in messages
+        if isinstance(message, ToolMessage) and not is_cleared(str(message.content))
+    }
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        for call in message.tool_calls:
+            call_id = str(call.get("id") or "")
+            if call_id == exclude_id or call_id not in alive:
+                continue
+            if str(call.get("name") or "") == name and (call.get("args") or {}) == args:
+                return True
+    return False
+
+
+class ToolFailureBudget(AgentMiddleware[ReviewState, ReviewContext, Any]):
+    """兜住工具异常，并给「失败」本身设一个预算。
+
+    两件事做在一处，因为它们读的是同一份计数：
+
+    1. **兜异常**（原来 `tool_error_guard` 的活）：框架默认的兜底只认
+       `ToolInvocationError`，其余原样 re-raise
+       （`langgraph.prebuilt.tool_node._default_handle_tool_errors` 最后一行就是
+       `raise e`）。于是工具里任何一个意外异常都会穿过图、穿过 `run_review_agent`，
+       把**整条 review 带走**（后面所有组不跑，前面审出来的评论也一起没）。
+       实测过：`code_search(file_pattern="a\0b")` 让 `subprocess` 抛 `ValueError`。
+       兜底**不是静默**：ERROR + 完整堆栈照记。
+    2. **失败预算**：连续失败到 `tool_fail_remind` 就在工具结果里追加一句硬提醒；
+       累计到 `tool_fail_exit` 就在下一次 `before_model` 带缺口退出本组。
+
+    为什么需要第 2 件：`no_report_rounds` 只管「这一轮有没有产出」，而一轮里
+    **既有 report_hunks 又有失败的工具调用**时它会被清零 —— 于是模型可以一边慢
+    慢产出、一边把预算烧在一直失败的调用上。那是「把预算浪费在无效调用上」唯一
+    没被别处覆盖的形态（重复调用由 `tool_call_dedup` 管）。
+
+    写成**类式**：计数是跨轮次状态，而模块级的 `@wrap_tool_call` 产出的是全局
+    共享实例（框架缺口，见 CLAUDE.md），上一组的失败计数会漏到下一组。
+    """
+
+    state_schema = ReviewState
+
+    def __init__(self) -> None:
+        """初始化计数。"""
+        super().__init__()
+        self._streak = 0
+        self._total = 0
+        # 并行工具调用可能在多个线程里同时进来（同一个 super-step）——
+        # 计数用锁护一下，免得漏记（漏记的后果是闸门晚响，方向是安全的）
+        self._lock = threading.Lock()
+
+    # @hook_config 是类式钩子声明跳转目标的方式（`__can_jump_to__` 由它挂上），
+    # 与 ReviewProgress.before_model 那行手工挂载是同一件事
+    @hook_config(can_jump_to=["end"])
+    def before_model(
+        self, state: ReviewState, runtime: Runtime[ReviewContext]
+    ) -> dict[str, Any] | None:
+        """累计失败到上限就带缺口退出。
+
+        Args:
+            state: 当前状态
+            runtime: 运行时（不用）
+
+        Returns:
+            退出更新；没到上限时 None
+        """
+        with self._lock:
+            total = self._total
+        if total < settings.review.tool_fail_exit:
+            return None
+        logger.error(
+            "工具在本组累计失败 %d 次（上限 %d），带缺口退出本组 —— 去看 ERROR 日志找根因",
+            total,
+            settings.review.tool_fail_exit,
         )
+        return {
+            "stop_reason": state["stop_reason"] or STOP_TOOL_FAILURES,
+            "jump_to": "end",
+        }
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        """执行工具；抛异常时兜成一条结果并计数。
+
+        Args:
+            request: 工具调用请求
+            handler: 真正的工具调用
+
+        Returns:
+            工具返回；抛异常时返回一条说明性的 ToolMessage
+        """
+        try:
+            result = handler(request)
+        # 这里是最后一道网，宽except 是有意的（见类 docstring）
+        except Exception as exc:
+            streak = self._record_failure()
+            logger.exception(
+                "工具 %s 抛异常（本组累计失败 %d 次，连续 %d 次），转成工具结果继续",
+                request.tool_call["name"],
+                self._total,
+                streak,
+            )
+            text = TOOL_ERROR_MESSAGE.format(kind=type(exc).__name__, detail=exc)
+            if streak >= settings.review.tool_fail_remind:
+                text += TOOL_FAILURE_ESCALATION.format(streak=streak)
+            return ToolMessage(
+                content=text,
+                tool_call_id=str(request.tool_call["id"]),
+                # status="error"：工具结果自身标记失败，模型与日志都能一眼看出来
+                status="error",
+            )
+        self._record_success()
+        return result
+
+    def _record_failure(self) -> int:
+        """记一次失败。
+
+        Returns:
+            记完之后的连续失败次数
+        """
+        with self._lock:
+            self._streak += 1
+            self._total += 1
+            return self._streak
+
+    def _record_success(self) -> None:
+        """记一次成功：**连续**计数清零，累计计数不动。
+
+        连续与累计是两个问题：连续问「这个工具是不是坏了」，累计问「这一组烧了
+        多少」。中途成功一次说明工具还能用，但那次失败确实已经花掉了。
+        """
+        with self._lock:
+            self._streak = 0

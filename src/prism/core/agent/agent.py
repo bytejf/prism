@@ -27,7 +27,12 @@ from langgraph.graph.state import CompiledStateGraph
 from prism.config.settings import settings
 from prism.core.agent.compression import Compressor
 from prism.core.agent.context import ReviewContext
-from prism.core.agent.middleware import ReviewProgress, review_pacing, tool_error_guard
+from prism.core.agent.middleware import (
+    ReviewProgress,
+    ToolFailureBudget,
+    review_pacing,
+    tool_call_dedup,
+)
 from prism.core.agent.state import (
     EXIT_ERROR,
     EXIT_RECURSION,
@@ -121,10 +126,14 @@ def build_review_agent(
                     review_pacing,
                     # 轮次上限：框架自带，不用自己数
                     ModelCallLimitMiddleware(run_limit=max_rounds, exit_behavior="end"),
-                    # 兜住工具抛出的异常，别让它炸掉整组审查。
-                    # 放最内侧（最后一个）：ReviewTrace 在它外面，于是失败的那次
+                    # 兜住工具异常 + 给「失败」本身设预算。
+                    # 放最内侧（倒数第二个）：ReviewTrace 在它外面，于是失败的那次
                     # 调用照样有一条带耗时的 tool 日志，日志形态不因失败而变
-                    tool_error_guard,
+                    ToolFailureBudget(),
+                    # 参数完全相同的只读调用不重复执行，挡在真正的执行之前。
+                    # 放在兜底**里面**：这一步自己的 bug 也会被兜成一条工具结果，
+                    # 而不是把整组带走
+                    tool_call_dedup,
                 ],
             ),
             state_schema=ReviewState,
@@ -170,7 +179,7 @@ def initial_state(
         end_done_mark=0,
         group=group,
         usage=UsageTotals(),
-        budget_stop="",
+        stop_reason="",
     )
 
 

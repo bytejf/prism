@@ -62,6 +62,8 @@ class ReviewSettings:
         max_group_seconds: 单组时长上限（秒）
         max_review_cost: 整条 review 的花费上限（元）
         max_review_seconds: 整条 review 的时长上限（秒）
+        tool_fail_remind: 工具连续失败到几次时追加硬提醒
+        tool_fail_exit: 工具累计失败到几次时带缺口退出本组
     """
 
     min_rounds: int
@@ -74,6 +76,8 @@ class ReviewSettings:
     max_group_seconds: float
     max_review_cost: float
     max_review_seconds: float
+    tool_fail_remind: int
+    tool_fail_exit: int
 
 
 @dataclass(frozen=True)
@@ -407,6 +411,8 @@ def load(path: Path = PATH) -> Settings:
         max_group_seconds=review.number("max_group_seconds"),
         max_review_cost=review.number("max_review_cost"),
         max_review_seconds=review.number("max_review_seconds"),
+        tool_fail_remind=review.count("tool_fail_remind"),
+        tool_fail_exit=review.count("tool_fail_exit"),
     )
 
     cost = root.section("cost")

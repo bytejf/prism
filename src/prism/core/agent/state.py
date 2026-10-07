@@ -12,7 +12,7 @@ from typing import Annotated
 from langchain.agents.middleware import AgentState
 
 from prism.config.settings import settings
-from prism.core.agent.budget import STOP_COST
+from prism.core.agent.budget import STOP_COST, STOP_TIME, STOP_TOOL_FAILURES
 from prism.models.cost import UsageTotals
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
@@ -38,6 +38,9 @@ EXIT_ERROR = "error"
 # 因为处置不同 —— 花钱超了要调价格表或提示词，时间超了要看单次延迟
 EXIT_BUDGET_COST = "budget_cost"
 EXIT_BUDGET_TIME = "budget_time"
+# 工具连续/累计失败太多：**这是「不要把预算浪费在无效调用上」那道闸**，
+# 与预算分开，因为处置不同 —— 它说明有东西在系统性失败，该去看日志而不是调预算
+EXIT_TOOL_FAILURES = "tool_failures"
 
 
 @dataclass
@@ -104,7 +107,9 @@ class ReviewState(AgentState):
         end_done_mark: 上次重置时已完成的 hunk 数，用来判断「有没有新进展」
         group: 当前审查单元
         usage: 累计用量（**按轮增量累加**，不能最后扫消息：压缩会把历史删掉）
-        budget_stop: 因预算停下的原因（``cost`` / ``time``），没超时为 ""
+        stop_reason: 停下来的原因（``cost`` / ``time`` / ``tool_failures``），没停时为 ""。
+            **单键、先写者胜**：同一轮里有两个中间件都决定停时，谁先写谁的原因留下 ——
+            顺序由 `build_review_agent` 的中间件列表定（预算在两个停手里排最前）
     """
 
     hunk_status: Annotated[dict[str, HunkStatus], merge_hunk_status]
@@ -115,7 +120,7 @@ class ReviewState(AgentState):
     end_done_mark: int
     group: Group
     usage: UsageTotals
-    budget_stop: str
+    stop_reason: str
 
 
 def pending_ids(hunk_status: dict[str, HunkStatus]) -> list[str]:
@@ -195,10 +200,12 @@ def exit_reason_of(state: ReviewState) -> str | None:
     if state["end_done_count"] > 0 and end_done_verdict(state["end_done_count"], pending)[0]:
         return EXIT_END_DONE_WITH_GAPS if pending else EXIT_END_DONE
 
-    if state["budget_stop"] == STOP_COST:
+    if state["stop_reason"] == STOP_COST:
         return EXIT_BUDGET_COST
-    if state["budget_stop"]:
+    if state["stop_reason"] == STOP_TIME:
         return EXIT_BUDGET_TIME
+    if state["stop_reason"] == STOP_TOOL_FAILURES:
+        return EXIT_TOOL_FAILURES
 
     if state["round_count"] >= state["max_rounds"]:
         return EXIT_MAX_ROUNDS

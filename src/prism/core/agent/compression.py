@@ -70,6 +70,23 @@ REFETCHABLE_TOOLS = frozenset({"file_read", "file_read_diff", "code_search"})
 # 说成「(内容已抹除)」则会被读成「这段不重要」。
 PLACEHOLDER = "[内容已清理：原为 {call}，可重新获取]"
 
+# 占位符的前缀。**判「结果还在不在上下文里」只能靠它** —— 去重那一步要用
+# （被清掉的内容可以重新取，见 `core/agent/middleware.py` 的 tool_call_dedup）
+PLACEHOLDER_PREFIX = PLACEHOLDER.split("{")[0]
+
+
+def is_cleared(content: str) -> bool:
+    """这段工具结果是不是「已被压缩清掉」的占位符。
+
+    Args:
+        content: 工具结果文本
+
+    Returns:
+        是占位符时返回 True
+    """
+    return content.lstrip().startswith(PLACEHOLDER_PREFIX)
+
+
 # 摘要消息的标签。用 user 消息 + 特殊标签，不加新的消息类型
 SUMMARY_TAG_OPEN = "<compression_summary>"
 SUMMARY_TAG_CLOSE = "</compression_summary>"

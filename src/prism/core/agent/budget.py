@@ -24,9 +24,10 @@ from prism.models.cost import PER_MILLION, CostConfig, UsageTotals
 
 logger = logging.getLogger(__name__)
 
-# 超预算的原因码（进退出原因，也是给人看的）：钱 / 时间
+# 停下来的原因码（进 `ReviewState.stop_reason`，也是给人看的）：钱 / 时间 / 工具失败
 STOP_COST = "cost"
 STOP_TIME = "time"
+STOP_TOOL_FAILURES = "tool_failures"
 
 
 def usage_of(messages: Sequence[BaseMessage]) -> UsageTotals:
