@@ -105,6 +105,9 @@ class ReviewState(AgentState):
         end_done_mark: 上次重置时已完成的 hunk 数，用来判断「有没有新进展」
         group: 当前审查单元
         usage: 累计用量（**按轮增量累加**，不能最后扫消息：压缩会把历史删掉）
+        explore_closed: 探索工具是否已被停用（连续无产出到收尾阈值时为 True）。
+            停用只留 `report_hunks` / `end_done` —— **不丢结论**：与其把已经花掉的
+            轮次连同查到的结论一起丢掉，不如逼它把已有结论报出来
         stop_reason: 停下来的原因（``cost`` / ``time`` / ``tool_failures``），没停时为 ""。
             **单键、先写者胜**：同一轮里有两个中间件都决定停时，谁先写谁的原因留下 ——
             顺序由 `build_review_agent` 的中间件列表定（预算在两个停手里排最前）
@@ -118,6 +121,7 @@ class ReviewState(AgentState):
     group: Group
     usage: UsageTotals
     stop_reason: str
+    explore_closed: bool
 
 
 def pending_ids(hunk_status: dict[str, HunkStatus]) -> list[str]:

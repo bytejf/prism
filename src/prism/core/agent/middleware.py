@@ -16,9 +16,11 @@
 - 本模块只管**语义退出**：end_done 裁决、连续无产出、纯文本不停机
 """
 
+import hashlib
 import logging
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -72,9 +74,18 @@ PLAIN_TEXT_REMINDER = "\n".join(
 NO_PROGRESS_REMINDER = "\n".join(
     (
         "<agent_reminder>",
-        "你已经连续 {rounds} 轮未报告审查结论。",
+        "你已经连续 {rounds} 轮未报告审查结论（连续 {exit_rounds} 轮不报告，本组就会收尾）。",
         "请立即调用 report_hunks 报告已完成审查的 hunk，",
         "不要只探索不产出。",
+        # 「报告不是终局」这半句是实测补的：一条真实 PR 上模型连续 8 轮翻文件找旁证，
+        # 两次提醒都不理 —— 它把「报告」当成了收尾动作，觉得没百分百确定就不该报。
+        # 而 report_hunks 本来就是可累积、可续报的（`complete=false` = 部分结论）
+        "**报告不是终局**：报告完可以继续查别的 hunk，也可以之后再补报同一个 hunk。",
+        # 紧跟着的这句是**上一句的补丁**：只说「拿不准也报」，实测模型就把
+        # 「确认无误」与「请你确认」写成了评论（4 条产出里 2 条是这种），
+        # 精确率被自己拉低。报的是 hunk 的结论，不是「报点什么」
+        "报的是 **hunk 的结论**（没问题就报空评论列表），"
+        "**不要把「确认无误」或「请你确认」写成评论**。",
         "如果所有 hunk 已审完，请调用 end_done 结束审查。",
         "</agent_reminder>",
     )
@@ -165,6 +176,53 @@ def should_exit(state: ReviewState, *, end_done_count: int | None = None) -> boo
     return state["no_report_rounds"] >= settings.review.no_progress_exit_rounds
 
 
+def _round_tool_results(messages: Sequence[BaseMessage]) -> list[ToolMessage]:
+    """取本轮的工具结果（消息尾部连续的那几条）。
+
+    工具跑完后尾部是 ToolMessage，往前翻到第一条非 ToolMessage 为止
+    —— 那条就是本轮的 AI 消息。
+
+    Args:
+        messages: 消息历史
+
+    Returns:
+        本轮的工具结果；尾部不是工具结果时返回空列表
+    """
+    results: list[ToolMessage] = []
+    for message in reversed(messages):
+        if not isinstance(message, ToolMessage):
+            break
+        results.append(message)
+    return results
+
+
+def _digest(text: str) -> str:
+    """给一段工具结果算摘要（用来判断「这段内容见过了吗」）。
+
+    Args:
+        text: 工具结果文本
+
+    Returns:
+        十六进制摘要
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _describe_kinds(kinds: "Counter[str]") -> str:
+    """把三类无产出轮次的计数渲染成一句人看的话。
+
+    Args:
+        kinds: 计数
+
+    Returns:
+        形如 ``新内容 8 / 重复 0 / 未调工具 0``
+    """
+    if not kinds:
+        return "（无）"
+    labels = {"new_content": "新内容", "repeat": "重复", "no_tools": "未调工具"}
+    return " / ".join(f"{labels.get(name, name)} {count}" for name, count in kinds.most_common())
+
+
 def _last_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
     """取**最近一条 AI 消息**的调用列表。
 
@@ -217,6 +275,10 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         self._started = time.monotonic()
         # 「拿不到用量」只警告一次：每轮都喊会把日志淹掉，而根因是同一个
         self._warned_missing_usage = False
+        # 无产出轮次的**性质**：读到新内容 / 全是重复内容 / 压根没调工具。
+        # 三者要分开 —— 「在推进」与「在原地打转」都算 no_report，但该不该砍是两回事
+        self._no_progress_kinds: Counter[str] = Counter()
+        self._seen_results: set[str] = set()
 
     def before_model(
         self, state: ReviewState, runtime: Runtime[ReviewContext]
@@ -239,6 +301,7 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         # 告警与判定分开：告警每次都要有机会发生（它说的是「成本闸可能失效」），
         # 而判定只在真要停的时候才用得上
         self._warn_if_usage_missing(state)
+        self._classify_round(state)
 
         reset = end_done_reset(state)
         if reset:
@@ -255,9 +318,10 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
                 logger.info("退出：end_done 已被受理（未审 %d 个 hunk）", len(pending))
             else:
                 logger.info(
-                    "退出：连续 %d 轮无产出（阈值 %d）",
+                    "退出：连续 %d 轮无产出（阈值 %d）；性质分布 %s",
                     state["no_report_rounds"],
                     settings.review.no_progress_exit_rounds,
+                    _describe_kinds(self._no_progress_kinds),
                 )
             return {**updates, "jump_to": "end"}
 
@@ -276,6 +340,12 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         if reminder is not None:
             updates["messages"] = [*updates.get("messages", []), reminder]
 
+        # ③ 收尾闸：连续无产出逼近上限时**停用探索工具**（而不是直接砍掉本组）。
+        # 留两轮给它把已有结论报出来 —— 现在的行为是把已经花掉的轮次连同结论一起丢
+        closed = self._close_explore(state)
+        if closed is not None:
+            updates["explore_closed"] = closed
+
         # **退出判定要在压缩之前**：这一轮就要收尾了还去压一遍历史，是白烧一次
         # 完整的摘要请求（实测踩到过 —— end_done 已经调完的那一轮仍然压了一次）
         if self._compressor is not None and self._compressor.should_compress(state["messages"]):
@@ -289,6 +359,61 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
                 ]
 
         return updates or None
+
+    def _classify_round(self, state: ReviewState) -> None:
+        """给「这一轮无产出」定个性：读到新内容 / 重复内容 / 没调工具。
+
+        **为什么要分**：三者都让 `no_report_rounds` +1，但含义完全不同 ——
+
+        - `new_content`：它在读没读过的代码 = **在推进**（实测那条真 PR 的 8 轮全是这个）
+        - `repeat`：本轮所有工具结果都是见过的 = **在原地打转**（同参数重复调用已被
+          `tool_call_dedup` 拦下，走到这里说明是「换了参数但拿到同样内容」）
+        - `no_tools`：纯文本轮，连工具都没调
+
+        实测那条 PR 就是被「推进型」的 8 轮砍掉的 —— 有了这个分布，
+        「阈值该不该放宽」才有依据，而不是拍脑袋。
+
+        Args:
+            state: 当前状态
+        """
+        if state["no_report_rounds"] == 0:
+            return
+        results = _round_tool_results(state["messages"])
+        if not results:
+            self._no_progress_kinds["no_tools"] += 1
+            return
+        digests = {_digest(str(message.content)) for message in results}
+        if digests & self._seen_results:
+            self._no_progress_kinds["repeat"] += 1
+        else:
+            self._no_progress_kinds["new_content"] += 1
+        self._seen_results |= digests
+
+    def _close_explore(self, state: ReviewState) -> bool | None:
+        """连续无产出逼近上限时，决定「探索工具是否停用」。
+
+        停用点取 `no_progress_exit_rounds - 3`：**留三轮** —— 实测推演下来三轮才够
+        （第一轮撞上拒绝、第二轮反应过来、第三轮把结论报出来）。只留两轮时，
+        计数器会在它反应过来之前到期，等于白收窄。
+        **一旦报告过（计数归零）就重新开放**：本组还有别的 hunk 要查。
+
+        Args:
+            state: 当前状态
+
+        Returns:
+            需要变更时返回新的标记；不变时 None
+        """
+        rounds = state["no_report_rounds"]
+        should_close = rounds >= max(settings.review.no_progress_exit_rounds - 3, 1)
+        if should_close == state["explore_closed"]:
+            return None
+        if should_close:
+            logger.warning(
+                "连续 %d 轮无产出，停用探索工具 —— 只放行 report_hunks / end_done，"
+                "让它把已有结论报出来（而不是把这一组连同结论一起丢掉）",
+                rounds,
+            )
+        return should_close
 
     def _remind_no_progress(self, state: ReviewState) -> HumanMessage | None:
         """「一直在调工具、从不报告」到阈值时注入提醒。
@@ -309,7 +434,11 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         if not _last_tool_calls(state["messages"]):
             return None
         logger.warning("连续 %d 轮无产出（模型一直在调工具），注入提醒", rounds)
-        return HumanMessage(content=NO_PROGRESS_REMINDER.format(rounds=rounds))
+        return HumanMessage(
+            content=NO_PROGRESS_REMINDER.format(
+                rounds=rounds, exit_rounds=settings.review.no_progress_exit_rounds
+            )
+        )
 
     def _warn_if_usage_missing(self, state: ReviewState) -> None:
         """拿不到用量时警告一次（每组一次）。
@@ -406,7 +535,9 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     # 走到这里说明模型**一个工具都没调**（纯文本）—— 不干预的话框架会直接收尾
     if no_report in settings.review.no_progress_remind_rounds:
         logger.warning("连续 %d 轮无产出，注入提醒", no_report)
-        content = NO_PROGRESS_REMINDER.format(rounds=no_report)
+        content = NO_PROGRESS_REMINDER.format(
+            rounds=no_report, exit_rounds=settings.review.no_progress_exit_rounds
+        )
     else:
         logger.debug("模型未调用工具，注入推进提醒（连续无产出 %d 轮）", no_report)
         content = PLAIN_TEXT_REMINDER
@@ -415,6 +546,52 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
     # 与旧实现一致：提醒照样追加，到阈值才结束
     updates["jump_to"] = "end" if no_report >= settings.review.no_progress_exit_rounds else "model"
     return updates
+
+
+# 探索工具被停用后回给模型的话。**要给出路**：它手上还有结论，只是不能再查了
+WRAP_UP_MESSAGE = (
+    "错误：本组的探索轮次已用完（连续多轮未报告结论），"
+    "从现在起只能调用 report_hunks（把已有的结论报出来，没问题就报空评论列表）"
+    "或 end_done。请立即报告。"
+)
+
+# 走查期间可以被停用的工具 = 三个只读工具。report_hunks / end_done 是**出路**，
+# 任何时候都放行 —— 收尾闸的目的是让它交结论，不是把路堵死
+EXPLORE_TOOLS = frozenset({"file_read", "file_read_diff", "code_search"})
+
+
+@wrap_tool_call
+def wrap_up_gate(
+    request: ToolCallRequest,
+    handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+) -> ToolMessage | Command[Any]:
+    """探索预算用完时，把只读工具挡下来。
+
+    **为什么要有它**：实测 4 条真实 PR、7 次运行，模型 6 次都是「一路读文件、
+    从不报告」，被连续无产出阈值砍掉 —— 已经花掉的 token 与它查到的东西**一起没了**。
+    提醒发两次它也不理（那是软信号）。这个闸是硬信号：能调的工具只剩两个，
+    它只能把结论交出来。
+
+    判据来自状态（`explore_closed`，由 `ReviewProgress.before_model` 设置），
+    所以本函数无状态、可以做成模块级。
+
+    Args:
+        request: 工具调用请求
+        handler: 真正的执行链
+
+    Returns:
+        工具结果；被挡下时返回一句说明，不执行
+    """
+    state = request.state if isinstance(request.state, dict) else {}
+    name = str(request.tool_call.get("name") or "")
+    if not state.get("explore_closed") or name not in EXPLORE_TOOLS:
+        return handler(request)
+    logger.info("收尾闸挡下探索工具：%s", name)
+    return ToolMessage(
+        content=WRAP_UP_MESSAGE,
+        tool_call_id=str(request.tool_call.get("id") or ""),
+        status="error",
+    )
 
 
 # 工具内部抛异常时回给模型的话。**要让模型能自己做决定**：换参数 / 换工具 /

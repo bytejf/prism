@@ -411,3 +411,16 @@ def test_static_finding_number_appears_in_the_row_not_as_severity() -> None:
     """行里的编号就是模型引用时要抄的那个（`[S-01]`）。"""
     text = build_static_block([make_finding("S-07")])
     assert "| S-07 |" in text
+
+
+def test_workflow_has_a_stopping_rule() -> None:
+    """工作方式里必须有**停止规则**。
+
+    实测：模型会「先把整个仓库理解一遍再下结论」，而那条链没有终点 —— 4 条真实
+    PR、7 次运行里 6 次把 8 轮预算全花在读文件上、一条结论都没报。提示词里
+    没有停止规则，就等于默许它无限细化。
+    """
+    text = build_requirements()
+
+    assert "先给结论，再深入" in text
+    assert "这轮结束时我要给哪个 hunk 什么结论" in text

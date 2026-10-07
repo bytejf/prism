@@ -36,6 +36,9 @@ from prism.core.agent.middleware import (
 from prism.core.agent.middleware import (
     _executed_before as executed_before,
 )
+from prism.core.agent.middleware import (
+    _round_tool_results as round_tool_results,
+)
 from prism.core.agent.state import (
     EXIT_BUDGET_COST,
     EXIT_BUDGET_TIME,
@@ -1429,3 +1432,154 @@ def test_no_progress_reminder_reaches_a_model_that_keeps_calling_tools(
     # 而两条一模一样的提醒白占 token，也让日志读起来像跑了两遍
     sixth = [str(message.content) for message in llm.calls[5]]
     assert sum(1 for text in sixth if "你已经连续 5 轮未报告" in text) == 1
+
+
+# ---------- 无产出轮次的性质分类 ----------
+
+
+def test_round_tool_results_only_takes_the_tail() -> None:
+    """只取消息尾部连续的工具结果（往前到第一条非工具消息为止）。"""
+    history: list[BaseMessage] = [
+        ai_call("file_read", {"path": "a.go"}, "c1"),
+        ToolMessage(content="旧的", tool_call_id="c1"),
+        ai_call("file_read", {"path": "b.go"}, "c2"),
+        ToolMessage(content="新的 1", tool_call_id="c2"),
+        ToolMessage(content="新的 2", tool_call_id="c2"),
+    ]
+
+    results = round_tool_results(history)
+
+    assert [str(message.content) for message in results] == ["新的 2", "新的 1"]
+
+
+def test_no_progress_kinds_separate_exploration_from_spinning(
+    project_root: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """八轮无产出：要能说清是「一直在读新内容」还是「在原地打转」。
+
+    实测那条真 PR 的八轮**全在读没读过的文件**（同参数重复调用已被去重拦下）——
+    它是在推进，只是没下结论。这与「换个参数读到同样内容」是两回事，砍不砍它
+    应该由这个分布来决定，而不是一律按同一个阈值。
+    """
+    # 每轮**逐行**读：内容必然不同（整段读的话，夹具文件短、会被截断成同样的内容，
+    # 那反而变成「重复」—— 第一版用例就是这么把自己坑了的）
+    llm = ScriptedChatModel(
+        responses=[
+            ai_call("file_read", {"path": "a.go", "start_line": i + 1, "end_line": i + 1}, f"c{i}")
+            for i in range(8)
+        ]
+    )
+
+    with caplog.at_level(logging.INFO):
+        run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert "性质分布" in caplog.text
+    assert "新内容" in caplog.text
+    # **不再断言「没有重复轮」**：收尾闸从第 6 轮起挡下只读工具，那些拒绝消息
+    # 每次一模一样 —— 于是它们被如实记成「重复」。那恰恰是想要的信号：
+    # `新内容 6 / 重复 2` 读起来就是「6 轮真探索，2 轮被闸挡下」
+
+
+# ---------- 收尾闸：不丢结论 ----------
+
+
+def test_wrap_up_gate_blocks_exploration_but_keeps_the_exit_open(
+    project_root: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """连续无产出逼近上限时停用探索工具，只放行 report_hunks / end_done。
+
+    **为什么**：实测 4 条真实 PR、7 次运行，6 次是「一路读文件、从不报告」被砍 ——
+    已经花掉的 token 与查到的结论一起没。软提醒它不理（发了 4 次都没用），
+    所以这里换成硬信号：把路收窄，只能交结论。
+    """
+    # 7 轮只读探索（其中两轮撞上被挡下的拒绝），第 8 轮报告、第 9 轮结束。
+    # 闸从第 5 轮起关闭 —— 留三轮：撞上拒绝、反应过来、报出来
+    llm = ScriptedChatModel(
+        responses=[
+            *[
+                ai_call(
+                    "file_read", {"path": "a.go", "start_line": i + 1, "end_line": i + 1}, f"c{i}"
+                )
+                for i in range(7)
+            ],
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+
+    with caplog.at_level("WARNING"):
+        result = run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    assert "停用探索工具" in caplog.text, "到阈值前两轮就该收窄"
+    assert result.exit_reason == EXIT_END_DONE, "被挡下之后它仍然能报结论并正常收尾"
+    assert result.pending_hunk_ids == [], "H-01 确实报上去了 —— 结论没丢"
+
+    # 被挡下的那些调用没有真的执行：工具结果是那句说明
+    blocked = [
+        str(message.content)
+        for call in llm.calls
+        for message in call
+        if "探索轮次已用完" in str(message.content)
+    ]
+    assert blocked, "挡下时要给模型一句能读懂的说明，而不是空结果"
+
+
+def test_reminder_carries_the_budget(project_root: str) -> None:
+    """提醒里要带上「连续几轮就会收尾」—— 不知道截止的工作会无限细化。"""
+    llm = ScriptedChatModel(
+        responses=[
+            *[
+                ai_call(
+                    "file_read", {"path": "a.go", "start_line": i + 1, "end_line": i + 1}, f"c{i}"
+                )
+                for i in range(5)
+            ],
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+
+    run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    delivered = [
+        str(message.content)
+        for call in llm.calls
+        for message in call
+        if "agent_reminder" in str(message.content)
+    ]
+    assert any("本组就会收尾" in text for text in delivered), "提醒要说明预算边界"
+
+
+def test_explore_reopens_after_a_report(project_root: str) -> None:
+    """报告一次之后探索重新开放 —— 本组还有别的 hunk 要查。"""
+    llm = ScriptedChatModel(
+        responses=[
+            *[
+                ai_call(
+                    "file_read", {"path": "a.go", "start_line": i + 1, "end_line": i + 1}, f"c{i}"
+                )
+                for i in range(7)
+            ],
+            report_call(["H-01"]),
+            ai_call("file_read", {"path": "a.go", "start_line": 99, "end_line": 99}, "c-after"),
+            # H-02 一直没报，第一次 end_done 会被拒（提示剩余 hunk），补一次
+            done_call("d1"),
+            done_call("d2"),
+        ]
+    )
+
+    result = run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
+
+    # H-02 一直没报 → 第二次 end_done 被接受，但带缺口（`_with_gaps`）。这是对的：
+    # 收尾闸保证「不丢已有结论」，不承诺「审完所有 hunk」
+    assert result.exit_reason == EXIT_END_DONE_WITH_GAPS
+    # 报告之后那次 file_read **真的要执行了**：看它那条工具结果（按调用 id 取，
+    # 不能翻整个历史 —— 之前被挡下的拒绝消息还在历史里躺着）
+    after = [
+        str(message.content)
+        for call in llm.calls
+        for message in call
+        if isinstance(message, ToolMessage) and message.tool_call_id == "c-after"
+    ]
+    assert after, "报告之后的那次调用要有结果"
+    assert "探索轮次已用完" not in after[0], "报告之后探索要重新开放"

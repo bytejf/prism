@@ -36,6 +36,7 @@ from prism.core.agent.middleware import (
     ToolFailureBudget,
     review_pacing,
     tool_call_dedup,
+    wrap_up_gate,
 )
 from prism.core.agent.state import (
     EXIT_ERROR,
@@ -138,6 +139,9 @@ def build_review_agent(model: BaseChatModel, compression: CompressionConfig | No
                     # 放在兜底**里面**：这一步自己的 bug 也会被兜成一条工具结果，
                     # 而不是把整组带走
                     tool_call_dedup,
+                    # 探索预算用完就只放行 report_hunks / end_done。
+                    # 放最内侧：它在工具真正执行前最后一道决定，且这个判断是无状态的
+                    wrap_up_gate,
                 ],
             ),
             state_schema=ReviewState,
@@ -192,6 +196,7 @@ def initial_state(group: Group, static_findings: Sequence[StaticFinding] = ()) -
         group=group,
         usage=UsageTotals(),
         stop_reason="",
+        explore_closed=False,
     )
 
 

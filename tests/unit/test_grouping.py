@@ -312,9 +312,12 @@ def test_static_findings_count_toward_the_budget(monkeypatch: pytest.MonkeyPatch
         pad_hunk(make_hunk_with_symbol("pkg/f.go", hunk_id=f"H-{index:02d}"), 30)
         for index in range(1, 5)
     ]
-    # 预算要够装下两三个 hunk，否则每条都会走「单个 hunk 自己也超」那条路，
-    # 切分点与发现无关，这条用例就测不到东西
-    budget(monkeypatch, 2000)
+    # 预算**按当前渲染结果现算**（固定开销 + 两个 hunk）：写死一个数的话，
+    # 提示词一改，它就落到「单个 hunk 自己也超」那个区间，切分点与发现无关了
+    fixed = fixed_prompt_tokens()
+    room = fixed + group_tokens(hunks[:2], [])
+    assert group_tokens(hunks[:1], []) + fixed <= room, "前提：单个装得下"
+    budget(monkeypatch, room)
     without = group_by_package(hunks)
 
     findings = [
