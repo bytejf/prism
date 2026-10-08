@@ -7,8 +7,9 @@
   工具、状态更新上，跟着数据一路走
 
 被审查的项目是 `~/Projects/python/prism-min-test`（可用环境变量
-`PRISM_MIN_TEST_REPO` 覆盖）：两个 Go 文件（`store.go` / `format.go`，
-同一个包）、6 个 hunk、**一个审查单元**，一次大约 4 轮 ReAct。
+`PRISM_MIN_TEST_REPO` 覆盖）：三个 Go 文件（`store.go` / `format.go` / `lint.go`，
+同一个包）、15 个 hunk、**一个审查单元**，一次大约 4 轮 ReAct。
+其中 `lint.go` 是专门让静态分析有东西可报的（5 条发现 / 5 个 linter / 三档优先级）。
 
 那个项目是独立于本仓库的 git 仓库（`main` 是干净版，`feature` 是改动版），
 不在本仓库里 —— 主仓库跟踪不了嵌套仓库。
