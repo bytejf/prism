@@ -636,6 +636,12 @@ prism-bench/evaluation/
       <样本>.trace.jsonl   # OTel trace（五类 span）
   metrics/<批次>/prism/<run_id>/metrics_*.json # ★ 裁判算出来的 P/R/F1（含逐条匹配）
   reviewers/prism.py     # 我们的 reviewer 插件（改的是克隆，不在 prism 仓库里）
+  prism_report.py        # 汇总一局（逐 PR 画像 + 总计，两套分母都报）
+  ref_audit.py           # ★ 把「没命中的参考」导成可逐条读、可打标签的清单
+                         #   → missed_references.md。判据是算出来的：参考行落没落
+                         #   在我们审过的 hunk 区间里。**改进方向该由它决定，
+                         #   不该由印象决定**（实测：81% 的漏掉是「看到了没看出来」，
+                         #   不是「没看到」—— 检索那条链是好的）
 ```
 
 跑一批：
