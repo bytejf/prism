@@ -622,6 +622,18 @@ JUDGE_MODEL=deepseek-flash JUDGE_USE_MOCK=false \
 PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
 ```
 
+**花钱之前先跑一次流水线对账**（秒级、零 token）：
+
+```bash
+uv run python tests/manual/audit_pipeline.py ~/Projects/python/prism-tests
+```
+
+它拿真实仓库量四件事，任何一项不对就先别跑 LLM：hunk 不重不漏 / **预算账 == 真实渲染**
+（差应在取整误差内，漂了「每组 ≤ N token」就是空话）/ 提示词自洽（每个 hunk 一个标签、
+静态表格行数 == 注入条数、`static_hint` 不引用没注入的编号）/ 定位同源（评论 `path` 与
+`hunk_id` 指向同一文件）。脚本把 `max_group_tokens` 压到 3000，否则走查仓库只有一组、
+装箱那条路没被走到。
+
 **外部二进制只有 golangci-lint 一个**（`go install
 github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`，实测装在
 `~/go/bin`）。它是**可选依赖**：没装时静态分析跳过、审查照常跑，所以单测里
