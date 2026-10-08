@@ -22,14 +22,12 @@ from prism.core.agent.agent import build_tools
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
     STATUS_DONE,
-    STATUS_IN_PROGRESS,
     STATUS_PENDING,
     HunkStatus,
     ReviewState,
     done_count,
     end_done_verdict,
     merge_hunk_status,
-    pending_ids,
 )
 from prism.core.diff.loader import build_diff_index
 from prism.core.diff.parser import parse_diff_text
@@ -717,7 +715,6 @@ def test_report_hunks_records_comments_and_marks_done() -> None:
             "reports": [
                 {
                     "hunk_id": "H-01",
-                    "complete": True,
                     "comments": [
                         {
                             "severity": "high",
@@ -733,7 +730,6 @@ def test_report_hunks_records_comments_and_marks_done() -> None:
 
     hunk_status = update["hunk_status"]
     assert "已记录" in tool_message_text(update)
-    assert "剩余" in tool_message_text(update)
     assert hunk_status["H-01"].status == STATUS_DONE
     assert "H-02" not in hunk_status, "增量里不该带没改动的 hunk"
     h01_comments = hunk_status["H-01"].comments
@@ -743,51 +739,13 @@ def test_report_hunks_records_comments_and_marks_done() -> None:
     # 工具不再原地改状态：调用前的快照没被动过（工具只是**返回**了新对象）
     assert before["H-01"].status == STATUS_PENDING
     assert before["H-01"].comments == []
-
-
-def test_report_hunks_returns_remaining_not_completed() -> None:
-    """测试返回值给「剩余未审」而非「已完成」。"""
-    state = make_state("H-01", "H-02", "H-03")
-    tool = ToolUnderTest(report_hunks, ReviewContext(), state)
-
-    update = tool.update({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
-    text = tool_message_text(update)
-    assert "剩余未审：H-02, H-03" in text
-    assert "1/3 完成" in text
-
-
-def test_report_hunks_all_done_reports_none_pending() -> None:
-    """测试全部完成时剩余为「无」。"""
-    tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
-    update = tool.update({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
-    assert "剩余未审：无" in tool_message_text(update)
-
-
 def test_report_hunks_ignores_unknown_hunk_id() -> None:
     """测试未知 hunk 编号被忽略且提示。"""
     tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
 
-    update = tool.update({"reports": [{"hunk_id": "H-99", "complete": True, "comments": []}]})
+    update = tool.update({"reports": [{"hunk_id": "H-99", "comments": []}]})
     assert "未知 hunk 编号" in tool_message_text(update)
     assert update["hunk_status"] == {}, "未知编号不该写回任何增量"
-
-
-def test_report_hunks_marks_incomplete_hunk_in_progress() -> None:
-    """测试 complete=False 时置为「审查中」而不是 done。
-
-    这给了 STATUS_IN_PROGRESS 一条真实的产生路径，<review_status> 的
-    「🔄 审查中」分组才有意义（否则永远是 0）。
-    """
-    tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
-
-    update = tool.update({"reports": [{"hunk_id": "H-01", "complete": False, "comments": []}]})
-    hunk_status = update["hunk_status"]
-    assert hunk_status["H-01"].status == STATUS_IN_PROGRESS
-    # 未完成 → 仍算未审，不进 pending_ids 之外的任何完成统计
-    assert pending_ids(hunk_status) == ["H-01"]
-    assert done_count(hunk_status) == 0
-
-
 def test_report_hunks_normalizes_optional_fields() -> None:
     """测试可选字段留空时转成 None，必填字段去掉首尾空白。"""
     tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
@@ -797,7 +755,6 @@ def test_report_hunks_normalizes_optional_fields() -> None:
             "reports": [
                 {
                     "hunk_id": "H-01",
-                    "complete": True,
                     "comments": [
                         {
                             "severity": "high",
@@ -828,7 +785,6 @@ def test_report_hunks_rejects_invalid_severity() -> None:
         "reports": [
             {
                 "hunk_id": "H-01",
-                "complete": True,
                 "comments": [
                     {"severity": "", "category": "x", "content": "y", "existing_code": "z"}
                 ],
@@ -843,7 +799,6 @@ def test_report_hunks_rejects_invalid_severity() -> None:
         "reports": [
             {
                 "hunk_id": "H-01",
-                "complete": True,
                 "comments": [{"category": "x", "content": "y", "existing_code": "z"}],
             }
         ]
@@ -856,7 +811,6 @@ def test_report_hunks_rejects_invalid_severity() -> None:
         "reports": [
             {
                 "hunk_id": "H-01",
-                "complete": True,
                 "comments": [
                     {"severity": "CRITICAL", "category": "x", "content": "y", "existing_code": "z"}
                 ],
@@ -880,71 +834,87 @@ def test_report_hunks_schema_is_visible_to_model() -> None:
     assert "hunk_id" in props
 
 
-def test_report_hunks_rejects_duplicate_report_of_done_hunk() -> None:
-    """测试已完成的 hunk 被重复报告时整体忽略，评论不成倍放大。
+def test_report_hunks_ignores_an_identical_repeat() -> None:
+    """完全相同的评论重复报，**一条都不加** —— 防止评论成倍放大。
 
-    回归用例：评论是追加不是去重合并，同一个问题报 3 次就会变成 3 条。
-    LLM 反复确认同一个 hunk 是自然行为。
+    这是原「已完成的 hunk 整份忽略」那条规则里唯一要保住的部分：LLM 反复确认
+    同一个 hunk 是自然行为（看到进度提示后想「再确认一下 H-01」），
+    而评论是追加不是替换，报 3 次就会变成 3 条。
     """
     state = make_state("H-01", "H-02")
     tool = ToolUnderTest(report_hunks, ReviewContext(), state)
     one_comment = [{"severity": "high", "category": "x", "content": "问题", "existing_code": "y"}]
     first = tool.update(
-        {"reports": [{"hunk_id": "H-01", "complete": True, "comments": one_comment}]}
+        {"reports": [{"hunk_id": "H-01", "comments": one_comment}]}
     )
     assert len(first["hunk_status"]["H-01"].comments) == 1
 
-    # 第二次、第三次报同一个 hunk —— 应被忽略
+    # 第二次报同一个 hunk，内容一字不差 —— 应被忽略
     repeat = tool.update(
-        {"reports": [{"hunk_id": "H-01", "complete": True, "comments": one_comment}]}
+        {"reports": [{"hunk_id": "H-01", "comments": one_comment}]}
     )
 
-    # 重复报告不写回增量 —— 这一条同时证明了评论没有成倍放大
+    # 没写回增量 —— 这一条同时证明了评论没有成倍放大
     assert repeat["hunk_status"] == {}, "重复报告写回了增量，评论会被放大"
     assert len(state["hunk_status"]["H-01"].comments) == 1
     text = tool_message_text(repeat)
-    assert "已审查完毕" in text
-    assert "本次报告已忽略" in text
+    assert "与已报过的完全相同" in text
     assert "未记录任何 hunk" in text
     # 拒绝报告不应影响进度（增量是空的，看合并后的状态）
     assert done_count(state["hunk_status"]) == 1
+
+
+def test_report_hunks_accepts_new_comments_on_a_reported_hunk() -> None:
+    """已报过的 hunk **可以继续补充新评论** —— 这条是「早报不吃亏」的全部依据。
+
+    改动理由（反馈文档 23 号 §十一）：以前的语义是「报了就锁死、整份忽略」，
+    于是「早报」变成纯亏损，模型理性地攒到最后一次性报，而那时又撞上收尾闸。
+    没有这条，提示词里「有结论就先报」就是空话。
+    """
+    state = make_state("H-01", "H-02")
+    tool = ToolUnderTest(report_hunks, ReviewContext(), state)
+    first = [{"severity": "high", "category": "x", "content": "问题一", "existing_code": "y"}]
+    later = [
+        # 内容一字不差 —— 会被去重丢掉
+        {"severity": "high", "category": "x", "content": "问题一", "existing_code": "y"},
+        # 换行差异不算新评论（归一化后相同）
+        {"severity": "low", "category": "x", "content": " 问题一 ", "existing_code": "y"},
+        # 真的新结论 —— 要收
+        {"severity": "medium", "category": "y", "content": "问题二", "existing_code": "z"},
+    ]
+    tool.update({"reports": [{"hunk_id": "H-01", "comments": first}]})
+
+    update = tool.update({"reports": [{"hunk_id": "H-01", "comments": later}]})
+
+    kept = state["hunk_status"]["H-01"].comments
+    assert [item.content for item in kept] == ["问题一", "问题二"], "只收**新**的那条"
+    text = tool_message_text(update)
+    assert "补充了新评论" in text
+    assert "新增评论 1 条" in text
+    # 状态仍是 done：补充不改变「报过了」这个事实
+    assert state["hunk_status"]["H-01"].status == STATUS_DONE
 
 
 def test_report_hunks_duplicate_and_new_in_one_call() -> None:
     """测试同一次调用里既有重复也有新报告时，只忽略重复的那部分。"""
     state = make_state("H-01", "H-02")
     tool = ToolUnderTest(report_hunks, ReviewContext(), state)
-    tool.update({"reports": [{"hunk_id": "H-01", "complete": True, "comments": []}]})
+    tool.update({"reports": [{"hunk_id": "H-01", "comments": []}]})
 
     update = tool.update(
         {
             "reports": [
-                {"hunk_id": "H-01", "complete": True, "comments": []},
-                {"hunk_id": "H-02", "complete": True, "comments": []},
+                {"hunk_id": "H-01", "comments": []},
+                {"hunk_id": "H-02", "comments": []},
             ]
         }
     )
     text = tool_message_text(update)
     assert "已记录 1 个 hunk：H-02" in text
-    assert "已审查完毕" in text
+    assert "与已报过的完全相同，已忽略：H-01" in text
     # 增量只含 H-02，进度要看合并后的状态
     assert set(update["hunk_status"]) == {"H-02"}
     assert done_count(state["hunk_status"]) == 2
-
-
-def test_report_hunks_incomplete_hunk_accepts_repeat() -> None:
-    """测试未完成的 hunk 仍可被重复报告 —— 补充评论的路径不能被堵死。
-
-    complete=false 表示「报了部分结论但还没审完」，此时重复报告是合法的。
-    """
-    tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
-    note = [{"severity": "low", "category": "x", "content": "补充", "existing_code": "y"}]
-
-    tool.update({"reports": [{"hunk_id": "H-01", "complete": False, "comments": note}]})
-    update = tool.update({"reports": [{"hunk_id": "H-01", "complete": False, "comments": note}]})
-
-    assert "已审查完毕" not in tool_message_text(update)
-    assert len(update["hunk_status"]["H-01"].comments) == 2
 
 
 # ---------- end_done ----------

@@ -17,18 +17,20 @@ from prism.models.cost import UsageTotals
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
 
-# hunk 审查状态的取值
+# hunk 审查状态的取值。
+#
+# **只有两态**：报过 = done。曾经还有 `in_progress`（模型用 `complete=false` 表达
+# 「报了部分结论、还没审完」）—— 那个字段后来整个删掉了：报过就没有终局语义，
+# 同一个 hunk 随时可以再报、评论会累加，所以「审到一半」这个状态没有对应物
 STATUS_PENDING = "pending"
-STATUS_IN_PROGRESS = "in_progress"
 STATUS_DONE = "done"
 
-# 轮次公式、无产出提醒/退出阈值、end_done 拒绝上限**都是配置项**，
-# 见 default.toml 的 [review]。这里不写第二份默认值。
+# 提醒阈值、收尾闸比例、end_done 拒绝上限**都是配置项**，见 default.toml 的
+# [review]。这里不写第二份默认值。
 
 # 退出原因取值
 EXIT_END_DONE = "end_done"
 EXIT_END_DONE_WITH_GAPS = "end_done_with_gaps"
-EXIT_NO_PROGRESS = "no_progress"
 # 撞上 recursion_limit：**不该发生**（说明前面几道闸一个都没生效），带缺口退出
 EXIT_RECURSION = "recursion"
 # 图抛了别的异常：同样带缺口退出，不把整条 review 带走
@@ -100,14 +102,16 @@ class ReviewState(AgentState):
     Attributes:
         hunk_status: hunk 状态表（hunk_id → HunkStatus）。并行写按 key 合并
         round_count: 已完成的模型调用轮次（**只是观测数据**，不再参与退出判定）
-        no_report_rounds: 连续无产出的轮次数
+        no_report_rounds: 连续无产出（没有 report_hunks / end_done）的轮次数。
+            **只驱动软提醒**，不再参与退出判定 —— 硬的那道是收尾闸（预算口径）
         end_done_count: 上次有进展以来 end_done 被调用的次数（拒绝机制用）
         end_done_mark: 上次重置时已完成的 hunk 数，用来判断「有没有新进展」
         group: 当前审查单元
         usage: 累计用量（**按轮增量累加**，不能最后扫消息：压缩会把历史删掉）
-        explore_closed: 探索工具是否已被停用（连续无产出到收尾阈值时为 True）。
+        explore_closed: 探索工具是否已被停用（单组钱或时间用掉
+            `settings.review.explore_close_ratio` 时为 True，**单调不回退**）。
             停用只留 `report_hunks` / `end_done` —— **不丢结论**：与其把已经花掉的
-            轮次连同查到的结论一起丢掉，不如逼它把已有结论报出来
+            预算连同查到的结论一起丢掉，不如逼它把已有结论报出来
         stop_reason: 停下来的原因（``cost`` / ``time`` / ``tool_failures``），没停时为 ""。
             **单键、先写者胜**：同一轮里有两个中间件都决定停时，谁先写谁的原因留下 ——
             顺序由 `build_review_agent` 的中间件列表定（预算在两个停手里排最前）
@@ -170,10 +174,9 @@ def exit_reason_of(state: ReviewState) -> str | None:
     """从**终态**读出退出原因，而不是一路传递。
 
     这样 `exit_reason` 不必进 state —— 它是终态的一个纯函数，好测也好读。
-    顺序：**end_done 裁决 → 预算 → 工具失败 → 连续无产出**。
+    顺序：**end_done 裁决 → 预算 → 工具失败**。
 
-    顺序是有讲究的：审完了就是审完了（不该报成「因预算停止」而给用户一个假缺口），
-    而预算比「连续无产出」更值得报 —— 后者往往只是前者的表象。
+    顺序是有讲究的：审完了就是审完了（不该报成「因预算停止」而给用户一个假缺口）。
 
     Args:
         state: 循环结束时的状态
@@ -193,9 +196,6 @@ def exit_reason_of(state: ReviewState) -> str | None:
         return EXIT_BUDGET_TIME
     if state["stop_reason"] == STOP_TOOL_FAILURES:
         return EXIT_TOOL_FAILURES
-
-    if state["no_report_rounds"] >= settings.review.no_progress_exit_rounds:
-        return EXIT_NO_PROGRESS
 
     return None
 

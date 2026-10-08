@@ -29,6 +29,7 @@ from prism.core.agent.budget import STOP_COST, STOP_TOOL_FAILURES
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.middleware import (
     DUPLICATE_CALL_MESSAGE,
+    ReviewProgress,
     end_done_reset,
     should_exit,
     update_no_report_rounds,
@@ -45,10 +46,8 @@ from prism.core.agent.state import (
     EXIT_END_DONE,
     EXIT_END_DONE_WITH_GAPS,
     EXIT_ERROR,
-    EXIT_NO_PROGRESS,
     EXIT_RECURSION,
     STATUS_DONE,
-    STATUS_IN_PROGRESS,
     STATUS_PENDING,
     HunkStatus,
     ReviewState,
@@ -59,6 +58,7 @@ from prism.core.agent.status import build_review_status
 from prism.core.diff.loader import build_diff_index
 from prism.core.diff.parser import parse_diff_text
 from prism.models.ast import HunkWithSymbol, Symbol
+from prism.models.cost import UsageTotals
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
 from prism.models.tool import CommentInput
@@ -190,21 +190,18 @@ def read_call(call_id: str = "call-1") -> AIMessage:
     return ai_call("file_read", {"path": "a.go", "start_line": 1, "end_line": 2}, call_id)
 
 
-def report_call(
-    hunk_ids: list[str], complete: bool = True, call_id: str = "call-r", *, usage: bool = True
-) -> AIMessage:
+def report_call(hunk_ids: list[str], call_id: str = "call-r", *, usage: bool = True) -> AIMessage:
     """构造一次 report_hunks 调用。
 
     Args:
         hunk_ids: 要报告的 hunk 编号
-        complete: 是否标记完成
         call_id: 调用 ID
         usage: 是否带用量元数据
 
     Returns:
         AIMessage
     """
-    reports = [{"hunk_id": hunk_id, "complete": complete, "comments": []} for hunk_id in hunk_ids]
+    reports = [{"hunk_id": hunk_id, "comments": []} for hunk_id in hunk_ids]
     return ai_call("report_hunks", {"reports": reports}, call_id, usage=usage)
 
 
@@ -307,10 +304,19 @@ def test_should_exit_on_accepted_end_done() -> None:
     assert should_exit(twice) is True
 
 
-def test_should_exit_on_no_progress() -> None:
-    """测试连续无产出到阈值时退出。"""
-    state = state_with(hunk_status={}, end_done_count=0, no_report_rounds=8)
-    assert should_exit(state) is True
+def test_should_exit_ignores_round_counts() -> None:
+    """**轮数不再是退出条件** —— 语义退出只看 end_done 裁决。
+
+    这条钉住的是「轮数是代理指标」那个决定：同一轮的产出能差几十倍，数不出来。
+    资源止损由预算 / 收尾闸 / 工具失败各自负责，不在这里。
+    """
+    for rounds in (8, 50, 500):
+        state = state_with(
+            hunk_status={"H-01": HunkStatus("H-01", STATUS_PENDING)},
+            end_done_count=0,
+            no_report_rounds=rounds,
+        )
+        assert should_exit(state) is False
 
 
 def test_end_done_reset_on_progress() -> None:
@@ -331,9 +337,9 @@ def test_end_done_reset_on_progress() -> None:
 
 
 def test_end_done_reset_needs_actual_progress() -> None:
-    """测试「审查中」不算进展，不重置。"""
+    """测试没报完的 hunk 不算进展，不重置。"""
     state = state_with(
-        hunk_status={"H-01": HunkStatus("H-01", STATUS_IN_PROGRESS)},
+        hunk_status={"H-01": HunkStatus("H-01", STATUS_PENDING)},
         end_done_count=1,
         end_done_mark=0,
     )
@@ -399,36 +405,47 @@ def test_build_tools_exposes_five_tools() -> None:
 # ---------- review_status ----------
 
 
-def test_build_review_status_reports_progress() -> None:
-    """测试进度快照的内容与格式。"""
+def test_build_review_status_reports_the_coverage_gap() -> None:
+    """快照的第一句必须是**还缺多少**，而不是「完成了多少」。
+
+    实测（反馈文档 23 号 §十一）：模型读 41 轮、最后一次性报 49 个 hunk、写 1 条
+    评论 —— 而它自始至终没看到过缺口。所以这里断言的措辞是「已给结论 2/3」与
+    未报清单，不是「x/N 完成」（后者读起来像进程状态）。
+    """
     hunk_status = {
         "H-01": HunkStatus("H-01", STATUS_DONE),
         "H-02": HunkStatus("H-02", STATUS_DONE),
         "H-03": HunkStatus("H-03", STATUS_PENDING),
     }
 
-    status = build_review_status(hunk_status)
+    status = build_review_status(hunk_status, used_ratio=0.42)
     assert "<review_status>" in status
-    assert "### Hunk 审查进度（2/3 完成）" in status
-    assert "H-01 — 无问题" in status
-    assert "⏳ 待审查（1）：" in status
-    assert "H-03" in status
+    assert "已给结论 2/3" in status
+    assert "本组预算已用 42%" in status
+    assert "已报过（2）：H-01, H-02" in status
+    assert "**还没报告（1）**：H-03" in status
 
 
-def test_build_review_status_counts_severity() -> None:
-    """测试有问题的 hunk 按 severity 汇总。"""
+def test_build_review_status_omits_the_budget_when_unknown() -> None:
+    """拿不到用量时不写预算 —— 写个 0% 是错的，比不写更坏。
+
+    压缩器那条路径没有用量，它调本函数时只能不传。
+    """
+    status = build_review_status({"H-01": HunkStatus("H-01", STATUS_PENDING)})
+    assert "预算" not in status
+    assert "已给结论 0/1" in status
+
+
+def test_build_review_status_truncates_a_long_pending_list() -> None:
+    """未报清单过长时截断，但**数字要保留** —— 差多少个看数字，具体哪些看编号。"""
     hunk_status = {
-        "H-01": HunkStatus(
-            "H-01",
-            STATUS_DONE,
-            comments=[
-                CommentInput(severity="high", category="c", content="x", existing_code="y"),
-                CommentInput(severity="medium", category="c", content="x", existing_code="y"),
-            ],
-        )
+        f"H-{index:02d}": HunkStatus(f"H-{index:02d}", STATUS_PENDING)
+        for index in range(1, 31)
     }
     status = build_review_status(hunk_status)
-    assert "H-01 — 2 issues（high:1, medium:1）" in status
+    assert "**还没报告（30）**" in status
+    assert "（等 30 个）" in status
+    assert "H-21" not in status, "只列前 20 个"
 
 
 # ---------- 端到端循环 ----------
@@ -483,13 +500,25 @@ def test_diff_index_reaches_the_tool(project_root: str) -> None:
     assert "+new()" in second_request
 
 
-def test_main_loop_exits_on_no_progress(project_root: str) -> None:
-    """测试连续无产出退出：一直只调 file_read。"""
-    llm = ScriptedChatModel(responses=[read_call(call_id=f"call-{i}") for i in range(20)])
+def test_many_explore_rounds_no_longer_end_the_group(project_root: str) -> None:
+    """连读 12 轮探索**不再**按轮数收尾 —— 它自己报完再结束。
+
+    回归：上一版到第 8 轮就把整组按停，实测在真实仓库上表现为「88 个 hunk 的组
+    只跑了 8 轮就全部报完」（反馈文档 23 号 §十一）。收尾闸现在按预算比例触发，
+    轮数只驱动软提醒。
+    """
+    llm = ScriptedChatModel(
+        responses=[
+            *[read_call(call_id=f"call-{i}") for i in range(12)],
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
 
     result = run_review_agent(make_group(["H-01"]), llm, project_root)
-    assert result.exit_reason == EXIT_NO_PROGRESS
-    assert result.round_count == 8
+
+    assert result.exit_reason == EXIT_END_DONE
+    assert result.round_count == 14, "12 轮探索之后照样能报结论、正常收尾"
 
 
 def test_plain_text_after_tool_call_does_not_end_loop(project_root: str) -> None:
@@ -499,7 +528,7 @@ def test_plain_text_after_tool_call_does_not_end_loop(project_root: str) -> None
     纯文本响应的 `tool_calls` 是空列表（假值），于是它继续往前翻、翻到了上一轮
     的调用 —— `review_pacing` 误判「这轮有工具调用」，既不注入提醒也不
     `jump_to="model"`，框架按默认的「没调工具就结束」收尾，
-    而我们的三个退出条件（end_done / 轮次耗尽 / 连续无产出）一个都不满足，
+    而语义退出的条件（end_done 被受理）还没满足，
     `exit_reason_of` 返回 None，整个审查以 ValueError 崩掉。
 
     这条路径要「纯文本紧跟在一次工具调用之后」才会走到，所以常态跑不出来 ——
@@ -519,25 +548,34 @@ def test_plain_text_after_tool_call_does_not_end_loop(project_root: str) -> None
     assert result.round_count == 4, "纯文本那一轮被当成「有工具调用」，循环提前结束了"
 
 
-def test_main_loop_exits_on_no_progress_for_plain_text(project_root: str) -> None:
-    """测试纯文本输出也算无产出。
+def test_main_loop_survives_many_plain_text_rounds(project_root: str) -> None:
+    """连续 10 轮纯文本也不结束循环 —— 它只是「还没报结论」的一种形态。
 
     这条同时验证了 prism 与框架默认行为的冲突点：框架遇到「模型没调工具」
     会直接结束循环，是 middleware 返回 jump_to="model" 把它拉回来的。
+    上一版还在第 8 轮按计数收尾，现在只由预算兜。
     """
-    llm = ScriptedChatModel(responses=[ai_text() for _ in range(20)])
+    llm = ScriptedChatModel(
+        responses=[
+            *[ai_text() for _ in range(10)],
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
 
     result = run_review_agent(make_group(["H-01"]), llm, project_root)
-    assert result.exit_reason == EXIT_NO_PROGRESS
-    assert result.round_count == 8
+
+    assert result.exit_reason == EXIT_END_DONE
+    assert result.round_count == 12, "纯文本轮次被拉回来了，没在途中被砍"
 
 
 def test_no_report_rounds_reset_on_end_done_rejected(project_root: str) -> None:
     """测试 end_done 被拒绝时 no_report_rounds 被重置。
 
-    4 轮 file_read（计数 4）→ end_done 被拒绝（重置为 0）→ 再 4 轮 file_read（计数 4）
-    → end_done 接受并带缺口退出。
-    若重置没生效，第 9 轮就会因计数超 8 而以 no_progress 退出。
+    4 轮 file_read（计数 4）→ end_done 被拒绝（重置为 0，纠正机会回来）→ 再 4 轮
+    file_read → end_done 接受并带缺口退出。
+    重置不生效的话，第二次 end_done 会被当成「又误调一次」直接接受 —— 差别在
+    `end_done_count`，不在轮数（轮数早已不参与退出判定）。
     """
     llm = ScriptedChatModel(
         responses=[
@@ -597,6 +635,41 @@ def test_main_loop_injects_review_status_after_report(project_root: str) -> None
     # 第二轮调用 LLM 时，消息里应已含 review_status
     second_round = llm.calls[1]
     assert any("<review_status>" in str(message.content) for message in second_round)
+
+
+def test_status_snapshot_is_injected_at_budget_milestones(
+    project_root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """预算跨过里程碑时也注入快照 —— **即使模型一次都没报告过**。
+
+    这是修一个**自锁**：快照原来只在「上一轮调过 report_hunks」时注入，于是一个
+    从不报告的模型一次都看不到覆盖缺口，而它恰恰是最需要看到的那一类（实测
+    41 轮的运行里注入了 0 次）。每档只报一次 —— 同一句话重复说会变成噪声。
+    """
+    # 一轮的用量折算约 0.0024 元（假模型的 usage 是固定的）→ 0.02 元预算下每轮约 12%
+    tiny_budget(monkeypatch, max_group_cost=0.02, status_milestones=(5, 20))
+    llm = ScriptedChatModel(
+        responses=[
+            read_call("c1"),
+            read_call("c2"),
+            read_call("c3"),
+            report_call(["H-01"]),
+            done_call(),
+        ]
+    )
+
+    run_review_agent(make_group(["H-01"]), llm, project_root)
+
+    def snapshots(call: list[BaseMessage]) -> int:
+        return sum(1 for message in call if "<review_status>" in str(message.content))
+
+    assert snapshots(llm.calls[1]) == 1, "第 1 轮跨过 5% 就该注入（此时它还一条都没报）"
+    assert snapshots(llm.calls[2]) == 2, "第 2 轮跨过 20% 再注入一次"
+    assert snapshots(llm.calls[3]) == 2, "36% 没有新跨过的档，不该重复播报"
+
+    text = "\n".join(str(message.content) for message in llm.calls[1])
+    assert "已给结论 0/1" in text, "快照要说的是**还缺多少**"
+    assert "本组预算已用" in text
 
 
 def with_usage(message: AIMessage, tokens: int) -> AIMessage:
@@ -999,6 +1072,22 @@ def tiny_budget(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
     monkeypatch.setattr("prism.core.agent.middleware.settings", replace(settings, review=review))
 
 
+def budget_usage(fraction: float = 0.9) -> UsageTotals:
+    """造一份「已经用掉单组预算 `fraction`」的用量。
+
+    **从配置反推 token 数**，不写死数字：价格表或单组预算一改，写死的那个数就会
+    静默落到阈值另一侧 —— 用例照样绿，断言已经不测东西了。
+
+    Args:
+        fraction: 想用掉的比例
+
+    Returns:
+        对应用量
+    """
+    yuan = settings.review.max_group_cost * fraction
+    return UsageTotals(calls=1, output=int(yuan * 1_000_000 / settings.cost.output) + 1)
+
+
 def test_cost_budget_stops_the_group_and_keeps_comments(
     project_root: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1384,6 +1473,38 @@ def test_key_logs_are_present_on_a_normal_group(
     assert "用量" in text
 
 
+def test_shallow_coverage_is_logged_as_warning(
+    project_root: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """「hunk 很多、轮次很少」必须自己冒出来 —— 实测那时没有任何一行日志会指出来。
+
+    背景（反馈文档 23 号 §十一）：全量跑里出现过 88 个 hunk 的组只跑 8 轮就全部
+    报完，而日志里是 `未审 0` + `exit_reason=end_done`，看起来一切正常。
+    一次 report_hunks 能把全部 hunk 一起标 complete，所以「未审 0」**不是覆盖度
+    的证据** —— 这条告警是给这件事的一声响。
+    """
+    hunk_ids = [f"H-{index:02d}" for index in range(1, 26)]
+    llm = ScriptedChatModel(responses=[report_call(hunk_ids), done_call()])
+
+    with caplog.at_level("WARNING"):
+        result = run_review_agent(make_group(hunk_ids), llm, project_root)
+
+    assert result.pending_hunk_ids == [], "前提正是「未审 0」—— 这个数不可信"
+    assert "严重不成比例" in caplog.text
+
+
+def test_shallow_coverage_warning_skips_small_groups(
+    project_root: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """小组不参与：比值本来就抖，喊了只会让人学会忽略这条告警。"""
+    llm = ScriptedChatModel(responses=[report_call(["H-01", "H-02"]), done_call()])
+
+    with caplog.at_level("WARNING"):
+        run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
+
+    assert "严重不成比例" not in caplog.text
+
+
 def test_budget_stop_is_logged_as_warning(
     project_root: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1404,16 +1525,20 @@ def test_no_progress_reminder_reaches_a_model_that_keeps_calling_tools(
     """「一直在调工具、从不报告」到阈值时要真的收到提醒。
 
     这是**实测踩出来的回归**：提醒原来只写在 `review_pacing` 的「没有工具调用」
-    分支里，于是「连续 8 轮读文件、一条不报」这种最该被提醒的形态一次提醒都拿不到，
-    第 8 轮被 no_progress 直接砍掉（第一次真跑一条真实 PR 就撞上了）。
+    分支里，于是「连续读文件、一条不报」这种最该被提醒的形态一次提醒都拿不到。
 
-    提醒现在挂在 `before_model`（工具跑完、追加人类消息合法的地方）。
+    提醒现在挂在 `before_model`（工具跑完、追加人类消息合法的地方），
+    而且**只有提醒、没有硬后果** —— 硬的交给收尾闸（预算口径）。
     """
     # 每轮读不同范围：避免被去重拦下（那会让「一直在调工具」这个前提失真）
     llm = ScriptedChatModel(
         responses=[
-            ai_call("file_read", {"path": "a.go", "start_line": i, "end_line": i + 5}, f"c{i}")
-            for i in range(8)
+            *[
+                ai_call("file_read", {"path": "a.go", "start_line": i, "end_line": i + 5}, f"c{i}")
+                for i in range(8)
+            ],
+            report_call(["H-01"]),
+            done_call(),
         ]
     )
 
@@ -1425,13 +1550,13 @@ def test_no_progress_reminder_reaches_a_model_that_keeps_calling_tools(
         for message in call
         if "连续" in str(message.content)
     ]
-    assert result.exit_reason == EXIT_NO_PROGRESS, "8 轮无产出仍然按原阈值收尾"
-    assert any("你已经连续 5 轮未报告" in text for text in delivered), "第 5 轮的提醒没送到"
-    assert any("你已经连续 7 轮未报告" in text for text in delivered), "第 7 轮的提醒没送到"
+    assert result.exit_reason == EXIT_END_DONE, "提醒不带硬后果，收尾由模型自己决定"
+    assert any("你已经连续 5 轮没有报告" in text for text in delivered), "第 5 轮的提醒没送到"
+    assert any("你已经连续 7 轮没有报告" in text for text in delivered), "第 7 轮的提醒没送到"
     # 每轮**只能有一条**：实测撞过「同一轮注入两条」—— 那是我改这块时补丁被应用了两次，
     # 而两条一模一样的提醒白占 token，也让日志读起来像跑了两遍
     sixth = [str(message.content) for message in llm.calls[5]]
-    assert sum(1 for text in sixth if "你已经连续 5 轮未报告" in text) == 1
+    assert sum(1 for text in sixth if "你已经连续 5 轮没有报告" in text) == 1
 
 
 # ---------- 无产出轮次的性质分类 ----------
@@ -1453,55 +1578,86 @@ def test_round_tool_results_only_takes_the_tail() -> None:
 
 
 def test_no_progress_kinds_separate_exploration_from_spinning(
-    project_root: str, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """八轮无产出：要能说清是「一直在读新内容」还是「在原地打转」。
+    """要能说清是「一直在读新内容」还是「在原地打转」—— 收尾闸触发时把它打出来。
 
     实测那条真 PR 的八轮**全在读没读过的文件**（同参数重复调用已被去重拦下）——
-    它是在推进，只是没下结论。这与「换个参数读到同样内容」是两回事，砍不砍它
-    应该由这个分布来决定，而不是一律按同一个阈值。
+    它是在推进，只是没下结论。这与「换个参数读到同样内容」是两回事，
+    收尾闸该松还是该紧，要有这个分布才有依据。
     """
-    # 每轮**逐行**读：内容必然不同（整段读的话，夹具文件短、会被截断成同样的内容，
-    # 那反而变成「重复」—— 第一版用例就是这么把自己坑了的）
-    llm = ScriptedChatModel(
-        responses=[
-            ai_call("file_read", {"path": "a.go", "start_line": i + 1, "end_line": i + 1}, f"c{i}")
-            for i in range(8)
-        ]
+    progress = ReviewProgress(compressor=None)
+    # 第 1 轮读到新内容，第 2 轮换了参数、结果还是那段内容 → 打转
+    progress._classify_round(
+        state_with(
+            no_report_rounds=1,
+            messages=[
+                ai_call("file_read", {"path": "a.go"}, "c1"),
+                ToolMessage(content="内容甲", tool_call_id="c1"),
+            ],
+        )
+    )
+    progress._classify_round(
+        state_with(
+            no_report_rounds=2,
+            messages=[
+                ai_call("file_read", {"path": "a.go", "start_line": 1}, "c2"),
+                ToolMessage(content="内容甲", tool_call_id="c2"),
+            ],
+        )
     )
 
-    with caplog.at_level(logging.INFO):
-        run_review_agent(make_group(["H-01"]), llm, project_root)
+    expensive = state_with(explore_closed=False, usage=budget_usage())
+    with caplog.at_level(logging.WARNING):
+        assert progress._close_explore(expensive) is True
 
     assert "性质分布" in caplog.text
-    assert "新内容" in caplog.text
-    # **不再断言「没有重复轮」**：收尾闸从第 6 轮起挡下只读工具，那些拒绝消息
-    # 每次一模一样 —— 于是它们被如实记成「重复」。那恰恰是想要的信号：
-    # `新内容 6 / 重复 2` 读起来就是「6 轮真探索，2 轮被闸挡下」
+    assert "新内容 1" in caplog.text and "重复 1" in caplog.text
 
 
 # ---------- 收尾闸：不丢结论 ----------
 
 
+def test_explore_gate_fires_on_budget_not_rounds() -> None:
+    """收尾闸按**预算比例**开，与轮数无关；而且**单调**（关掉不再开）。
+
+    钉住的是反馈文档 23 号 §十一 那个决定：轮数对组大小不敏感 —— 实测 4 个 hunk
+    的组和 88 个 hunk 的组都只拿到 5 轮探索，大组只读了 8 个文件就被要求交卷。
+    """
+    progress = ReviewProgress(compressor=None)
+
+    enough_rounds_but_cheap = state_with(
+        explore_closed=False, usage=budget_usage(0.5), no_report_rounds=999
+    )
+    assert progress._close_explore(enough_rounds_but_cheap) is None, "预算没用够，跑多少轮都不关"
+
+    one_round_but_expensive = state_with(
+        explore_closed=False, usage=budget_usage(0.9), no_report_rounds=1
+    )
+    assert progress._close_explore(one_round_but_expensive) is True, "预算用够就关，哪怕只跑一轮"
+
+    already = state_with(explore_closed=True, usage=budget_usage(0.9))
+    assert progress._close_explore(already) is None, "已经关了就返回 None —— 预算不会退回来"
+
+
 def test_wrap_up_gate_blocks_exploration_but_keeps_the_exit_open(
-    project_root: str, caplog: pytest.LogCaptureFixture
+    project_root: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """连续无产出逼近上限时停用探索工具，只放行 report_hunks / end_done。
+    """收尾闸触发后停用探索工具，只放行 report_hunks / end_done。
 
     **为什么**：实测 4 条真实 PR、7 次运行，6 次是「一路读文件、从不报告」被砍 ——
     已经花掉的 token 与查到的结论一起没。软提醒它不理（发了 4 次都没用），
     所以这里换成硬信号：把路收窄，只能交结论。
+
+    闸的判据是预算比例，用例里把它压到 0（第一轮之后必定触发），
+    这样「闸关掉之后会发生什么」与具体价格无关。
     """
-    # 7 轮只读探索（其中两轮撞上被挡下的拒绝），第 8 轮报告、第 9 轮结束。
-    # 闸从第 5 轮起关闭 —— 留三轮：撞上拒绝、反应过来、报出来
+    tiny_budget(monkeypatch, explore_close_ratio=0.0)
     llm = ScriptedChatModel(
         responses=[
-            *[
-                ai_call(
-                    "file_read", {"path": "a.go", "start_line": i + 1, "end_line": i + 1}, f"c{i}"
-                )
-                for i in range(7)
-            ],
+            ai_call("file_read", {"path": "a.go", "start_line": 1, "end_line": 1}, "c0"),
+            # 这一轮闸已经关了，调用会被挡下
+            ai_call("file_read", {"path": "a.go", "start_line": 2, "end_line": 2}, "c1"),
             report_call(["H-01"]),
             done_call(),
         ]
@@ -1510,22 +1666,26 @@ def test_wrap_up_gate_blocks_exploration_but_keeps_the_exit_open(
     with caplog.at_level("WARNING"):
         result = run_review_agent(make_group(["H-01"]), llm, project_root)
 
-    assert "停用探索工具" in caplog.text, "到阈值前两轮就该收窄"
+    assert "停用探索工具" in caplog.text
     assert result.exit_reason == EXIT_END_DONE, "被挡下之后它仍然能报结论并正常收尾"
     assert result.pending_hunk_ids == [], "H-01 确实报上去了 —— 结论没丢"
 
-    # 被挡下的那些调用没有真的执行：工具结果是那句说明
+    # 被挡下的那个调用没有真的执行：工具结果是那句说明
     blocked = [
         str(message.content)
         for call in llm.calls
         for message in call
-        if "探索轮次已用完" in str(message.content)
+        if "探索工具已停用" in str(message.content)
     ]
     assert blocked, "挡下时要给模型一句能读懂的说明，而不是空结果"
 
 
-def test_reminder_carries_the_budget(project_root: str) -> None:
-    """提醒里要带上「连续几轮就会收尾」—— 不知道截止的工作会无限细化。"""
+def test_reminder_states_the_cost_of_not_reporting(project_root: str) -> None:
+    """提醒要说清**代价**（没报的结论会随预算一起丢），而不是下命令。
+
+    实测模型对「你必须做 X」不敏感（同一条硬提醒连发 4 次无效），
+    对「不做的后果」才有反应。
+    """
     llm = ScriptedChatModel(
         responses=[
             *[
@@ -1547,39 +1707,5 @@ def test_reminder_carries_the_budget(project_root: str) -> None:
         for message in call
         if "agent_reminder" in str(message.content)
     ]
-    assert any("本组就会收尾" in text for text in delivered), "提醒要说明预算边界"
-
-
-def test_explore_reopens_after_a_report(project_root: str) -> None:
-    """报告一次之后探索重新开放 —— 本组还有别的 hunk 要查。"""
-    llm = ScriptedChatModel(
-        responses=[
-            *[
-                ai_call(
-                    "file_read", {"path": "a.go", "start_line": i + 1, "end_line": i + 1}, f"c{i}"
-                )
-                for i in range(7)
-            ],
-            report_call(["H-01"]),
-            ai_call("file_read", {"path": "a.go", "start_line": 99, "end_line": 99}, "c-after"),
-            # H-02 一直没报，第一次 end_done 会被拒（提示剩余 hunk），补一次
-            done_call("d1"),
-            done_call("d2"),
-        ]
-    )
-
-    result = run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
-
-    # H-02 一直没报 → 第二次 end_done 被接受，但带缺口（`_with_gaps`）。这是对的：
-    # 收尾闸保证「不丢已有结论」，不承诺「审完所有 hunk」
-    assert result.exit_reason == EXIT_END_DONE_WITH_GAPS
-    # 报告之后那次 file_read **真的要执行了**：看它那条工具结果（按调用 id 取，
-    # 不能翻整个历史 —— 之前被挡下的拒绝消息还在历史里躺着）
-    after = [
-        str(message.content)
-        for call in llm.calls
-        for message in call
-        if isinstance(message, ToolMessage) and message.tool_call_id == "c-after"
-    ]
-    assert after, "报告之后的那次调用要有结果"
-    assert "探索轮次已用完" not in after[0], "报告之后探索要重新开放"
+    assert any("会随预算一起丢掉" in text for text in delivered), "提醒要说明代价"
+    assert any("报告不是终局" in text for text in delivered), "也要说明报了还能继续补"

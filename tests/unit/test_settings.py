@@ -142,7 +142,7 @@ def test_load_maps_every_value() -> None:
 
     assert settings.review.max_group_tokens == review_raw["max_group_tokens"]
     assert settings.review.max_super_steps == review_raw["max_super_steps"]
-    assert settings.review.no_progress_exit_rounds == review_raw["no_progress_exit_rounds"]
+    assert settings.review.explore_close_ratio == review_raw["explore_close_ratio"]
     assert settings.review.max_rejections == review_raw["max_rejections"]
     # toml 数组读进来是 list，配置里存成 tuple
     assert (

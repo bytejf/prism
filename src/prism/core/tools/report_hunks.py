@@ -19,11 +19,9 @@ from pydantic import BaseModel, Field
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import (
     STATUS_DONE,
-    STATUS_IN_PROGRESS,
     HunkStatus,
     ReviewState,
     done_count,
-    pending_ids,
 )
 from prism.models.tool import CommentInput
 
@@ -53,27 +51,29 @@ class CommentArg(BaseModel):
     rule_ref: str | None = Field(default=None, description="引用的规则编号（可选，V1 不用）")
 
 
+# 类 docstring 会成为 schema 里的 `items.description`，**是模型看得到的**，
+# 所以只写一句给模型看的话；下面这条设计理由用注释写。
+#
+# **为什么没有 `complete` 字段**（反馈文档 23 号 §十一）：那个布尔表达的是
+# 「这是终局结论、以后不许再报」，模型读到之后理性地攒到最后一次性报，而收尾闸
+# 又按预算把它按停 —— 两边打架，产出的是假结论。去掉之后「报过 = 关注过」，
+# 同一个 hunk 随时可以再报、评论累加。
 class HunkReportArg(BaseModel):
     """单个 hunk 的审查结论。"""
 
     hunk_id: str = Field(description="hunk 编号，必须来自审查范围，如 H-01")
-    complete: bool = Field(
-        description="是否审查完毕。true=已审完（之后再报该 hunk 会被忽略）；"
-        "false=只报部分结论，仍需继续审查"
+    comments: list[CommentArg] = Field(
+        default_factory=list, description="在这个 hunk 上发现的问题；没有问题就传空列表"
     )
-    comments: list[CommentArg] = Field(default_factory=list, description="评论列表，可为空")
 
 
 # 工具装饰器的形态约定与「为什么不能用 args_schema」，见 file_read.py。
-#
-# 描述里第 2 句是从 docstring 的 `Notes:` 段搬过来的：那条规则模型必须看到，
-# 而 `parse_docstring=True` 会把 `Notes:` 剥掉，所以改成显式 `description=`。
 @tool(
     parse_docstring=True,
     description=(
-        "报告 hunk 的审查结论。\n"
-        "已标记 complete 的 hunk 会被拒绝重复报告（本次报告整体忽略）；"
-        "一个 hunk 只想补充评论、还没审完时，用 complete=false 报告。"
+        "报告 hunk 的审查结论（有问题报问题，没有问题也报一次空列表）。\n"
+        "报过的 hunk 之后仍可继续补充**新**评论（与已报过的内容重复的会被忽略）。"
+        "所有 hunk 都报过一次之后，才能用 end_done 结束。"
     ),
 )
 def report_hunks(
@@ -104,6 +104,7 @@ def report_hunks(
     recorded: list[str] = []
     unknown: list[str] = []
     already_done: list[str] = []
+    supplemented: list[str] = []
     new_comment_count = 0
 
     for raw in reports:
@@ -113,36 +114,43 @@ def report_hunks(
             unknown.append(hunk_id or "<空编号>")
             continue
 
-        # 已审查完毕的 hunk 拒绝重复报告。评论是追加不是去重合并，
-        # 同一个问题报 N 次就会变成 N 条评论 —— 而 LLM 反复确认同一个 hunk
-        # 是自然行为（看到进度提示后想「再确认一下 H-01」）
-        if current.status == STATUS_DONE:
-            already_done.append(hunk_id)
-            continue
-
         comments = [_to_comment(item) for item in raw.comments]
+
+        # 已报过的 hunk **允许继续补充**（去掉重复的之后追加），从来不是「整份忽略」。
+        # 去重挡的是「反复确认同一个 hunk」那类重复评论（模型看到进度提示后想
+        # 「再确认一下 H-01」是自然行为），不该挡新结论
+        if current.status == STATUS_DONE:
+            said = {_normalize(item.content) for item in current.comments}
+            fresh = [item for item in comments if _normalize(item.content) not in said]
+            if not fresh:
+                already_done.append(hunk_id)
+                continue
+            comments = fresh
+            supplemented.append(hunk_id)
+        else:
+            recorded.append(hunk_id)
+
         new_comment_count += len(comments)
 
-        # complete=False 表示「报了部分结论但还没审完」，置为审查中
         # 整体替换成新对象，不做原地修改
         updated = HunkStatus(
             hunk_id=hunk_id,
-            status=STATUS_DONE if raw.complete else STATUS_IN_PROGRESS,
+            status=STATUS_DONE,
             comments=[*current.comments, *comments],
         )
         hunk_status[hunk_id] = updated
         changed[hunk_id] = updated
-        recorded.append(hunk_id)
 
     done = done_count(hunk_status)
     total = len(hunk_status)
-    pending = pending_ids(hunk_status)
     logger.info(
-        "report_hunks：记录 %s，新增 %d 条评论，进度 %d/%d（重复报告被忽略 %d 个）",
+        "report_hunks：记录 %s，新增 %d 条评论，进度 %d/%d（补充已报过的 %d 个，"
+        "重复报告被忽略 %d 个）",
         ", ".join(recorded) or "无",
         new_comment_count,
         done,
         total,
+        len(supplemented),
         len(already_done),
     )
     if unknown:
@@ -153,19 +161,23 @@ def report_hunks(
     parts: list[str] = []
     if recorded:
         parts.append(f"已记录 {len(recorded)} 个 hunk：{', '.join(recorded)}")
+    if supplemented:
+        parts.append(
+            f"已为 {len(supplemented)} 个报过的 hunk 补充了新评论：{', '.join(supplemented)}"
+        )
+    if recorded or supplemented:
         parts.append(f"新增评论 {new_comment_count} 条")
     else:
         parts.append("未记录任何 hunk")
     if already_done:
         parts.append(
-            f"⚠️ 以下 hunk 已审查完毕（status=done），本次报告已忽略："
-            f"{', '.join(already_done)}。"
-            "如需补充评论，请对其他未完成的 hunk 调用 report_hunks。"
+            f"⚠️ 以下 hunk 本轮的评论与已报过的完全相同，已忽略：{', '.join(already_done)}。"
+            "（同一个 hunk 可以继续补充**新**的结论，重复内容不必再报）"
         )
     if unknown:
         parts.append(f"⚠️ 未知 hunk 编号（已忽略）：{', '.join(unknown)}")
-    parts.append(f"进度：{done}/{total} 完成")
-    parts.append(f"剩余未审：{', '.join(pending) if pending else '无'}")
+    # 进度的**权威表述**不在这里，在那条 `<review_status>` 快照（它带着覆盖缺口与
+    # 预算进度）。这里再说一遍只会让同一个数字在一轮里出现两次、还少一半信息
 
     # 写回去的是**增量** `changed`，不是全量 `hunk_status` —— 并行调用要靠
     # reducer 按 key 合并增量。另外 `end_done_count` 的重置挪到了
@@ -177,6 +189,21 @@ def report_hunks(
             "messages": [ToolMessage(content="\n".join(parts), tool_call_id=runtime.tool_call_id)],
         }
     )
+
+
+def _normalize(text: str) -> str:
+    """把评论正文归一化，用来判「这条是不是已经报过了」。
+
+    只折叠空白、去首尾 —— **不做语义相似**：那是另一个量级的东西，而且判错的
+    代价（把一条真评论当重复丢掉）比留下一条重复评论大得多。
+
+    Args:
+        text: 评论正文
+
+    Returns:
+        归一化后的文本
+    """
+    return " ".join(text.split())
 
 
 def _to_comment(arg: CommentArg) -> CommentInput:

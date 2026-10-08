@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 @tool(
     parse_docstring=True,
     description=(
-        "结束审查。只有所有 hunk 都标记为 complete 时才能结束；"
-        "有未完成的 hunk 时会返回拒绝消息并提示剩余 hunk。"
+        "结束审查。只有每个 hunk 都至少报告过一次时才能结束；"
+        "还有没报告过的 hunk 时会返回拒绝消息并列出它们。"
     ),
 )
 def end_done(runtime: ToolRuntime[ReviewContext, ReviewState]) -> Command[Any]:

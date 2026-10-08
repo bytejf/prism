@@ -144,6 +144,39 @@ def exceeded(
     return None
 
 
+def consumed_ratio(
+    usage: UsageTotals,
+    elapsed_seconds: float,
+    *,
+    prices: CostConfig,
+    max_cost: float,
+    max_seconds: float,
+) -> float:
+    """已用掉单组预算的比例（钱与时间取**较大**的那个）。
+
+    收尾闸要问的不是「超没超」，是「还剩多少」—— 剩下的得够交卷。
+    与 `exceeded` 同一套口径，只是一个答「越界没有」、一个答「走了多远」。
+
+    `<= 0` 的那一路表示不限制，**不参与取大**（否则恒为 0，闸永远不响）。
+
+    Args:
+        usage: 累计用量
+        elapsed_seconds: 已用时间（秒）
+        prices: 价格表
+        max_cost: 花费上限（元）。<= 0 表示不限制
+        max_seconds: 时长上限（秒）。<= 0 表示不限制
+
+    Returns:
+        0.0~1.0+ 的比例；两路都不限制时返回 0.0
+    """
+    ratios: list[float] = []
+    if max_cost > 0:
+        ratios.append(cost_yuan(usage, prices) / max_cost)
+    if max_seconds > 0:
+        ratios.append(elapsed_seconds / max_seconds)
+    return max(ratios) if ratios else 0.0
+
+
 def describe(usage: UsageTotals, prices: CostConfig) -> str:
     """把用量渲染成一句人看的说明（进日志与终端输出）。
 

@@ -282,15 +282,28 @@ def run_review_agent(
     # 耗时与用量都要打：预算闸是按这两个量判的，排查「这组为什么停」时
     # 第一个要看的就是它们（只看轮次看不出花了多快）
     logger.info(
-        "结束审查 %s：exit_reason=%s，轮次 %d，评论 %d 条，未审 %d 个，耗时 %.1f 秒，用量 %s",
+        "结束审查 %s：exit_reason=%s，hunk %d 个，轮次 %d，评论 %d 条，未审 %d 个，"
+        "耗时 %.1f 秒，用量 %s",
         group.group_id,
         exit_reason,
+        len(hunk_status),
         final["round_count"],
         total_comments,
         len(pending),
         time.monotonic() - started,
         describe(final["usage"], settings.cost),
     )
+    # **「审得太浅」必须有日志**：实测踩过 88 个 hunk 只跑 8 轮就全部报完，而当
+    # 时没有任何一行日志会指出来 —— `未审 0` + `end_done`，看起来一切正常。
+    # 判据是「轮次/hunk 严重不成比例」（1 轮至少覆盖 5 个 hunk 才算合理），
+    # 小样本不参与（20 个 hunk 以下这个比值本来就抖）
+    if not pending and len(hunk_status) >= 20 and final["round_count"] * 5 < len(hunk_status):
+        logger.warning(
+            "本组 %d 个 hunk 只跑了 %d 轮就全部报完 —— 轮次与 hunk 数严重不成比例。"
+            "「未审 0」可能只是模型一次性把全部 hunk 标成了 complete，不代表逐个看过",
+            len(hunk_status),
+            final["round_count"],
+        )
     return MainLoopResult(
         group_id=group.group_id,
         exit_reason=exit_reason,

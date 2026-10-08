@@ -52,8 +52,9 @@ class ReviewSettings:
     """审查循环的轮次与节奏。
 
     Attributes:
-        no_progress_remind_rounds: 连续无产出到这些轮次时注入提醒
-        no_progress_exit_rounds: 连续无产出到该轮次强制退出
+        no_progress_remind_rounds: 连续无产出到这些轮次时注入提醒（只有提醒，无硬后果）
+        status_milestones: 预算跨过这些百分比时注入一次进度快照
+        explore_close_ratio: 单组钱或时间用掉这个比例时停用探索工具（收尾闸）
         max_rejections: end_done 被拒绝的上限，超过就接受并带缺口退出
         max_group_tokens: 单个审查组的提示词预算（估算 token），分组按它装箱
         max_group_cost: 单组花费上限（元）
@@ -67,7 +68,8 @@ class ReviewSettings:
     """
 
     no_progress_remind_rounds: tuple[int, ...]
-    no_progress_exit_rounds: int
+    status_milestones: tuple[int, ...]
+    explore_close_ratio: float
     max_rejections: int
     max_group_tokens: int
     max_group_cost: float
@@ -425,7 +427,8 @@ def load(path: Path = PATH) -> Settings:
     review = root.section("review")
     review_settings = ReviewSettings(
         no_progress_remind_rounds=review.numbers("no_progress_remind_rounds"),
-        no_progress_exit_rounds=review.count("no_progress_exit_rounds"),
+        status_milestones=review.numbers("status_milestones"),
+        explore_close_ratio=review.number("explore_close_ratio"),
         max_rejections=review.count("max_rejections"),
         max_group_tokens=review.count("max_group_tokens"),
         max_group_cost=review.number("max_group_cost"),

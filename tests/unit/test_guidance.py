@@ -414,17 +414,23 @@ def test_static_finding_number_appears_in_the_row_not_as_severity() -> None:
     assert "| S-07 |" in text
 
 
-def test_workflow_has_a_stopping_rule() -> None:
-    """工作方式里必须有**停止规则**。
+def test_workflow_bounds_exploration_without_forcing_early_verdicts() -> None:
+    """工作方式要写清**两遍审查**与逐 hunk 的核对线索，但**不再规定「审一个报一个」**。
 
-    实测：模型会「先把整个仓库理解一遍再下结论」，而那条链没有终点 —— 4 条真实
-    PR、7 次运行里 6 次把 8 轮预算全花在读文件上、一条结论都没报。提示词里
-    没有停止规则，就等于默许它无限细化。
+    实测：要求逐 hunk 即时报等于要求先下结论再收集证据 —— 模型做不到，只能假装
+    走一遍、最后一次性交卷（反馈文档 23 号 §十一：20 个样本里 18 个
+    「首报轮次 = 总轮次 − 1」）。所以换成：第一遍只理解、不下结论；第二遍按
+    hunk 编号逐个走同一条线索；有结论就先报（是保险，不是频率）。
     """
     text = build_requirements()
 
-    assert "先给结论，再深入" in text
-    assert "这轮结束时我要给哪个 hunk 什么结论" in text
+    assert "第一遍 · 理解（不下结论）" in text
+    assert "第二遍 · 核对（逐个 hunk）" in text
+    assert "一个 hunk 走完再走下一个" in text
+    assert "优先级" in text and "跨文件一致性" in text
+    assert "每次探查前问自己" in text
+    assert "有结论就报，别攒到最后" in text
+    assert "每完成 1~2 个 hunk" not in text, "按 hunk 规定上报频率，正是要拆掉的那条"
 
 
 def test_budget_account_matches_the_real_prompt() -> None:

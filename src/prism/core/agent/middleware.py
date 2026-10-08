@@ -39,6 +39,7 @@ from prism.config.settings import settings
 from prism.core.agent.budget import (
     STOP_TOOL_FAILURES,
     add_usage,
+    consumed_ratio,
     describe,
     exceeded,
     usage_of_message,
@@ -70,17 +71,21 @@ PLAIN_TEXT_REMINDER = "\n".join(
     )
 )
 
-# 连续无产出到提醒阈值时的提示
+# 连续无产出到提醒阈值时的提示。
+#
+# **说的是代价，不是命令**。上一版写「连续 8 轮不报告本组就会收尾」—— 那句话既是
+# 威胁又不真（收尾闸早就改成预算口径了），而且实测模型对「你必须做 X」不敏感，
+# 对「不做的后果」才有反应（同一条硬提醒连发 4 次无效）。
 NO_PROGRESS_REMINDER = "\n".join(
     (
         "<agent_reminder>",
-        "你已经连续 {rounds} 轮未报告审查结论（连续 {exit_rounds} 轮不报告，本组就会收尾）。",
-        "请立即调用 report_hunks 报告已完成审查的 hunk，",
-        "不要只探索不产出。",
-        # 「报告不是终局」这半句是实测补的：一条真实 PR 上模型连续 8 轮翻文件找旁证，
-        # 两次提醒都不理 —— 它把「报告」当成了收尾动作，觉得没百分百确定就不该报。
-        # 而 report_hunks 本来就是可累积、可续报的（`complete=false` = 部分结论）
-        "**报告不是终局**：报告完可以继续查别的 hunk，也可以之后再补报同一个 hunk。",
+        "你已经连续 {rounds} 轮没有报告任何审查结论了。",
+        "**没报出来的结论会随预算一起丢掉**：本组一旦因超时或超支结束，"
+        "你只在这段上下文里得出的判断不会出现在最终报告里。",
+        # 「报告不是终局」是实测补的：模型把「报告」当成了收尾动作，觉得没百分百
+        # 确定就不该报。而 report_hunks 本来就可以续报（同 hunk 也能再补充）
+        "所以 **有结论就先报，报告不是终局** —— 报完可以继续查别的 hunk，"
+        "也可以之后再补充同一个 hunk。",
         # 紧跟着的这句是**上一句的补丁**：只说「拿不准也报」，实测模型就把
         # 「确认无误」与「请你确认」写成了评论（4 条产出里 2 条是这种），
         # 精确率被自己拉低。报的是 hunk 的结论，不是「报点什么」
@@ -156,10 +161,11 @@ def end_done_reset(state: ReviewState) -> dict[str, Any]:
 
 
 def should_exit(state: ReviewState, *, end_done_count: int | None = None) -> bool:
-    """语义退出判定。
+    """语义退出判定：**只答「审查这件事本身结束了吗」**。
 
-    资源止损（钱 / 时间 / 工具失败）**不在这里** —— 那是各自中间件的职责。
-    本函数只答「审查这件事本身结束了吗」。
+    资源止损（钱 / 时间 / 工具失败 / 收尾闸）**不在这里** —— 那是各自中间件的职责。
+    这里也**不看轮数**：轮数是代理指标，实测同一轮的产出能差几十倍（见 budget.py
+    的文件头）。
 
     Args:
         state: 当前状态
@@ -171,9 +177,7 @@ def should_exit(state: ReviewState, *, end_done_count: int | None = None) -> boo
     """
     pending = pending_ids(state["hunk_status"])
     count = state["end_done_count"] if end_done_count is None else end_done_count
-    if count > 0 and end_done_verdict(count, pending)[0]:
-        return True
-    return state["no_report_rounds"] >= settings.review.no_progress_exit_rounds
+    return count > 0 and end_done_verdict(count, pending)[0]
 
 
 def _round_tool_results(messages: Sequence[BaseMessage]) -> list[ToolMessage]:
@@ -279,6 +283,8 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         # 三者要分开 —— 「在推进」与「在原地打转」都算 no_report，但该不该砍是两回事
         self._no_progress_kinds: Counter[str] = Counter()
         self._seen_results: set[str] = set()
+        # 已经播报过的预算里程碑（百分数）。按实例记 —— 实例是每组一份
+        self._announced: set[int] = set()
 
     def before_model(
         self, state: ReviewState, runtime: Runtime[ReviewContext]
@@ -311,18 +317,10 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         # 退出判定要看重置之后的值
         end_done_count = 0 if reset else state["end_done_count"]
         if should_exit(state, end_done_count=end_done_count):
-            # 两个原因分开说：一句「end_done 或连续无产出」在排查时等于没说
-            # （一个是我们想要的收尾，一个说明模型卡住了）
-            pending = pending_ids(state["hunk_status"])
-            if end_done_count > 0:
-                logger.info("退出：end_done 已被受理（未审 %d 个 hunk）", len(pending))
-            else:
-                logger.info(
-                    "退出：连续 %d 轮无产出（阈值 %d）；性质分布 %s",
-                    state["no_report_rounds"],
-                    settings.review.no_progress_exit_rounds,
-                    _describe_kinds(self._no_progress_kinds),
-                )
+            logger.info(
+                "退出：end_done 已被受理（未审 %d 个 hunk）",
+                len(pending_ids(state["hunk_status"])),
+            )
             return {**updates, "jump_to": "end"}
 
         # **语义退出优先于预算**：审完了就是审完了 —— 让预算把一个已完成的组标成
@@ -353,12 +351,56 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
             updates["messages"] = self._compressor.compress(state["messages"], state["hunk_status"])
         else:
             calls = _last_tool_calls(state["messages"])
-            if any(str(call.get("name", "")) == "report_hunks" for call in calls):
-                updates["messages"] = [
-                    HumanMessage(content=build_review_status(state["hunk_status"]))
-                ]
+            reported = any(str(call.get("name", "")) == "report_hunks" for call in calls)
+            # **里程碑也要注入**：只看「上一轮报过没有」的话，一个从不报告的模型
+            # 会一次都看不到缺口 —— 实测 41 轮的运行里快照注入了 0 次（自锁）
+            ratio = self._consumed(state)
+            crossed = self._crossed_milestone(ratio)
+            if reported or crossed is not None:
+                if crossed is not None:
+                    logger.info("预算跨过 %d%% 里程碑，注入进度快照", crossed)
+                status = build_review_status(state["hunk_status"], used_ratio=ratio)
+                updates["messages"] = [HumanMessage(content=status)]
 
         return updates or None
+
+    def _consumed(self, state: ReviewState) -> float:
+        """本组已用预算比例（钱 / 时间取大者），与收尾闸同一个口径。
+
+        Args:
+            state: 当前状态
+
+        Returns:
+            0.0~1.0+ 的比例
+        """
+        return consumed_ratio(
+            state["usage"],
+            time.monotonic() - self._started,
+            prices=settings.cost,
+            max_cost=settings.review.max_group_cost,
+            max_seconds=settings.review.max_group_seconds,
+        )
+
+    def _crossed_milestone(self, ratio: float) -> int | None:
+        """预算跨过新的里程碑时返回那一档（只报一次，按档去重）。
+
+        一次跨过两档也**只报最高那档** —— 同一个进度在一轮里说两遍是噪声。
+
+        Args:
+            ratio: 已用比例
+
+        Returns:
+            里程碑的百分数；没有新跨过时返回 None
+        """
+        hit = [
+            mark
+            for mark in settings.review.status_milestones
+            if ratio >= mark / 100 and mark not in self._announced
+        ]
+        if not hit:
+            return None
+        self._announced.update(hit)
+        return max(hit)
 
     def _classify_round(self, state: ReviewState) -> None:
         """给「这一轮无产出」定个性：读到新内容 / 重复内容 / 没调工具。
@@ -390,30 +432,37 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         self._seen_results |= digests
 
     def _close_explore(self, state: ReviewState) -> bool | None:
-        """连续无产出逼近上限时，决定「探索工具是否停用」。
+        """单组预算用到 `explore_close_ratio` 时，决定「探索工具是否停用」。
 
-        停用点取 `no_progress_exit_rounds - 3`：**留三轮** —— 实测推演下来三轮才够
-        （第一轮撞上拒绝、第二轮反应过来、第三轮把结论报出来）。只留两轮时，
-        计数器会在它反应过来之前到期，等于白收窄。
-        **一旦报告过（计数归零）就重新开放**：本组还有别的 hunk 要查。
+        **判据是预算，不是轮数。** 轮数对组大小不敏感 —— 实测 4 个 hunk 的组和
+        88 个 hunk 的组都只拿到 5 轮探索，88 个 hunk 的组读了 8 个文件就被要求
+        交卷。预算比例天然随组大小伸缩：大组每轮输入更贵、更早触顶。
+
+        留下的那一截（15%）是**交卷用的**：一次完整的 report_hunks 约 0.1 元，
+        对 2 元的单组预算来说是 3 倍余量。
+
+        **单调不回退**：预算花掉不会退回来，所以关掉就不再重开。
 
         Args:
             state: 当前状态
 
         Returns:
-            需要变更时返回新的标记；不变时 None
+            需要变更时返回 `True`；不变时 None
         """
-        rounds = state["no_report_rounds"]
-        should_close = rounds >= max(settings.review.no_progress_exit_rounds - 3, 1)
-        if should_close == state["explore_closed"]:
+        if state["explore_closed"]:
             return None
-        if should_close:
-            logger.warning(
-                "连续 %d 轮无产出，停用探索工具 —— 只放行 report_hunks / end_done，"
-                "让它把已有结论报出来（而不是把这一组连同结论一起丢掉）",
-                rounds,
-            )
-        return should_close
+        ratio = self._consumed(state)
+        if ratio < settings.review.explore_close_ratio:
+            return None
+        logger.warning(
+            "本组预算已用 %.0f%%（阈值 %.0f%%）—— 停用探索工具，只放行 report_hunks / "
+            "end_done，让它把已有结论报出来（而不是把这一组连同结论一起丢掉）；"
+            "此前无产出轮次的性质分布 %s",
+            ratio * 100,
+            settings.review.explore_close_ratio * 100,
+            _describe_kinds(self._no_progress_kinds),
+        )
+        return True
 
     def _remind_no_progress(self, state: ReviewState) -> HumanMessage | None:
         """「一直在调工具、从不报告」到阈值时注入提醒。
@@ -434,11 +483,7 @@ class ReviewProgress(AgentMiddleware[ReviewState, ReviewContext, Any]):
         if not _last_tool_calls(state["messages"]):
             return None
         logger.warning("连续 %d 轮无产出（模型一直在调工具），注入提醒", rounds)
-        return HumanMessage(
-            content=NO_PROGRESS_REMINDER.format(
-                rounds=rounds, exit_rounds=settings.review.no_progress_exit_rounds
-            )
-        )
+        return HumanMessage(content=NO_PROGRESS_REMINDER.format(rounds=rounds))
 
     def _warn_if_usage_missing(self, state: ReviewState) -> None:
         """拿不到用量时警告一次（每组一次）。
@@ -534,23 +579,22 @@ def review_pacing(state: ReviewState, _runtime: Any) -> dict[str, Any] | None:
 
     # 走到这里说明模型**一个工具都没调**（纯文本）—— 不干预的话框架会直接收尾
     if no_report in settings.review.no_progress_remind_rounds:
-        logger.warning("连续 %d 轮无产出，注入提醒", no_report)
-        content = NO_PROGRESS_REMINDER.format(
-            rounds=no_report, exit_rounds=settings.review.no_progress_exit_rounds
-        )
+        logger.warning("连续 %d 轮无产出（纯文本），注入提醒", no_report)
+        content = NO_PROGRESS_REMINDER.format(rounds=no_report)
     else:
         logger.debug("模型未调用工具，注入推进提醒（连续无产出 %d 轮）", no_report)
         content = PLAIN_TEXT_REMINDER
 
     updates["messages"] = [HumanMessage(content=content)]
-    # 与旧实现一致：提醒照样追加，到阈值才结束
-    updates["jump_to"] = "end" if no_report >= settings.review.no_progress_exit_rounds else "model"
+    # **一律继续循环**：纯文本不是终点，而是「还没报结论」的一种形态。
+    # 它一直不报时由收尾闸（预算口径）与时间闸兜住，不在这里按轮数收尾
+    updates["jump_to"] = "model"
     return updates
 
 
 # 探索工具被停用后回给模型的话。**要给出路**：它手上还有结论，只是不能再查了
 WRAP_UP_MESSAGE = (
-    "错误：本组的探索轮次已用完（连续多轮未报告结论），"
+    "错误：本组预算已接近上限，探索工具已停用（要留出交卷的余量）。"
     "从现在起只能调用 report_hunks（把已有的结论报出来，没问题就报空评论列表）"
     "或 end_done。请立即报告。"
 )
@@ -731,10 +775,10 @@ class ToolFailureBudget(AgentMiddleware[ReviewState, ReviewContext, Any]):
     2. **失败预算**：连续失败到 `tool_fail_remind` 就在工具结果里追加一句硬提醒；
        累计到 `tool_fail_exit` 就在下一次 `before_model` 带缺口退出本组。
 
-    为什么需要第 2 件：`no_report_rounds` 只管「这一轮有没有产出」，而一轮里
-    **既有 report_hunks 又有失败的工具调用**时它会被清零 —— 于是模型可以一边慢
-    慢产出、一边把预算烧在一直失败的调用上。那是「把预算浪费在无效调用上」唯一
-    没被别处覆盖的形态（重复调用由 `tool_call_dedup` 管）。
+    为什么需要第 2 件：一轮里 **既有 report_hunks 又有失败的工具调用**时，它在
+    收尾闸那边是一个完全正常的轮次 —— 于是模型可以一边慢慢产出、一边把预算烧在
+    一直失败的调用上。那是「把预算浪费在无效调用上」唯一没被别处覆盖的形态
+    （重复调用由 `tool_call_dedup` 管）。
 
     写成**类式**：计数是跨轮次状态，而模块级的 `@wrap_tool_call` 产出的是全局
     共享实例（框架缺口，见 CLAUDE.md），上一组的失败计数会漏到下一组。
