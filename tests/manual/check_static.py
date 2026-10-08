@@ -233,7 +233,7 @@ def test_prompt_carries_static_hint(injected: tuple[Group, list[StaticFinding]])
     block = build_diff_block(group, selected)
     for item in selected:
         assert f'static_hint="{item.finding_id}' in block or item.finding_id in block
-    assert "### 静态分析提示" in build_static_block(selected)
+    assert "### 待核验的提示" in build_static_block(selected)
     assert "（以下按静态分析的建议顺序排列，仅供参考）" in block
 
 

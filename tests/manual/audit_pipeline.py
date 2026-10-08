@@ -138,9 +138,9 @@ def main() -> int:
                     prompt_failures.append(
                         f"{group.group_id} 的 static_hint 引用了没注入的编号 {one}"
                     )
-        if related and "### 静态分析提示" not in text:
+        if related and "### 待核验的提示" not in text:
             prompt_failures.append(f"{group.group_id} 有静态发现却没有静态段")
-        if not related and "### 静态分析提示" in text:
+        if not related and "### 待核验的提示" in text:
             prompt_failures.append(f"{group.group_id} 没有静态发现却出现了静态段")
     failures.extend(prompt_failures)
     print(

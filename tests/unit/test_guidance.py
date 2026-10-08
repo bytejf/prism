@@ -339,7 +339,7 @@ def test_without_findings_the_prompt_is_unchanged() -> None:
     text = build_diff_block(group)
 
     assert build_static_block([]) == ""
-    assert "静态分析提示" not in text
+    assert "待核验的提示" not in text
     assert "static_hint" not in text
     assert "按静态分析的建议顺序" not in text
     assert "\n\n\n" not in text
@@ -366,7 +366,7 @@ def test_hunk_with_findings_is_marked() -> None:
 
     assert 'static_hint="S-01 S-02"' in block
     assert "high" not in block, "hunk 属性里不出现严重性"
-    assert "（以下按静态分析的建议顺序排列，仅供参考）" in block
+    assert "（以下按待核验的提示排列，仅供参考）" in block
 
 
 def test_same_file_hunks_stay_under_one_file_tag_after_reorder() -> None:
@@ -399,10 +399,11 @@ def test_static_block_is_a_weak_worded_table() -> None:
         ]
     )
 
-    assert "### 静态分析提示（待验证的假设）" in text
-    assert "线索，不是结论" in text
-    assert "工具自己的口径" in text, "要挡住「把工具标记抄进 severity」"
+    assert "### 待核验的提示" in text
+    # 要说明**来源的局限**（模式匹配、没读上下文），光说「可能是错的」不够
+    assert "按模式匹配" in text and "没有读过上下文" in text
     assert "误报是常态" in text
+    assert "工具自己的口径" in text, "要挡住「把工具标记抄进 severity」"
     assert "| S-01 | internal/agent/agent.go | 245 | 高优先 | H-01 |" in text
     assert "低优先" in text
     assert "| — |" in text, "关联不上 hunk 的发现显示占位符"
@@ -454,6 +455,9 @@ def test_requirements_never_mention_the_static_tool() -> None:
     text = build_requirements()
 
     assert "静态" not in text, "要求块里不该出现「静态」二字"
+    # 「先核验再采信」这条**要在主任务里无条件出现**：只在静态段里说，等于
+    # 「有没有提示」决定模型有没有核验意识；而这本来是该一直有的态度
+    assert "给到你的任何提示都要先核验再采信" in text
     assert build_requirements() == text, "要求块不随组变化 —— 预算账依赖这一点"
 
 
