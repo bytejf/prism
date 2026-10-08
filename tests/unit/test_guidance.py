@@ -7,6 +7,7 @@
 
 from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
 from prism.core.guidance.templates import MAIN_TASK_DIMENSIONS, SYSTEM, WORKFLOW
+from prism.core.guidance.tokens import estimate_tokens
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
 from prism.models.grouping import Group
@@ -424,3 +425,27 @@ def test_workflow_has_a_stopping_rule() -> None:
 
     assert "先给结论，再深入" in text
     assert "这轮结束时我要给哪个 hunk 什么结论" in text
+
+
+def test_budget_account_matches_the_real_prompt() -> None:
+    """**账 == 真实渲染**：`fixed + group_tokens` 必须等于真发出去那条请求的估算。
+
+    装箱的预算用的是账上的数，发出去的是真渲染的那条 —— 两者一旦漂开，
+    「每组 ≤ N token」就是句空话：账算得下、真实超了，没人会发现。
+
+    这条也顺带钉住口径：账 = `SYSTEM + 要求块 + diff + 静态发现`，真实请求
+    = `SYSTEM + user 消息`（user 里已经含要求块）。**别把要求块算两遍**、
+    也别忘加 SYSTEM —— 这两个错误差的是常数（实测差 550 / 669 token），
+    看起来特别像代码有 bug（我第一次拿它做对账时被骗了两回）。
+    """
+    from prism.core.agent.agent import initial_state
+    from prism.core.grouping.packages import fixed_prompt_tokens, group_tokens
+
+    group = _fixture()
+    findings = [make_finding("S-01", hunk_id="H-01", path="internal/agent/agent.go", line=245)]
+    for injected in ([], findings):
+        account = fixed_prompt_tokens() + group_tokens(group.hunks, injected)
+        real = estimate_tokens(SYSTEM) + estimate_tokens(
+            str(initial_state(group, injected)["messages"][0].content)
+        )
+        assert abs(real - account) <= 2, f"账 {account} vs 真实 {real}（超出取整误差）"
