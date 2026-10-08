@@ -300,7 +300,8 @@ def run_review_agent(
     if not pending and len(hunk_status) >= 20 and final["round_count"] * 5 < len(hunk_status):
         logger.warning(
             "本组 %d 个 hunk 只跑了 %d 轮就全部报完 —— 轮次与 hunk 数严重不成比例。"
-            "「未审 0」可能只是模型一次性把全部 hunk 标成了 complete，不代表逐个看过",
+            "「未审 0」只说明模型声称每个 hunk 都有结论（一次 report_hunks 可以带全部"
+            "hunk），不代表逐个看过",
             len(hunk_status),
             final["round_count"],
         )
