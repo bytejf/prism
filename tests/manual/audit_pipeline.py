@@ -57,7 +57,8 @@ def main() -> int:
     mapped = map_hunks_to_symbols(ROOT, BASE, HEAD, reviewable)
     groups = group_by_package(mapped, [])
     print(
-        f"仓库 {ROOT.name}：{len(reviewable)} 个可审查文件 / {len(mapped)} 个 hunk → {len(groups)} 组\n"
+        f"仓库 {ROOT.name}：{len(reviewable)} 个可审查文件 / "
+        f"{len(mapped)} 个 hunk → {len(groups)} 组\n"
     )
 
     failures: list[str] = []
@@ -169,7 +170,7 @@ def main() -> int:
             expected = path_of_hunk.get(located.hunk_id)
             if expected and located.path != expected:
                 locate_failures.append(
-                    f"定位后的评论 path={located.path} 与 hunk {located.hunk_id} 的 {expected} 不一致"
+                    f"定位后 path={located.path} 与 hunk {located.hunk_id} 的 {expected} 不一致"
                 )
     failures.extend(locate_failures)
     print(f"   核了 {checked} 条定位结果：{'✓' if not locate_failures else '✗'}\n")
