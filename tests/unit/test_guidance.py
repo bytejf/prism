@@ -386,7 +386,12 @@ def test_same_file_hunks_stay_under_one_file_tag_after_reorder() -> None:
 
 
 def test_static_block_is_a_weak_worded_table() -> None:
-    """静态发现列表用「提示 / 工具标记 / 高优先」这三层弱化措辞（设计 §2.7 层 2）。"""
+    """静态发现列表用「提示 / 关于 / 工具标记 / 高优先」这几层弱化措辞（设计 §2.7 层 2）。
+
+    这一整段（含「怎么用这些提示」「`static_hint` 是什么」）**只在真有发现时出现**
+    —— 主任务段与工作方式段一个字都不提静态工具，没有发现时提它就是凭空建立
+    一套「工具 vs 你」的框架（见 24 号文档 §五）。
+    """
     text = build_static_block(
         [
             make_finding("S-01", priority=PRIORITY_HIGH),
@@ -395,7 +400,9 @@ def test_static_block_is_a_weak_worded_table() -> None:
     )
 
     assert "### 静态分析提示（待验证的假设）" in text
-    assert "需你自己" in text or "需要你结合实际代码判断" in text
+    assert "线索，不是结论" in text
+    assert "工具自己的口径" in text, "要挡住「把工具标记抄进 severity」"
+    assert "误报是常态" in text
     assert "| S-01 | internal/agent/agent.go | 245 | 高优先 | H-01 |" in text
     assert "低优先" in text
     assert "| — |" in text, "关联不上 hunk 的发现显示占位符"
@@ -425,12 +432,42 @@ def test_workflow_bounds_exploration_without_forcing_early_verdicts() -> None:
     text = build_requirements()
 
     assert "第一遍 · 理解（不下结论）" in text
-    assert "第二遍 · 核对（逐个 hunk）" in text
+    assert "第二遍 · 逐个 hunk 核对" in text
+    # 四条线索要按顺序都在：读全符号 → 查上游调用方 → 看下游影响 → 下结论
+    assert "读全它归属的符号" in text
+    assert "往上游查调用方" in text
+    assert "往下游看影响" in text
     assert "一个 hunk 走完再走下一个" in text
-    assert "优先级" in text and "跨文件一致性" in text
+    assert "跨文件一致性是本任务里最值钱的一类发现" in text
     assert "每次探查前问自己" in text
     assert "有结论就报，别攒到最后" in text
     assert "每完成 1~2 个 hunk" not in text, "按 hunk 规定上报频率，正是要拆掉的那条"
+
+
+def test_requirements_never_mention_the_static_tool() -> None:
+    """主任务段与工作方式段**一个字都不提静态工具**。
+
+    理由（24 号文档 §五）：没有静态发现时提它，等于凭空建立一套「工具已经做过什么、
+    你别重复」的框架，而模型手上没有任何东西可用。静态该怎么用，写在静态段里
+    —— 那一段只在真有发现时出现。
+    """
+    text = build_requirements()
+
+    assert "静态" not in text, "要求块里不该出现「静态」二字"
+    assert build_requirements() == text, "要求块不随组变化 —— 预算账依赖这一点"
+
+
+def test_static_hint_meaning_is_explained_where_it_appears() -> None:
+    """`static_hint` 的含义写在静态段里 —— 那个属性也只在有发现时才出现。
+
+    两条必须同时出现，否则模型看到 hunk 上有个没解释的属性。
+    """
+    finding = make_finding("S-01", hunk_id="H-01")
+    block = build_diff_block(_fixture(), [finding])
+    assert 'static_hint="S-01"' in block
+
+    section = build_static_block([finding])
+    assert "`static_hint`" in section, "属性出现在 hunk 上，解释就得在同一份请求里"
 
 
 def test_budget_account_matches_the_real_prompt() -> None:
