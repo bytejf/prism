@@ -31,7 +31,14 @@ TRUNCATED_HINT = "（已截断：单次最多读取 {max_lines} 行）"
 # `runtime: ToolRuntime[...]` 会从 `get_input_schema()` 里消失、注入断掉，
 # 调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。
 # 详见 CLAUDE.md 的「框架缺口」。
-@tool(parse_docstring=True, description="读取文件指定行范围的内容。")
+@tool(
+    parse_docstring=True,
+    description=(
+        "读取文件指定行范围的内容。\n"
+        "**只读得到审查范围内的文件**：`.go` 源码与 `go.mod`。测试文件（`*_test.go`）、"
+        "生成代码（`*.pb.go`）以及文档 / 配置 / 静态资源读不到。"
+    ),
+)
 def file_read(
     path: str,
     start_line: int,
