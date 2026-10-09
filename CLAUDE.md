@@ -645,10 +645,15 @@ prism-bench/evaluation/
                          #   → missed_references_classified.md：把那 95 条逐条读过后
                          #   的三分类（A1 六维度内没做出来 52 / A2 报了没兑上 19 /
                          #   A3 六维度外·可维护性 24）。**下一步该做什么，看这份**
-  judge.py               # 裁判的匹配规则（`evaluate_comments`）：path → side → line(k=1)
-                         #   → LLM 语义。**一条生成评论的行号额度只兑一次**
-                         #   （`matched_gen_ids_by_line`）—— 同一处位置有多条参考时，
-                         #   只有先到的那条算命中，其余落进 (a) 桶。别把它当审查质量问题
+  judge.py               # 裁判的匹配规则（`evaluate_comments`）：对**每条参考**扫我们
+                         #   全部评论，path → side → line(k=1) → LLM 语义（只有语义命中
+                         #   才 break，位置命中不会中断扫描）。**两个额度都挂在「我们的
+                         #   每条评论」上，各只兑一次**：行号额度 `matched_gen_ids_by_line`、
+                         #   语义额度 `matched_gen_ids_by_semantic`。**进 P/R/F1 的是语义
+                         #   额度**（`evaluate.py` 的 `semantic_f1`；行号额度只喂 `line_f1`）
+                         #   → 我们一条评论最多兑一条参考 —— 所以产出条数就是召回的天花板。
+                         #   同一处有多条参考时，只有先到的那条能兑上，其余落进 (a) 桶，
+                         #   别把它当审查质量问题
 ```
 
 跑一批：
