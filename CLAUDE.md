@@ -661,6 +661,10 @@ prism-bench/evaluation/
                          #   → missed_references_classified.md：把那 95 条逐条读过后
                          #   的三分类（A1 六维度内没做出来 52 / A2 报了没兑上 19 /
                          #   A3 六维度外·可维护性 24）。**下一步该做什么，看这份**
+                         #   → missed_references_gofr_classified.md：gofr 新提示词那一局
+                         #   的 18 条再分类（A 我们其实说了 3 / B 同行不同角度 3 /
+                         #   C 真的没报 8 / D 结构不可达 go.mod 4）。
+                         #   **A 类是「召回被低估」的证据，D 类是唯一一条改一行换 22% 的路**
   judge.py               # 裁判的匹配规则（`evaluate_comments`）：对**每条参考**扫我们
                          #   全部评论，path → side → line(k=1) → LLM 语义（只有语义命中
                          #   才 break，位置命中不会中断扫描）。**两个额度都挂在「我们的

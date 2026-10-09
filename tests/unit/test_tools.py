@@ -739,6 +739,8 @@ def test_report_hunks_records_comments_and_marks_done() -> None:
     # 工具不再原地改状态：调用前的快照没被动过（工具只是**返回**了新对象）
     assert before["H-01"].status == STATUS_PENDING
     assert before["H-01"].comments == []
+
+
 def test_report_hunks_ignores_unknown_hunk_id() -> None:
     """测试未知 hunk 编号被忽略且提示。"""
     tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
@@ -746,6 +748,8 @@ def test_report_hunks_ignores_unknown_hunk_id() -> None:
     update = tool.update({"reports": [{"hunk_id": "H-99", "comments": []}]})
     assert "未知 hunk 编号" in tool_message_text(update)
     assert update["hunk_status"] == {}, "未知编号不该写回任何增量"
+
+
 def test_report_hunks_normalizes_optional_fields() -> None:
     """测试可选字段留空时转成 None，必填字段去掉首尾空白。"""
     tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
@@ -844,15 +848,11 @@ def test_report_hunks_ignores_an_identical_repeat() -> None:
     state = make_state("H-01", "H-02")
     tool = ToolUnderTest(report_hunks, ReviewContext(), state)
     one_comment = [{"severity": "high", "category": "x", "content": "问题", "existing_code": "y"}]
-    first = tool.update(
-        {"reports": [{"hunk_id": "H-01", "comments": one_comment}]}
-    )
+    first = tool.update({"reports": [{"hunk_id": "H-01", "comments": one_comment}]})
     assert len(first["hunk_status"]["H-01"].comments) == 1
 
     # 第二次报同一个 hunk，内容一字不差 —— 应被忽略
-    repeat = tool.update(
-        {"reports": [{"hunk_id": "H-01", "comments": one_comment}]}
-    )
+    repeat = tool.update({"reports": [{"hunk_id": "H-01", "comments": one_comment}]})
 
     # 没写回增量 —— 这一条同时证明了评论没有成倍放大
     assert repeat["hunk_status"] == {}, "重复报告写回了增量，评论会被放大"

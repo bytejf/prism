@@ -67,9 +67,7 @@ from prism.observability.logging import setup_logging
 from prism.observability.tracing import setup_tracing
 
 # 走查目标与版本。都用环境变量兜一层，方便换仓库时不用改文件
-REPO = Path(
-    os.getenv("PRISM_WALKTHROUGH_REPO", "~/Projects/python/prism-min-test")
-).expanduser()
+REPO = Path(os.getenv("PRISM_WALKTHROUGH_REPO", "~/Projects/python/prism-min-test")).expanduser()
 BASE = os.getenv("PRISM_WALKTHROUGH_BASE", "main")
 HEAD = os.getenv("PRISM_WALKTHROUGH_HEAD", "HEAD")
 
@@ -113,6 +111,4 @@ def _print_stats(stats: ReviewStats) -> None:
         f"  缺口      未跑的组 {stats.skipped_groups}，"
         f"未审的 hunk {stats.pending_hunks}，异常退出的组 {stats.failed_groups}"
     )
-    print(
-        "\n  提示：上面正文里的评论才是产出；缺口三个数全 0 才说明这一轮真的审完了"
-    )
+    print("\n  提示：上面正文里的评论才是产出；缺口三个数全 0 才说明这一轮真的审完了")

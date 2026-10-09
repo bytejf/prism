@@ -2,7 +2,7 @@
 
 三级过滤，按顺序命中即跳过：
 1. 硬性排除 —— 二进制文件、符号链接
-2. 扩展名白名单 —— 只保留 .go
+2. 白名单 —— 扩展名只保留 .go，外加 `go.mod`（按**文件名**放行）
 3. 内置降噪 —— *_test.go、*.pb.go
 """
 
@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 
 # V1 只审 Go 文件，不做用户配置
 ALLOWED_EXTENSIONS: frozenset[str] = frozenset({".go"})
+
+# 按**文件名**放行的例外，不看扩展名。
+#
+# 这里只有 `go.mod`，依据是评测：gofr 那一局 30 条参考里有 4 条（13%）落在
+# `go.mod` / 子模块 `go.mod` 的 `go` 与 `toolchain` 指令一致性上，而它们
+# **结构上不可达**（见 prism-bench 的 missed_references_gofr_classified.md §D）。
+# 注意后缀是 `.mod`，所以这条必须在扩展名检查**之前**判，否则会被当成非 .go 挡掉。
+ALLOWED_FILENAMES: frozenset[str] = frozenset({"go.mod"})
 
 # 内置降噪：文件名后缀 → 展示用的通配写法（保持插入顺序即匹配优先级）
 BUILTIN_NOISE: dict[str, str] = {
@@ -72,9 +80,10 @@ def _skip_reason(diff: Diff) -> str | None:
         return REASON_SYMLINK
 
     name = PurePosixPath(diff.path).name
-    suffix = PurePosixPath(name).suffix
-    if suffix not in ALLOWED_EXTENSIONS:
-        return f"{REASON_EXTENSION}: {suffix or '无扩展名'}"
+    if name not in ALLOWED_FILENAMES:
+        suffix = PurePosixPath(name).suffix
+        if suffix not in ALLOWED_EXTENSIONS:
+            return f"{REASON_EXTENSION}: {suffix or '无扩展名'}"
 
     for noise_suffix, label in BUILTIN_NOISE.items():
         if name.endswith(noise_suffix):

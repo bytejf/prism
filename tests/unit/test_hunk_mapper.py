@@ -419,6 +419,54 @@ def test_map_hunks_empty_diffs(go_repo: Path) -> None:
     assert map_hunks_to_symbols(go_repo, "main", "feature", []) == []
 
 
+GOMOD_BASELINE = "module example.com/x\n\ngo 1.22.4\n"
+GOMOD_MODIFIED = "module example.com/x\n\ngo 1.22.7\n\ntoolchain go1.23.4\n"
+
+
+def test_map_hunks_gives_non_go_file_a_whole_file_symbol(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """测试 `go.mod` 的改动拿到一个整文件符号，而不是被丢掉。
+
+    非 .go 文件解析不出 Go 符号，以前在这里被当成「查不到符号表」丢弃
+    —— 这就是 go.mod 上的参考此前结构上不可达的原因。
+    """
+    git(go_repo, "checkout", "-q", "-b", "gomod", "main")
+    (go_repo / "go.mod").write_text(GOMOD_BASELINE, encoding="utf-8")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "add go.mod")
+    (go_repo / "go.mod").write_text(GOMOD_MODIFIED, encoding="utf-8")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "bump go")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "gomod")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "gomod", diffs)
+
+    mod = next(item for item in mapped if item.file_path == "go.mod")
+    assert mod.symbol.kind == "file"
+    assert mod.symbol.name == "go.mod"
+    # 整文件范围 —— lines 属性据此给出，模型靠它用 file_read 读全文
+    assert (mod.symbol.start_line, mod.symbol.end_line) == (1, 5)
+    assert mod.head_lines == (1, 5)
+
+
+def test_map_hunks_drops_go_file_without_symbols(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试 `.go` 文件解析不出符号时**仍然丢弃**（整文件符号只给非 .go）。
+
+    这条是那个 WARNING 的守门用例：`.go` 查不到符号表是「路径对不上」的
+    信号（改名后拿新路径查旧版），静默给个整文件符号会把这个诊断抹掉。
+    """
+    git(go_repo, "checkout", "-q", "-b", "empty", "main")
+    (go_repo / "empty.go").write_text("// 只有注释，没有声明\n", encoding="utf-8")
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "empty go file")
+
+    diffs = filter_files(load_diffs(go_repo, "main", "empty")).reviewable
+    mapped = map_hunks_to_symbols(go_repo, "main", "empty", diffs)
+
+    assert all(item.file_path != "empty.go" for item in mapped)
+
+
 def test_map_hunks_missing_file_is_dropped(go_repo: Path, git: Callable[..., None]) -> None:
     """测试 diff 里的文件在目标版本中不存在时，其 hunk 无归属被丢弃、不抛异常。"""
     diffs = load_diffs(go_repo, "main", "feature")

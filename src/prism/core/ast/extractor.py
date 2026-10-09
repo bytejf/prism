@@ -39,6 +39,10 @@ KIND_STRUCT = "struct"
 KIND_INTERFACE = "interface"
 KIND_TYPE = "type"
 
+# **不是提取出来的**，由 mapper 给「没有符号可归的文件」（如 go.mod）合成：
+# 整个文件当作一个符号。放在这里是为了让 kind 常量只有一个出处。
+KIND_FILE = "file"
+
 # 顶层声明块节点 → 符号类型
 BLOCK_KINDS: dict[str, str] = {
     PACKAGE_NODE: KIND_PACKAGE,

@@ -439,8 +439,7 @@ def test_build_review_status_omits_the_budget_when_unknown() -> None:
 def test_build_review_status_truncates_a_long_pending_list() -> None:
     """未报清单过长时截断，但**数字要保留** —— 差多少个看数字，具体哪些看编号。"""
     hunk_status = {
-        f"H-{index:02d}": HunkStatus(f"H-{index:02d}", STATUS_PENDING)
-        for index in range(1, 31)
+        f"H-{index:02d}": HunkStatus(f"H-{index:02d}", STATUS_PENDING) for index in range(1, 31)
     }
     status = build_review_status(hunk_status)
     assert "**还没报告（30）**" in status

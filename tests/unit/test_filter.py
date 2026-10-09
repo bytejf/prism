@@ -93,11 +93,31 @@ def test_filter_hard_exclusion_takes_priority() -> None:
 
 def test_filter_extension_reason_includes_suffix() -> None:
     """测试扩展名不匹配时原因里带上实际后缀。"""
-    result = filter_files([make_diff("go.mod"), make_diff("Makefile")])
+    result = filter_files([make_diff("libs.mod"), make_diff("Makefile")])
     assert [s.reason for s in result.skipped] == [
         f"{REASON_EXTENSION}: .mod",
         f"{REASON_EXTENSION}: 无扩展名",
     ]
+
+
+def test_filter_allows_go_mod_by_filename() -> None:
+    """`go.mod` 按文件名放行（依据：评测里 13% 的参考落在它上面）。
+
+    同时守住边界：**只有 go.mod 这一个名字**放行，别的 `.mod` 仍然被挡
+    —— 按文件名判而不是按扩展名判，就是不想把 `.mod` 一类都放进来。
+    """
+    result = filter_files(
+        [
+            make_diff("go.mod"),
+            make_diff("pkg/gofr/datasource/file/s3/go.mod"),  # 子模块也要放行
+            make_diff("libs.mod"),
+        ]
+    )
+    assert [d.path for d in result.reviewable] == [
+        "go.mod",
+        "pkg/gofr/datasource/file/s3/go.mod",
+    ]
+    assert [s.path for s in result.skipped] == ["libs.mod"]
 
 
 def test_filter_deleted_go_file_uses_old_path() -> None:

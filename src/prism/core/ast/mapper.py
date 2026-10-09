@@ -10,13 +10,14 @@ diff 用 `-U0` 生成（见 `loader.CONTEXT_LINES`），hunk 里只有改动行�
 """
 
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 import pygit2
 
 from prism.core.ast.extractor import (
     KIND_CONST,
+    KIND_FILE,
     KIND_FUNCTION,
     KIND_IMPORT,
     KIND_INTERFACE,
@@ -48,6 +49,7 @@ KIND_LABELS: dict[str, str] = {
     KIND_STRUCT: "结构体",
     KIND_INTERFACE: "接口",
     KIND_TYPE: "类型",
+    KIND_FILE: "整文件",
 }
 
 
@@ -449,6 +451,14 @@ def _file_symbols(
 ) -> list[Symbol]:
     """取某个文件在指定侧的符号表，带缓存。
 
+    **非 .go 的可审文件（目前只有 `go.mod`）合成一个整文件符号**：它没有
+    Go 符号可归，不给符号就会在下面被当成「查不到符号表」丢掉（那正是
+    go.mod 上的参考此前结构上不可达的原因）。整文件当符号之后，
+    `lines` 就是全文件范围，模型照样读得到。
+
+    **只对非 .go 生效**：`.go` 文件解析不出符号是「路径对不上」的信号
+    （文件改名后仍拿新路径查旧版符号表），那个 WARNING 必须留着。
+
     Args:
         cache: 缓存字典
         repo: pygit2 仓库
@@ -466,5 +476,15 @@ def _file_symbols(
             logger.debug("文件 %s 在该版本中不存在，符号表为空", path)
             cache[key] = []
         else:
-            cache[key] = extract_symbols(source)
+            symbols = extract_symbols(source)
+            if not symbols and PurePosixPath(path).suffix != ".go":
+                symbols = [
+                    Symbol(
+                        name=PurePosixPath(path).name,
+                        kind=KIND_FILE,
+                        start_line=1,
+                        end_line=max(len(source.splitlines()), 1),
+                    )
+                ]
+            cache[key] = symbols
     return cache[key]

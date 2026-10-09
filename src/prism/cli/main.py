@@ -87,7 +87,7 @@ from dataclasses import dataclass
 from functools import partial
 from importlib.metadata import version
 from itertools import groupby
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -361,7 +361,10 @@ def group(
         # 变量叫 file_path 不叫 path：后者是 `--path` 参数的名字，遮蔽它两边都读不懂
         for file_path, hunks in groupby(item.hunks, key=lambda h: h.file_path):
             hunk_ids = ", ".join(h.hunk_id for h in hunks)
-            lines.append(f"  - {PurePosixPath(file_path).name} ({hunk_ids})")
+            # 打**完整相对路径**，不是 basename：一个组里可能有多个同名文件
+            # （子模块各有一个 go.mod 就是四份），只打 basename 时这几行长得一样，
+            # 而这个输出的唯一用途就是让人核对范围 —— 分不清文件等于没打
+            lines.append(f"  - {file_path} ({hunk_ids})")
         blocks.append("\n".join(lines))
 
     typer.echo("\n\n".join(blocks))
