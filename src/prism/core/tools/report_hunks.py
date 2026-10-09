@@ -43,7 +43,7 @@ class CommentArg(BaseModel):
         )
     )
     category: str = Field(description="问题类别，如 并发安全 / 边界条件 / 跨文件一致性 / 可维护性")
-    content: str = Field(description="评论正文：说清问题、影响与依据")
+    content: str = Field(description="评论正文：说清问题、影响与依据。**一条评论只讲一件事**")
     existing_code: str = Field(
         description="用于定位的代码片段：本 hunk diff 里新增行的原文，逐行照抄（写法见系统提示词）"
     )
