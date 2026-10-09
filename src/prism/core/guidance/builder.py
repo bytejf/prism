@@ -87,7 +87,7 @@ def build_requirements() -> str:
 
 
 def _render_main_task() -> str:
-    """渲染主任务段（6 条维度）。
+    """渲染主任务段（维度清单，条数见 `MAIN_TASK_DIMENSIONS`）。
 
     Returns:
         主任务段落

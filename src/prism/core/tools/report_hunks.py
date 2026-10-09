@@ -42,7 +42,7 @@ class CommentArg(BaseModel):
             "medium=有风险或明显的维护性问题；low=风格与可读性"
         )
     )
-    category: str = Field(description="问题类别，如 并发安全 / 边界条件 / 跨文件一致性")
+    category: str = Field(description="问题类别，如 并发安全 / 边界条件 / 跨文件一致性 / 可维护性")
     content: str = Field(description="评论正文：说清问题、影响与依据")
     existing_code: str = Field(
         description="用于定位的代码片段：本 hunk diff 里新增行的原文，逐行照抄（写法见系统提示词）"

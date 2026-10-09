@@ -232,13 +232,16 @@ def test_empty_group() -> None:
 
 
 def test_requirements_lists_all_dimensions() -> None:
-    """测试六个审查维度都在文本里。"""
+    """测试所有审查维度都在文本里，且渲染顺序固定。"""
     text = build_requirements()
     for dimension in MAIN_TASK_DIMENSIONS:
         assert dimension in text
     assert "1. **业务逻辑正确性**" in text
     assert "4. **副作用与隐式契约**" in text
-    assert "6. **安全**" in text
+    # 顺序是有意义的：可维护性刻意排在「安全」之前（它是最低价值的一档，
+    # 不占末尾那个注意力最强的位置）—— 见 templates.py 的模块注释
+    assert "6. **可维护性**" in text
+    assert "7. **安全**" in text
     assert "### 你的主任务" in text
 
 
