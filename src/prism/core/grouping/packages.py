@@ -34,8 +34,7 @@ from collections.abc import Sequence
 from pathlib import PurePosixPath
 
 from prism.config.settings import settings
-from prism.core.guidance import templates as tpl
-from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
+from prism.core.guidance.builder import build_diff_block, build_static_block, build_system
 from prism.core.guidance.tokens import estimate_tokens
 from prism.models.ast import HunkWithSymbol
 from prism.models.grouping import Group
@@ -170,14 +169,15 @@ def group_cost(hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFinding
 
 
 def fixed_prompt_tokens() -> int:
-    """量一组的固定开销：system 段 + 要求块。
+    """量一组的固定开销：system 段（角色 + 主任务 + 工作方式 + 硬约束 + 收尾）。
 
     它每轮都要重发，所以是**每一轮的地板价** —— 组数越多，这笔钱付得越多。
+    通用约束整段搬进 system 之后，这里就只剩一项（原来还要加 user 里的要求块）。
 
     Returns:
         估算 token 数
     """
-    return estimate_tokens(tpl.SYSTEM) + estimate_tokens(build_requirements())
+    return estimate_tokens(build_system())
 
 
 def _findings_for_files(

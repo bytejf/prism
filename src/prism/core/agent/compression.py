@@ -52,6 +52,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from prism.core.agent.state import HunkStatus
 from prism.core.agent.status import REVIEW_STATUS_TAG_OPEN, build_review_status
 from prism.core.guidance import templates as tpl
+from prism.core.guidance.builder import build_system
 from prism.models.compression import CompressionConfig
 from prism.observability.llm_trace import fields
 
@@ -509,7 +510,7 @@ class Compressor:
             摘要正文；两次都不合格时返回 None
         """
         prompt = tpl.COMPRESSION_USER.format(
-            review_system=tpl.SYSTEM,
+            review_system=build_system(),
             background=background,
             history=render_history(history),
             status=status,

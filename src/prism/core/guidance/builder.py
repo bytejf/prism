@@ -1,15 +1,27 @@
 """静态指导组装。
 
-把审查单元（Group）渲染成 user 消息的三块：**diff 块**（审查范围 + `<diff>`）、
-**静态发现块**（待核验的提示，可能为空）、**要求块**（主任务 + 工作方式 +
-结束审查）。V1 不注入调用图与规则。
+两个出口：
 
-三块的分工按「数据 / 流程」来分：待审代码是有字段的数据，用 XML；要求是流程
-描述，用 markdown。**数据在前、要求在后** —— 模型决策前最后读到的是一段短要求，
-而不是还要翻过一整段 diff 才知道要审什么。
+- **`build_system()`** —— 组装 system 提示词。审查的**通用约束全在这里**
+  （角色、主任务维度、工作方式、硬约束、existing_code 写法、收尾），
+  它们不随审查单元变化，按项目判据（「不随组变化的进 system」）本就该在这。
+- **`build_diff_block()` / `build_static_block()`** —— user 消息**只剩材料**：
+  待审代码（XML，有字段的数据）与静态发现（可空的提示段）。
 
-**文本本身整块写在 `templates.py` 里**，这里只负责填变量 —— 这样一眼能看出
-LLM 收到的整体结构，而不是 `"\\n".join((...))` 一行一行拼。
+**顺序即信息。** system 按「抽象 → 具体」排：角色 → 目标（要找什么）→
+材料形态（标签含义）→ 方法（怎么读）→ 红线 → 输出契约 → 收尾；
+user 紧跟着给出材料本身。
+
+**这条推翻了先前的「数据在前、要求在后」**（原文写在 `USER` 的顺序上：
+「模型决策前最后读到的是一段短要求」）。那个理由只在**首轮**成立 ——
+从第二轮起要求块就在上下文中间了，recency 不再有效；而它的代价是实打实的：
+模型先读完十几 k 的代码，**最后才知道自己要找什么**，整个阅读过程没有框架。
+同一份提示词里，硬约束在前、主任务在后，本身就是自相矛盾的。
+（当时把要求放 user 的直接原因是去重：同一句「报告完调 end_done」在
+system 与 user 各说一遍，合并时整段挪到了 user。）
+
+**文本本身整块写在 `templates.py` 里**，这里只负责填变量与定顺序 ——
+这样一眼能看出 LLM 收到的整体结构，而不是 `"\\n".join((...))` 一行一行拼。
 
 静态发现的两处呈现（设计文档 18 号 §2.6）：**独立成段**列出（保留跨 hunk 的
 全局视角」，另外在每个 hunk 上标 `static_hint="S-01"` 作为与 hunk 的桥。
@@ -75,15 +87,34 @@ def build_static_block(findings: Sequence[StaticFinding]) -> str:
     return "\n\n" + tpl.STATIC_SECTION.format(rows=rows)
 
 
-def build_requirements() -> str:
-    """组装要求块：主任务 + 工作方式 + 结束审查。
+def build_system() -> str:
+    """组装 system 提示词：审查的全部通用约束，**顺序即信息**。
 
-    三小段都是静态的，不随审查单元变化 —— 随组变化的东西全在 diff 块里。
+    七段都不随审查单元变化 —— 随组变化的东西全在 user 消息（diff）里。
+    顺序按「抽象 → 具体」：
+
+    1. 角色（我是谁）
+    2. 主任务（**要找什么** —— 维度清单）
+    3. 输入格式（材料长什么样 —— 标签含义；下面几段要用到它的术语）
+    4. 工作方式（怎么读）
+    5. 硬约束（红线：评论只能落在哪、必填哪些字段）
+    6. existing_code 怎么写（输出契约）
+    7. 结束审查（收尾）
 
     Returns:
-        要求块文本
+        system 提示词全文
     """
-    return "\n\n".join((_render_main_task(), _render_workflow(), tpl.FINISH))
+    return "\n\n".join(
+        (
+            tpl.SYSTEM_ROLE,
+            _render_main_task(),
+            tpl.SYSTEM_INPUT_FORMAT,
+            _render_workflow(),
+            tpl.SYSTEM_CONSTRAINTS,
+            tpl.SYSTEM_EXISTING_CODE,
+            tpl.FINISH,
+        )
+    )
 
 
 def _render_main_task() -> str:

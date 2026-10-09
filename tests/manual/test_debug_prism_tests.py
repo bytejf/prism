@@ -45,7 +45,7 @@ from prism.core.ast.mapper import format_location, format_symbol, map_hunks_to_s
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import group_by_package
-from prism.core.guidance import templates as tpl
+from prism.core.guidance.builder import build_system
 from prism.core.output.locate import locate_group
 from prism.core.output.renderer import TerminalRenderer
 from prism.core.output.sort import sort_comments
@@ -182,7 +182,7 @@ def dump_state(state: ReviewState) -> None:
         state: initial_state 的产物
     """
     print(f"\n{'=' * 30} system {'=' * 30}")
-    print(tpl.SYSTEM[:1500])
+    print(build_system()[:1500])
     for message in state["messages"]:
         print(f"\n{'=' * 30} {message.type} {'=' * 30}")
         print(str(message.content)[:1500])

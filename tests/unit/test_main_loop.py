@@ -389,8 +389,13 @@ def test_initial_state_builds_user_message_and_round_budget(project_root: str) -
     user_text = str(state["messages"][0].content)
     assert "### 审查范围" in user_text
     assert "<diff>" in user_text
-    # diff 块在前、要求块在后 —— 模型决策前最后读到的是一段短要求
-    assert user_text.index("<diff>") < user_text.index("### 你的主任务")
+    # **user 消息只剩材料**：通用约束（主任务 / 工作方式 / 硬约束 / 收尾）全在
+    # system —— 它们不随审查单元变化。原先写的是「要求块在后，模型决策前最后
+    # 读到的是一段短要求」，那个理由只在首轮成立，且代价是模型先读完十几 k 的
+    # 代码、最后才知道要找什么（见 builder.build_system 的说明）。
+    assert "你的主任务" not in user_text
+    assert "工作方式" not in user_text
+    assert "硬约束" not in user_text
     # 没有静态发现时整段省略（工作方式那句会提到段名，所以断言的是段标题）
     assert "### 待核验的提示" not in user_text
     assert "\n\n\n" not in user_text

@@ -1,12 +1,12 @@
 """静态指导组装的单元测试。
 
 三块分开测：`build_diff_block`（数据，XML）、`build_static_block`（线索，md 表格）
-与 `build_requirements`（流程，md）。静态发现那部分还额外守两条：注入之后 hunk 的
+与 `build_system`（流程，md）。静态发现那部分还额外守两条：注入之后 hunk 的
 展示顺序按优先级走，而**没有静态发现时的渲染结果与引入这个功能之前一致**。
 """
 
-from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
-from prism.core.guidance.templates import MAIN_TASK_DIMENSIONS, SYSTEM, WORKFLOW
+from prism.core.guidance.builder import build_diff_block, build_static_block, build_system
+from prism.core.guidance.templates import MAIN_TASK_DIMENSIONS, WORKFLOW
 from prism.core.guidance.tokens import estimate_tokens
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.diff import Hunk
@@ -233,7 +233,7 @@ def test_empty_group() -> None:
 
 def test_requirements_lists_all_dimensions() -> None:
     """测试所有审查维度都在文本里，且渲染顺序固定。"""
-    text = build_requirements()
+    text = build_system()
     for dimension in MAIN_TASK_DIMENSIONS:
         assert dimension in text
     assert "1. **业务逻辑正确性**" in text
@@ -242,13 +242,13 @@ def test_requirements_lists_all_dimensions() -> None:
     # 不占末尾那个注意力最强的位置）—— 见 templates.py 的模块注释
     assert "6. **可维护性**" in text
     assert "7. **安全**" in text
-    assert "### 你的主任务" in text
+    assert "## 你的主任务" in text
 
 
 def test_requirements_lists_workflow() -> None:
     """测试工作方式的每一条都在文本里。"""
-    text = build_requirements()
-    assert "### 工作方式" in text
+    text = build_system()
+    assert "## 工作方式" in text
     for step in WORKFLOW:
         assert f"- {step}" in text
 
@@ -260,8 +260,8 @@ def test_prompt_teaches_cross_file_lookup_without_exposing_groups() -> None:
     而且我们要主动判断哪些文件相关 —— 那是在用近似规则模拟调用图（见设计
     文档 15 号 §4.4）。判断权交给它，配一个能查改动的工具就够。
     """
-    system = SYSTEM
-    text = build_requirements()
+    system = build_system()
+    text = build_system()
 
     assert "file_read_diff" in text, "工作方式里要说到这个工具"
     assert "file_read_diff" in system, "硬约束里要划定它的用途"
@@ -271,16 +271,16 @@ def test_prompt_teaches_cross_file_lookup_without_exposing_groups() -> None:
 
 def test_requirements_instructs_report_hunks_and_end_done() -> None:
     """测试要求里明确提到 report_hunks 与 end_done。"""
-    text = build_requirements()
+    text = build_system()
     assert "report_hunks" in text
     assert "end_done" in text
-    assert "### 结束审查" in text
+    assert "## 结束审查" in text
 
 
 def test_diff_block_and_requirements_do_not_overlap() -> None:
     """测试 diff 块与要求块各管各的，没有重复段落。"""
     diff_block = build_diff_block(_fixture())
-    requirements = build_requirements()
+    requirements = build_system()
     assert "审查要求" not in diff_block
     assert "### 审查范围" not in requirements
     assert "report_hunks" not in diff_block
@@ -290,7 +290,7 @@ def test_is_deterministic() -> None:
     """测试同一输入产生同一输出。"""
     group = _fixture()
     assert build_diff_block(group) == build_diff_block(group)
-    assert build_requirements() == build_requirements()
+    assert build_system() == build_system()
 
 
 # ---------- 静态发现注入 ----------
@@ -453,7 +453,7 @@ def test_workflow_plans_first_and_keeps_reporting_as_an_output_contract() -> Non
     并明确「花多少力气可以不一样」（否则逐 hunk 平均用力的暗示会让它在
     import、常量上也去查一遍调用方）。
     """
-    text = build_requirements()
+    text = build_system()
 
     # 第一遍：理解 + 定计划
     assert "第一遍 · 理解 + 定计划" in text
@@ -488,13 +488,13 @@ def test_requirements_never_mention_the_static_tool() -> None:
     你别重复」的框架，而模型手上没有任何东西可用。静态该怎么用，写在静态段里
     —— 那一段只在真有发现时出现。
     """
-    text = build_requirements()
+    text = build_system()
 
     assert "静态" not in text, "要求块里不该出现「静态」二字"
     # 「先核验再采信」这条**要在主任务里无条件出现**：只在静态段里说，等于
     # 「有没有提示」决定模型有没有核验意识；而这本来是该一直有的态度
     assert "给到你的任何提示都要先核验再采信" in text
-    assert build_requirements() == text, "要求块不随组变化 —— 预算账依赖这一点"
+    assert build_system() == text, "要求块不随组变化 —— 预算账依赖这一点"
 
 
 def test_static_hint_meaning_is_explained_where_it_appears() -> None:
@@ -528,7 +528,7 @@ def test_budget_account_matches_the_real_prompt() -> None:
     findings = [make_finding("S-01", hunk_id="H-01", path="internal/agent/agent.go", line=245)]
     for injected in ([], findings):
         account = fixed_prompt_tokens() + group_tokens(group.hunks, injected)
-        real = estimate_tokens(SYSTEM) + estimate_tokens(
+        real = estimate_tokens(build_system()) + estimate_tokens(
             str(initial_state(group, injected)["messages"][0].content)
         )
         assert abs(real - account) <= 2, f"账 {account} vs 真实 {real}（超出取整误差）"

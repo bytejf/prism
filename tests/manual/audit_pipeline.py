@@ -28,7 +28,7 @@ from prism.core.ast.mapper import map_hunks_to_symbols
 from prism.core.diff.loader import load_diffs
 from prism.core.filter.rules import filter_files
 from prism.core.grouping.packages import fixed_prompt_tokens, group_by_package, group_tokens
-from prism.core.guidance import templates as tpl
+from prism.core.guidance.builder import build_system
 from prism.core.guidance.tokens import estimate_tokens
 from prism.core.output.locate import locate_group
 from prism.models.comment import Comment  # noqa: F401  （仅供类型参考）
@@ -91,7 +91,7 @@ def main() -> int:
         # 而 user 消息里已经含要求块。所以这一侧只能加 SYSTEM，**不能再加 fixed**
         # （第一版加了 fixed、第二版忘了加 SYSTEM —— 两次都是我把口径搞错了，
         # 差的常数恰好分别等于要求块与 system 段，很容易误判成代码有 bug）
-        real = estimate_tokens(tpl.SYSTEM) + estimate_tokens(
+        real = estimate_tokens(build_system()) + estimate_tokens(
             str(initial_state(group)["messages"][0].content)
         )
         gap = real - estimated

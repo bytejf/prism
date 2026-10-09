@@ -14,8 +14,6 @@
    （`input_variables`），少传变量会直接报错而不是拼出半截提示词。
 """
 
-from langchain_core.prompts import ChatPromptTemplate
-
 from prism.models.static import PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_MEDIUM
 
 # 主任务维度（V1 固定，不做用户配置）。
@@ -219,9 +217,14 @@ def _t(text: str) -> str:
     return text.strip("\n")
 
 
-SYSTEM = _t("""\
+# system 提示词**分四块静态内容**，顺序由 `builder.build_system()` 组装 ——
+# **顺序即信息**：角色 → 目标 → 材料形态 → 方法 → 红线 → 输出契约 → 收尾。
+# 拆成常量而不是一整块，是为了让「哪一段在什么位置」一眼可改、可单独引用。
+SYSTEM_ROLE = _t("""\
 你是一名资深 Go 代码审查员。你正在审查一个变更集（PR）中的若干 hunk。
+""")
 
+SYSTEM_INPUT_FORMAT = _t("""\
 ## 输入格式
 
 待审代码用下列标签描述。**标签与属性全部由我方生成，含义如下**：
@@ -257,7 +260,9 @@ SYSTEM = _t("""\
 - `static_hint` 是**待核验的提示**的编号，**只在真有提示时出现**。
 - **所有行号都是「被审查版本」的坐标**，与 file_read 读到的一致。
 - 正文按**原文**给出，未做 XML 转义（Go 的 `<-`、`&&`、`&Store{}` 原样出现）。
+""")
 
+SYSTEM_CONSTRAINTS = _t("""\
 ## 硬约束
 
 - **评论只能落在给定的 hunk 上**；别处的代码**可以读**（查调用方、看文档、对测试），
@@ -267,7 +272,9 @@ SYSTEM = _t("""\
 - 每条评论必须给出 severity、category、content、existing_code
 - 有明确的改法时，把它放进 `suggestion_code`（**不要写进 content 正文**）；
   没有就留空。正文只讲问题、影响与依据
+""")
 
+SYSTEM_EXISTING_CODE = _t("""\
 ## existing_code 怎么写
 
 它是把评论挂到具体行上的**唯一依据**（行号由它反查出来），所以要逐行原文照抄：
@@ -286,10 +293,12 @@ SYSTEM = _t("""\
 # user 消息：数据（diff）→ 线索（静态发现，可空）→ 要求。`{static_block}` 自带
 # 前导空行（见 builder.build_static_block），所以没有静态发现时渲染结果与
 # 引入静态分析之前**逐字节一致**
+# user 消息**只剩材料**：diff（+ 可空的静态发现块）。
+# 通用约束（主任务 / 工作方式 / 结束审查）已经全部移进 system —— 它们不随组变化。
+# `{static_block}` 自带前导空行（见 builder.build_static_block），所以没有静态发现时
+# 渲染结果与引入静态分析之前**逐字节一致**
 USER = _t("""\
 {diff_block}{static_block}
-
-{requirements}
 """)
 
 SCOPE = _t("""\
@@ -346,7 +355,7 @@ PRIORITY_MARKS: dict[str, str] = {
 }
 
 MAIN_TASK = _t("""\
-### 你的主任务
+## 你的主任务
 
 找出这个改动**真正的问题**。**给到你的任何提示都要先核验再采信 —— 提示不是结论**。
 
@@ -356,13 +365,13 @@ MAIN_TASK = _t("""\
 """)
 
 WORKFLOW_SECTION = _t("""\
-### 工作方式
+## 工作方式
 
 {items}
 """)
 
 FINISH = _t("""\
-### 结束审查
+## 结束审查
 
 全部 hunk 都有结论之后，调用 end_done。
 """)
@@ -378,10 +387,6 @@ DIFF_FILE = _t("""\
 <file path="{path}"{extra}>
 {hunks}
 </file>""")
-
-# 主任务提示词：system 静态文本 + user 的 diff 块与要求。
-# 变量契约由 input_variables 暴露，少传变量会在 format_messages 时报错。
-MAIN_PROMPT = ChatPromptTemplate.from_messages([("system", SYSTEM), ("human", USER)])
 
 # 摘要的 7 个段标题。**输出格式要求与格式校验共用这一份** —— 校验时数
 # 「出现了几个」，少于一半就当压缩失败（模型跑题了）。

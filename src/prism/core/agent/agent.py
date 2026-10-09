@@ -50,7 +50,7 @@ from prism.core.agent.state import (
 )
 from prism.core.grouping.packages import package_label
 from prism.core.guidance import templates as tpl
-from prism.core.guidance.builder import build_diff_block, build_requirements, build_static_block
+from prism.core.guidance.builder import build_diff_block, build_static_block, build_system
 from prism.core.guidance.tokens import estimate_tokens
 from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
@@ -116,7 +116,7 @@ def build_review_agent(model: BaseChatModel, compression: CompressionConfig | No
         create_agent(
             model=model,
             tools=build_tools(),
-            system_prompt=tpl.SYSTEM,
+            system_prompt=build_system(),
             middleware=cast(
                 list[AgentMiddleware[Any, Any, Any]],
                 [
@@ -168,11 +168,9 @@ def initial_state(group: Group, static_findings: Sequence[StaticFinding] = ()) -
     """
     diff_block = build_diff_block(group, static_findings)
     static_block = build_static_block(static_findings)
-    requirements = build_requirements()
     user_text = tpl.USER.format(
         diff_block=diff_block,
         static_block=static_block,
-        requirements=requirements,
     )
     logger.debug(
         "审查提示词：%s（%d 个 hunk / %d 个文件，diff %d 字符 + 静态发现 %d 条，共 %d 字符）",
