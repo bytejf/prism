@@ -46,7 +46,7 @@ def file_read(
     Args:
         path: 文件相对路径
         start_line: 起始行号（1-based）
-        end_line: 结束行号（1-based，最多 500 行）
+        end_line: 结束行号（1-based，含）；本次返回的行数超过单次上限时会截断并提示
         runtime: 运行时（框架注入，模型看不到）
 
     Returns:

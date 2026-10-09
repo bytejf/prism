@@ -43,7 +43,7 @@ def code_search(
         pattern: 搜索模式（支持正则）
         runtime: 运行时（框架注入，模型看不到）
         file_pattern: 文件过滤，默认 "*.go"
-        max_results: 最大结果数，传超过配置上限的值会被压到上限
+        max_results: 最大结果数；**默认值就是上限**，传更大的会被压到上限
 
     Returns:
         匹配行列表（含文件路径、行号、内容）；无匹配或出错时返回说明文本

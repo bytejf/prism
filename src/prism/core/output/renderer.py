@@ -12,7 +12,7 @@
 **疑似漏报**是反思阶段顺带发现的信号（「这处改动可能没被覆盖」），也单独成段放
 最后。它比未定位评论更弱 —— 它连评论都不是，只是提示。
 
-V1 简化：不渲染 suggestion_code 的 diff、不展示 rule_ref。
+V1 简化：不渲染 suggestion_code 的 diff。
 """
 
 import logging
@@ -92,7 +92,7 @@ class TerminalRenderer:
     """终端渲染器。
 
     将评论列表渲染为人类可读的终端文本。
-    V1 简化：不渲染 suggestion_code 的 diff，不展示 rule_ref。
+    V1 简化：不渲染 suggestion_code 的 diff。
     """
 
     def render(

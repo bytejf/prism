@@ -50,8 +50,9 @@ class CommentArg(BaseModel):
             "逐行照抄。**抄了 diff 里没有的行，这条评论会挂不上、变成未定位**"
         )
     )
-    suggestion_code: str | None = Field(default=None, description="建议的修改代码（可选）")
-    rule_ref: str | None = Field(default=None, description="引用的规则编号（可选，V1 不用）")
+    suggestion_code: str | None = Field(
+        default=None, description="建议的修改代码（可选；能给出就直接可替换的那种）"
+    )
 
 
 # 类 docstring 会成为 schema 里的 `items.description`，**是模型看得到的**，
@@ -228,7 +229,6 @@ def _to_comment(arg: CommentArg) -> CommentInput:
         content=arg.content.strip(),
         existing_code=arg.existing_code.strip(),
         suggestion_code=_optional_text(arg.suggestion_code),
-        rule_ref=_optional_text(arg.rule_ref),
     )
 
 
