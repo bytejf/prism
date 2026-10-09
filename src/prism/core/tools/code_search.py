@@ -13,6 +13,7 @@ from langgraph.prebuilt import ToolRuntime
 from prism.config.settings import settings
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import ReviewState
+from prism.core.filter.rules import is_reviewable_path
 from prism.core.tools.paths import check_no_nul, check_relative_path
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,11 @@ def code_search(
         logger.warning("code_search 失败：rc=%d %s", completed.returncode, completed.stderr.strip())
         return f"错误：git grep 失败：{completed.stderr.strip()}"
 
-    matched = completed.stdout.splitlines()
+    # 按 `\n` 切，**不能用 `splitlines()`**：后者把 U+2028 / U+2029 / `\x0b`
+    # 这些 Unicode 行边界也当换行，而 git 只认 `\n`。压缩过的 JS 里就有 U+2028
+    # （实测 swagger-ui-bundle.js），于是一条匹配被切成几段、后几段丢了路径前缀
+    # —— 既少了一条结果，还白占 `max_results` 的额度。
+    matched = [line for line in completed.stdout.split("\n") if line]
     # git grep 带 rev 搜索时给每条结果加 `<rev>:` 前缀（`HEAD:db.go:12: ...`，
     # rev 原样回显，分支名 / SHA 都是）。剥掉它：结果的路径要与 file_read /
     # file_read_diff 是同一套坐标，模型把这一行里的路径直接拿去调工具就能用 ——
@@ -123,6 +128,21 @@ def code_search(
     if ctx.head_rev:
         prefix = f"{ctx.head_rev}:"
         matched = [line.removeprefix(prefix) for line in matched]
+
+    # **在限条数之前按审查范围过滤**，与 diff 过滤用同一套规则。
+    #
+    # 这一步挡的不是越权（读得到也评不了，评论的 path 由 hunk_id 查出来），
+    # 是 **token**：搜索范围是整个仓库，模型可以把 file_pattern 放开成 `*`，
+    # 而 git grep 的一条结果 = 一整行源码 —— 打包产物的一行就是 1.4 MB
+    # （实测：swagger-ui-bundle.js 单行 1,461,344 字符，一次搜索把上下文从
+    # ~10k 炸到 ~500k token，撞穿 2 元上限、整组 0 条评论交卷）。
+    # 过滤放在截断**之前**：`max_results` 限的是条数，不是字节，
+    # 先截断会把额度浪费在永远不会返回的行上。
+    before = len(matched)
+    matched = [line for line in matched if is_reviewable_path(line.partition(":")[0])]
+    if before != len(matched):
+        logger.debug("code_search 过滤掉 %d 条范围外的匹配", before - len(matched))
+
     if not matched:
         logger.debug("code_search 无匹配：%s", pattern)
         return f"未找到匹配：{pattern}"

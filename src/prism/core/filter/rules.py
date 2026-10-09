@@ -4,6 +4,11 @@
 1. 硬性排除 —— 二进制文件、符号链接
 2. 白名单 —— 扩展名只保留 .go，外加 `go.mod`（按**文件名**放行）
 3. 内置降噪 —— *_test.go、*.pb.go
+
+**全流程只有这一套判据**：前两级之外的路径规则（`path_skip_reason`）同时被
+过滤阶段与三个读取工具使用 —— 能审的才读得到，读得到的才可能被审。
+工具各写一份判据一定会漂，而漂的表现是「某个文件审得到但读不到」这种
+无声的不一致。
 """
 
 import logging
@@ -65,8 +70,51 @@ def filter_files(diffs: list[Diff]) -> FilterResult:
     return FilterResult(reviewable=reviewable, skipped=skipped)
 
 
+def path_skip_reason(path: str) -> str | None:
+    """路径层面的跳过原因（扩展名白名单 + 内置降噪）；可审时返回 None。
+
+    **全流程唯一的路径判据**：过滤阶段用它决定跳过哪些文件，三个读取工具
+    （`file_read` / `code_search` / `file_read_diff`）用它决定拒掉哪些路径。
+    别在工具里另写一份 —— 两份判据漂开之后，「审得到但读不到」不会报错。
+
+    只看路径，**不看二进制 / 符号链接**那两级：那两个要文件内容或 diff 元数据，
+    调用方手上不一定有（`code_search` 拿到的是 grep 出来的一行文本）。
+
+    Args:
+        path: 仓库内相对路径
+
+    Returns:
+        跳过原因；可审时返回 None
+    """
+    name = PurePosixPath(path).name
+    if name not in ALLOWED_FILENAMES:
+        suffix = PurePosixPath(name).suffix
+        if suffix not in ALLOWED_EXTENSIONS:
+            return f"{REASON_EXTENSION}: {suffix or '无扩展名'}"
+
+    for noise_suffix, label in BUILTIN_NOISE.items():
+        if name.endswith(noise_suffix):
+            return f"{REASON_BUILTIN_NOISE}: {label}"
+    return None
+
+
+def is_reviewable_path(path: str) -> bool:
+    """这个路径在不在审查范围内。`path_skip_reason` 的布尔形态。
+
+    Args:
+        path: 仓库内相对路径
+
+    Returns:
+        可审为 True
+    """
+    return path_skip_reason(path) is None
+
+
 def _skip_reason(diff: Diff) -> str | None:
     """判断单个文件应被跳过的原因。
+
+    硬性排除那两级要用 diff 的元数据，所以入口与 `path_skip_reason` 不同，
+    但路径判据是**同一个函数** —— 不在这里重抄一遍扩展名与降噪规则。
 
     Args:
         diff: 单个文件的 diff
@@ -78,14 +126,4 @@ def _skip_reason(diff: Diff) -> str | None:
         return REASON_BINARY
     if diff.is_symlink:
         return REASON_SYMLINK
-
-    name = PurePosixPath(diff.path).name
-    if name not in ALLOWED_FILENAMES:
-        suffix = PurePosixPath(name).suffix
-        if suffix not in ALLOWED_EXTENSIONS:
-            return f"{REASON_EXTENSION}: {suffix or '无扩展名'}"
-
-    for noise_suffix, label in BUILTIN_NOISE.items():
-        if name.endswith(noise_suffix):
-            return f"{REASON_BUILTIN_NOISE}: {label}"
-    return None
+    return path_skip_reason(diff.path)

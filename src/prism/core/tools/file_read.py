@@ -13,6 +13,7 @@ from langgraph.prebuilt import ToolRuntime
 from prism.config.settings import settings
 from prism.core.agent.context import ReviewContext
 from prism.core.agent.state import ReviewState
+from prism.core.filter.rules import path_skip_reason
 from prism.core.tools.paths import check_relative_path
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,13 @@ def file_read(
     except ValueError as exc:
         logger.warning("file_read 路径校验失败：%s", exc)
         return f"错误：{exc}"
+
+    # 审查范围与过滤阶段**同一套规则**：审不到的文件也不必读。这一步挡的不只是
+    # 越权，更是 token —— 一次 `git grep` 或一个打包产物就能把一组预算烧穿
+    reason = path_skip_reason(path)
+    if reason is not None:
+        logger.debug("file_read 拒绝范围外文件：%s（%s）", path, reason)
+        return f"错误：{path} 不在审查范围内（{reason}）"
 
     text = _read_reviewed(ctx, path)
     if text is None:

@@ -298,6 +298,33 @@ def test_file_read_missing_file(ctx: ReviewContext) -> None:
     assert "不存在" in result
 
 
+def test_file_read_rejects_out_of_scope_path(ctx: ReviewContext, tmp_path: Path) -> None:
+    """测试读范围外的文件被拒，理由说清是「不在审查范围内」。
+
+    与过滤阶段同一套规则：审不到的文件也不必读。挡的不只是越权，更是 token
+    —— 路径层面的判据见 `filter/rules.path_skip_reason`。
+    """
+    (tmp_path / "note.md").write_text("说明\n", encoding="utf-8")
+    (tmp_path / "alpha_test.go").write_text("package main\n", encoding="utf-8")
+    tool = ToolUnderTest(file_read, ctx)
+
+    md = tool.text({"path": "note.md", "start_line": 1, "end_line": 1})
+    assert "错误" in md
+    assert "不在审查范围内" in md
+    assert "说明" not in md  # 正文一个字都没读出来
+
+    assert "不在审查范围内" in tool.text({"path": "alpha_test.go", "start_line": 1, "end_line": 1})
+
+
+def test_file_read_allows_go_mod(ctx: ReviewContext, tmp_path: Path) -> None:
+    """测试 `go.mod` 读得到 —— 它在白名单里（按文件名），不能只按扩展名判。"""
+    (tmp_path / "go.mod").write_text("module example.com/x\n\ngo 1.22.7\n", encoding="utf-8")
+    tool = ToolUnderTest(file_read, ctx)
+
+    result = tool.text({"path": "go.mod", "start_line": 1, "end_line": 3})
+    assert "module example.com/x" in result
+
+
 def test_file_read_start_line_beyond_eof(ctx: ReviewContext, tmp_path: Path) -> None:
     """测试起始行超出总行数。"""
     (tmp_path / "small.go").write_text("a\nb\n", encoding="utf-8")
@@ -619,7 +646,54 @@ def test_code_search_respects_file_pattern(go_repo: Path) -> None:
     """测试 file_pattern 限定文件类型。"""
     tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
     assert "note.md" not in tool.text({"pattern": "func Alpha", "file_pattern": "*.go"})
-    assert "note.md" in tool.text({"pattern": "func Alpha", "file_pattern": "*.md"})
+    # 把 file_pattern 放开成 *.md 也拿不到 —— 它不在审查范围内，
+    # 与 diff 过滤用的是同一套规则（见 filter/rules.path_skip_reason）
+    assert "未找到匹配" in tool.text({"pattern": "func Alpha", "file_pattern": "*.md"})
+
+
+def test_code_search_drops_out_of_scope_files_even_with_wildcard(
+    go_repo: Path, git: Callable[..., None]
+) -> None:
+    """回归：`file_pattern="*"` 时被过滤掉的文件不能进结果。
+
+    真实故障：模型把 file_pattern 放开成 `*`，`git grep` 命中了
+    `static/swagger-ui-bundle.js` —— 打包产物**整个文件在第 2 行**，
+    单行 1,461,344 字符。一次搜索把上下文从 ~10k 炸到 ~500k token，
+    撞穿单组 2 元上限，那一组 4 个 hunk **一条评论都没产出**。
+
+    `max_results` 限的是**条数**不是**字节**，`-I` 只跳二进制（压缩 JS 是文本），
+    所以两道闸都拦不住它 —— 拦它的是审查范围。
+    """
+    (go_repo / "bundle.js").write_text(
+        "var a=1;" + "x" * 200_000 + "func Alpha\n", encoding="utf-8"
+    )
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "add bundle")
+
+    tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
+    result = tool.text({"pattern": "func Alpha", "file_pattern": "*"})
+
+    assert "bundle.js" not in result
+    assert "a.go:3" in result  # 范围内的文件照常返回
+    assert len(result) < 10_000
+
+
+def test_code_search_drops_builtin_noise(go_repo: Path, git: Callable[..., None]) -> None:
+    """测试测试文件也被同一套规则挡掉（与 diff 过滤一致）。
+
+    **这是有意为之的代价**：`code_search` 从此搜不到 `*_test.go`。
+    `file_read` 也一样读不到（同一套判据）—— 「读测试文件确认行为有没有同步改」
+    这条能力因此消失。要拿回来的话只有一个开关：把 `_test.go` 从
+    `BUILTIN_NOISE` 里去掉，但那同时会让测试文件变成**可审**，改的是审查范围。
+    """
+    (go_repo / "alpha_test.go").write_text(
+        "package main\n\nfunc TestAlpha() { Alpha() }\n", encoding="utf-8"
+    )
+    git(go_repo, "add", "-A")
+    git(go_repo, "commit", "-q", "-m", "add test")
+
+    tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
+    assert "alpha_test.go" not in tool.text({"pattern": "Alpha"})
 
 
 def test_code_search_no_match(go_repo: Path) -> None:
@@ -636,14 +710,14 @@ def test_code_search_keeps_non_ascii_paths_readable(
     回归用例：git 默认 core.quotepath=true，会把中文路径输出成
     "\\346\\234\\200.md"，LLM 拿到后无法回传给 file_read。
     """
-    (go_repo / "中文说明.md").write_text("func Delta 说明\n", encoding="utf-8")
+    (go_repo / "中文说明.go").write_text("package main\n\nfunc Delta() {}\n", encoding="utf-8")
     git(go_repo, "add", "-A")
     git(go_repo, "commit", "-q", "-m", "add chinese file")
 
     tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
-    result = tool.text({"pattern": "func Delta", "file_pattern": "*.md"})
+    result = tool.text({"pattern": "func Delta"})
 
-    assert "中文说明.md" in result
+    assert "中文说明.go" in result
     assert "\\346" not in result
 
 
