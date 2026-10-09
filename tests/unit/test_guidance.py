@@ -425,27 +425,42 @@ def test_static_finding_number_appears_in_the_row_not_as_severity() -> None:
     assert "| S-07 |" in text
 
 
-def test_workflow_bounds_exploration_without_forcing_early_verdicts() -> None:
-    """工作方式要写清**两遍审查**与逐 hunk 的核对线索，但**不再规定「审一个报一个」**。
+def test_workflow_forces_per_hunk_verdicts_with_a_bounded_first_pass() -> None:
+    """工作方式要**强制逐 hunk 交卷**，并给「第一遍」一个可判定的边界。
 
-    实测：要求逐 hunk 即时报等于要求先下结论再收集证据 —— 模型做不到，只能假装
-    走一遍、最后一次性交卷（反馈文档 23 号 §十一：20 个样本里 18 个
-    「首报轮次 = 总轮次 − 1」）。所以换成：第一遍只理解、不下结论；第二遍按
-    hunk 编号逐个走同一条线索；有结论就先报（是保险，不是频率）。
+    **这条推翻了上一版的写法**（历史记在这，别拆掉后又装回来）：
+
+    上一版写的是「第一遍只理解、不下结论」＋「有结论就报（是**保险**，不是频率）」，
+    理由是「要求逐 hunk 即时报 ＝ 要求先下结论再收集证据」（反馈文档 23 号 §十一：
+    20 个样本里 18 个「首报轮次 = 总轮次 − 1」）。但实测那个「保险」**从未兑现**：
+
+    - 6/6 组的 `report_hunks` 都出现在第 N-1 位（5e284ae 一次报完 45 个 hunk）
+    - 历史上有 **4 次**闸门切断直接丢掉全部结论（每次都是 0 条评论，
+      含一次 **59 个 hunk 全丢**）—— 见文档 25 号 P2
+
+    现在改成强制，同时把顺序钉死：**每个 hunk 内部先收集证据（①②③）再交结论（④）**
+    ——「先下结论再收集证据」这个老问题因此不存在了。
+    第一遍的边界定成**「不调用工具」**：可判定，又不会让模型去通读整个仓库
+    （试过写「每个文件都读过一遍之后再报」，那等于指挥它把项目读一遍）。
+
+    下一局要看的：`report_hunks` 是不是**分散在各轮**，而不是集中在末尾。
     """
     text = build_requirements()
 
-    assert "第一遍 · 理解（不下结论）" in text
+    assert "第一遍 · 理解（只读 `<diff>`，不用工具）" in text
     assert "第二遍 · 逐个 hunk 核对" in text
-    # 四条线索要按顺序都在：读全符号 → 查上游调用方 → 看下游影响 → 下结论
+    # 四条线索要按顺序都在：读全符号 → 查上游调用方 → 看下游影响 → 交这一条
     assert "读全它归属的符号" in text
     assert "往上游查调用方" in text
     assert "往下游看影响" in text
-    assert "一个 hunk 走完再走下一个" in text
+    assert "交这个 hunk 的结论，交完才走下一个" in text
+    assert "审完一个 hunk 就报一个" in text
+    assert "一次 report_hunks 可以只带这一个 hunk" in text
     assert "跨文件一致性是本任务里最值钱的一类发现" in text
     assert "每次探查前问自己" in text
-    assert "有结论就报，别攒到最后" in text
-    assert "每完成 1~2 个 hunk" not in text, "按 hunk 规定上报频率，正是要拆掉的那条"
+    # 旧措辞必须已经消失：它是「保险，不是频率」，实测一次都没被兑现
+    assert "有结论就报，别攒到最后" not in text
+    assert "理解没建立起来之前不要报结论" not in text
 
 
 def test_requirements_never_mention_the_static_tool() -> None:

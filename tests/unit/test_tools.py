@@ -676,6 +676,8 @@ def test_code_search_drops_out_of_scope_files_even_with_wildcard(
     assert "bundle.js" not in result
     assert "a.go:3" in result  # 范围内的文件照常返回
     assert len(result) < 10_000
+    # 部分被过滤时要说明，否则模型会把返回的几条当成「全部调用点」
+    assert "落在审查范围之外" in result
 
 
 def test_code_search_drops_builtin_noise(go_repo: Path, git: Callable[..., None]) -> None:
@@ -694,6 +696,20 @@ def test_code_search_drops_builtin_noise(go_repo: Path, git: Callable[..., None]
 
     tool = ToolUnderTest(code_search, ReviewContext(project_root=str(go_repo)))
     assert "alpha_test.go" not in tool.text({"pattern": "Alpha"})
+
+    # **「被过滤」与「真没有」必须分成两句话**：合成一句时模型会把前者读成后者
+    # —— 实测它搜不到 *_test.go，就写下「这个包里没有测试」，而那个包有 10 个
+    # 测试文件、还是那次 PR 自己改的。后半句「不必再找」也必须有，
+    # 否则它接着花轮次去找那批文件。
+    filtered = tool.text({"pattern": "TestAlpha"})  # 只命中 alpha_test.go
+    assert "未找到匹配" in filtered
+    assert "落在审查范围之外" in filtered
+    assert "不必再找" in filtered
+
+    # 真·无匹配时**不能**出现那句话（否则模型会以为只是被过滤了，继续找）
+    clean = tool.text({"pattern": "这个字符串哪儿都没有"})
+    assert "未找到匹配" in clean
+    assert "落在审查范围之外" not in clean
 
 
 def test_code_search_no_match(go_repo: Path) -> None:

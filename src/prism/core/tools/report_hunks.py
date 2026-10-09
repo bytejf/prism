@@ -45,7 +45,10 @@ class CommentArg(BaseModel):
     category: str = Field(description="问题类别，如 并发安全 / 边界条件 / 跨文件一致性 / 可维护性")
     content: str = Field(description="评论正文：说清问题、影响与依据。**一条评论只讲一件事**")
     existing_code: str = Field(
-        description="用于定位的代码片段：本 hunk diff 里新增行的原文，逐行照抄（写法见系统提示词）"
+        description=(
+            "用于定位的代码片段：本 hunk diff 里**改动行**（`+` / `-`）的原文，"
+            "逐行照抄。**抄了 diff 里没有的行，这条评论会挂不上、变成未定位**"
+        )
     )
     suggestion_code: str | None = Field(default=None, description="建议的修改代码（可选）")
     rule_ref: str | None = Field(default=None, description="引用的规则编号（可选，V1 不用）")

@@ -140,14 +140,28 @@ def code_search(
     # 先截断会把额度浪费在永远不会返回的行上。
     before = len(matched)
     matched = [line for line in matched if is_reviewable_path(line.partition(":")[0])]
-    if before != len(matched):
-        logger.debug("code_search 过滤掉 %d 条范围外的匹配", before - len(matched))
+    skipped = before - len(matched)
+    if skipped:
+        logger.debug("code_search 过滤掉 %d 条范围外的匹配", skipped)
 
     if not matched:
         logger.debug("code_search 无匹配：%s", pattern)
+        if skipped:
+            # **「被过滤」与「真没有」必须分成两句话。** 合成一句时模型会把前者
+            # 读成后者 —— 实测它搜不到 *_test.go，就写下「这个包里没有测试」，
+            # 而那个包有 10 个测试文件、还是这次 PR 自己改的（见文档 25 号 P1）。
+            # 后半句要说「无需再找」，否则它接着花轮次去找那批文件。
+            return (
+                f"未找到匹配：{pattern}\n"
+                f"（另有 {skipped} 条命中落在审查范围之外 —— 非 Go 源码、测试文件或"
+                f"生成文件，与本任务无关，**不必再找**）"
+            )
         return f"未找到匹配：{pattern}"
 
     body = "\n".join(matched[:limit])
+    # 部分被过滤时也要说：不说的话，模型会把返回的这几条当成「全部调用点」
+    if skipped:
+        body += f"\n（另有 {skipped} 条命中落在审查范围之外，与本任务无关）"
     if len(matched) > limit:
         logger.debug("code_search 截断：共 %d 条，返回 %d 条", len(matched), limit)
         body += f"\n（已截断：共 {len(matched)} 条匹配，只显示前 {limit} 条）"
