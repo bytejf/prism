@@ -227,8 +227,9 @@ class RuleLibrary:
     def render(self, rule_ids: list[str]) -> str:
         """渲染 `load_rules` 的返回文本。
 
-        四种情况分开说（设计 26 号 §6.1）：生效的直接给正文、被完全覆盖的指路、
-        部分覆盖的两份都给、未知的代代号点名。
+        三种情况（设计 26 号的 §6.1 有一处已经不用了，见 `render` 里那段注释）：
+        **生效的**直接给正文、**部分被覆盖的**两份都给并说清以谁为准、
+        **没见过的代号**（含被完全覆盖的）点名让它回索引看。
 
         Args:
             rule_ids: 模型给的规则代号列表
@@ -244,7 +245,14 @@ class RuleLibrary:
                 unknown.append(rule_id)
                 continue
             if rule.fully_overridden:
-                blocks.append(self._render_covered(rule))
+                # **按「没有这条规则」处理**：索引里列的都是**现行**规则 ——
+                # 有私有规则覆盖时，那一行的代号在整理规则时就换成了私有代号，
+                # 所以模型正常问不到被覆盖的代号。真问到，只说明它手里的是旧
+                # 信息（或猜的），让它回索引重看就行。
+                #
+                # **这里不解释「谁覆盖了谁」**：那套优先级语义模型不需要理解，
+                # 端出来只会让它去推理两套来源的关系，而它要的只是现行内容
+                unknown.append(rule_id)
                 continue
             if rule.overridden_by is not None:
                 blocks.append(self._render_partial(rule))
@@ -258,28 +266,6 @@ class RuleLibrary:
                 f"可用的代号在「代码审查规则索引」那张表里，照表里的写。"
             )
         return "\n\n".join(parts) if parts else "没有可返回的规则。"
-
-    def _render_covered(self, rule: Rule) -> str:
-        """渲染「被完全覆盖」的规则：**直接把现行那一条的正文给回去**。
-
-        设计文档 §6.1 写的是「返回『已被 X 覆盖，请加载 X』」—— 那一版要模型再发
-        一次请求。现在改成一步到位：索引里本来就没有被覆盖的代号（模型正常不会
-        问到它），能问到只说明它读到过旧资料或猜了一个 —— 这时候让它再跑一趟纯属
-        浪费一轮，我们手里已经有现行内容了。
-
-        开头那一句只说明「你要的代号已被取代」，**不讲 C/G 的优先级语义**：
-        模型不需要理解两套来源的关系，只需要拿到现行规则。
-
-        Args:
-            rule: 被完全覆盖的规则
-
-        Returns:
-            覆盖者的正文（找不到覆盖者时退回一句说明）
-        """
-        covering = self.rules.get(str(rule.overridden_by))
-        if covering is None:
-            return f"{rule.rule_id} 已被 {rule.overridden_by} 取代，但规则库里没有它。"
-        return f"（你查的 {rule.rule_id} 已被取代，以下是现行规则）\n\n{covering.body}"
 
     def _render_partial(self, rule: Rule) -> str:
         """渲染「部分被覆盖」的规则：覆盖者的全文 + 本规则仍然有效的部分。

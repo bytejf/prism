@@ -254,12 +254,15 @@ def test_fully_overridden_rule_drops_out_of_the_index_and_points_elsewhere(
 
     assert library.rules["EH-G-01"].fully_overridden
     assert "EH-G-01" not in {item.rule_id for item in library.active()}
-    # 问它要一条被取代的规则 → **直接把现行那一条的正文给回去**，不让模型再发
-    # 一次请求（设计 §6.1 写的是「告诉它去加载 X」，那一版要多花一轮）
+    # 问它要一条被取代的规则 → **按「没有这条规则」处理**：索引里列的都是现行
+    # 规则（覆盖发生时整理规则的人会把那一行的代号换成私有代号），所以模型正常
+    # 问不到被取代的代号。回一句「去索引看」就够了 —— **不提「谁覆盖了谁」**，
+    # 那套优先级语义模型不需要理解
     text = library.render(["EH-G-01"])
-    assert "已被取代，以下是现行规则" in text
-    assert "# EH-C-01" in text, "现行规则的正文要一并发出来"
-    assert "# EH-G-01" not in text, "被取代的那条内容不再生效，不要混进来"
+    assert "未找到规则：EH-G-01" in text
+    assert "索引" in text, "要把它指回索引（那里列的是现行代号）"
+    assert "覆盖" not in text, "不要暴露优先级语义"
+    assert "# EH-C-01" not in text, "也别把别的代号的正文塞回来"
 
 
 def test_partially_overridden_rule_returns_both_sides(tmp_path: Path) -> None:
