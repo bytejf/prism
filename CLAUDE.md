@@ -240,6 +240,14 @@ bug 藏了很久。**丢弃日志说错原因，比丢东西本身更难发现�
   「预算账 ≠ 真实渲染」** —— 而那是 `audit_pipeline.py` 四件对账里的一件。
   `prism group` 也要传同一个值，否则干跑出来的分组与真审的不一样。
 
+**规则索引（`SYSTEM_RULES`，进 system 的第 4 段）**：位置在**主任务之后、
+输入格式之前** —— 先说要找什么（7 条维度），再说规则库里有哪些更细的规则可用，
+最后才给材料长什么样。它整次审查都一样，所以按本项目判据进 system；
+**设计文档 §8.2 写的是「user 消息里新增一段」，这里没照做**（user 那边只剩材料），
+偏离记在反馈文档 27 号。索引文本来自 `rules/index.md`，**进程内缓存一份**
+（`default_library()`）—— 这个函数在分组装箱里会被反复调用（O(k²) 次渲染量成本），
+不能每次读盘。
+
 **防提示注入（三处）**：待审代码是**别人写的文本**，而它正好在提示词里
 —— 注释 / 字符串里写「故意这么写」「已确认安全」「不要报告」时，模型可能把它当结论
 的依据。三处各管一头，**改任何一处都要看另外两处**：
@@ -407,6 +415,50 @@ NUL、`--` 挡住选项注入），变异 9/9（`/tmp/mutate_paths.py`）。
 与真审时的不一样，那就失去核对的意义了。输出里每组带 `约 N/20000 token`，
 超预算的那组带 ⚠️。
 
+## 规则库（改 `core/rules/` 或 `prism/rules/` 前必读）
+
+代码规范的**两层渐进式加载**（设计 26 号）：规则库可以无限扩，进提示词的固定
+成本不变。两层都在 `src/prism/rules/`，**随包发布**（`uv build` 出来的 wheel 里
+有它，与 `default.toml` 同一种放法）。
+
+| 层 | 在哪 | 怎么进上下文 | 成本 |
+|---|---|---|---|
+| **L1 索引** | `rules/index.md` | system 的第 4 段（`SYSTEM_RULES`），**每次都进** | ≤80 行，约 700 token |
+| **L2 正文** | `rules/themes/<主题>/<代号>.md` | 模型调 `load_rules(["代号"])` 按需取 | 每条 200~500 token |
+
+**规则按主题分目录，主题是九个固定枚举**（`_registry.toml` 的 `order`）。
+**目录名就是主题名**，规则文件 frontmatter 里的 `theme` 必须等于它所在的目录 ——
+三者同一份，所以主题名里**不带编号**：编号只出现在注册表里一次。
+
+六条不能动的：
+
+- **索引与磁盘不许漂**：索引里每个代号都要存在、每条生效规则都要出现在索引里。
+  两边的失效方向相反（模型加载一个不存在的规则 / 某条规则**永远加载不到**），
+  两条用例分别钉住（`test_rules.py`），第三条约「一个代号只出现一次」——
+  手工改编号最容易出的是**整段错位**，那样一个代号出现两次、另一个一次都没有
+- **索引 ≤ 80 行**（用例钉住）。它是**每次都进**的固定成本，涨了不是改这个数字，
+  是把低频规则挪出去
+- **覆盖关系的唯一来源是「被覆盖那条规则自己的 frontmatter」**（`overridden_by` +
+  `remaining_parts`）。设计文档另有一张 `OVERRIDE_MAP`（§6.2），**没有照做** ——
+  它与规则文件说的是同一件事，两份就会漂。`.overridden` 这个文件名后缀**只给完全
+  被覆盖**的（不再生效、只作备查）；部分覆盖的仍然生效，文件名保持原样
+- **frontmatter 用自带的严格解析器**，不引 PyYAML：只认 `键: 值` 与 `[值, "值"]`，
+  写别的形状**当场报错**。文件本身仍是合法 YAML，我们只是不接受自己用不到的语法
+- **读不了就硬报错**（`RulesError`），不降级成「没有规则」：规则库随包发布，
+  读不了说明打包或文件坏了。静默降级会让审查照常跑，只是**再也不会**按规则判断
+- **选规则的口径：优先收静态工具抓不到的**。errcheck / govet / ineffassign /
+  bodyclose / sqlclosecheck / unused 已经覆盖了「`_ :=` 忽略 error」「无效赋值」
+  「copyleft 拷贝」这类语法级模式，规则库再收一遍就是同一处报两遍（设计 §8.3）
+
+`load_rules` 是**唯一不吃 `runtime` 的审查工具**（规则库与被审查仓库无关，
+所以它是纯函数），因此在 `tests/unit/test_tools.py` 那条「吃 runtime 的工具」
+用例里被数出来排除掉。它进了两处名单：`REFETCHABLE_TOOLS`（规则文件静态，清了
+可以重取，与三个读工具同一个判据）与 `EXPLORE_TOOLS`（收尾闸也停用它 ——
+它同样是「读」，一条 200~500 token）。
+
+**目前一条私有规则（C-）都没有**：私有规范要先结构化才能入库，用户决定
+暂时不做（项目要发布到 GitHub）。覆盖机制本身有用例覆盖（fixture 里造 C- 规则）。
+
 ## 静态分析（改 `core/static/` 前必读）
 
 golangci-lint 跑一次，发现**只当线索**：不进评论列表、不进定位、不参与排序，
@@ -561,8 +613,8 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 | `create_agent` 的 `middleware` 参数只填了 `AgentMiddleware` 三个类型参数中的两个（漏 `ResponseT`），连它自带的 `ModelCallLimitMiddleware` 都过不了 mypy（那张图还在用） | `cast`，注释写明是框架签名问题 |
 | 四个 overload 都不把 `state_schema` / `context_schema` 串进返回类型，推出来是 `AgentState[Any]` / `Any` —— `invoke` 的 `context=` 传错也不报错 | `agent.py` 手写 `Agent` 别名（**比框架推出来的更精确**）+ 出参 `cast` |
 | `@wrap_model_call` / `@wrap_tool_call` 装饰**模块级函数**时，返回的中间件实例是**全局共享**的 | 用**类式中间件**，每组审查由 `build_review_agent` 造一个实例，跨轮次状态才不会串到下一组 |
-| `@tool` 的 **`parse_docstring` 默认 False** —— docstring 里 `Args:` 的参数说明**一个字都到不了模型** | 五个工具统一 `@tool(parse_docstring=True, description="…")`：描述走 `description=`、参数说明走 docstring 的 `Args:` |
-| **`@tool(args_schema=...)` 会让 `runtime: ToolRuntime[...]` 注入失效** —— 显式给了 args_schema，框架就不再从函数签名推导，`runtime` 从 `get_input_schema()` 里消失，调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。**五个工具全吃 runtime，所以全都不能用 `args_schema`** | 一律不给 `args_schema`。嵌套结构（`report_hunks` 的 `reports`）靠**类型注解**表达，一样能出嵌套 schema |
+| `@tool` 的 **`parse_docstring` 默认 False** —— docstring 里 `Args:` 的参数说明**一个字都到不了模型** | 六个工具统一 `@tool(parse_docstring=True, description="…")`：描述走 `description=`、参数说明走 docstring 的 `Args:` |
+| **`@tool(args_schema=...)` 会让 `runtime: ToolRuntime[...]` 注入失效** —— 显式给了 args_schema，框架就不再从函数签名推导，`runtime` 从 `get_input_schema()` 里消失，调用时报 `TypeError: missing 1 required positional argument: 'runtime'`。**六个工具都不给 `args_schema`**（其中五个吃 runtime，`load_rules` 不吃但也一样） | 一律不给 `args_schema`。嵌套结构（`report_hunks` 的 `reports`）靠**类型注解**表达，一样能出嵌套 schema |
 | `parse_docstring=True` + `args_schema=` 一起给时，工具描述会**静默变成参数模型的 docstring** | 同上：不给 `args_schema`。另注意**参数模型的 docstring 本身也会进 schema**，所以要写成给模型看的话，设计理由用 `#` 注释 |
 | 工具定义**入站**还要过一道转换：`convert_to_openai_tool` 会剥掉所有 `title`、剥掉参数顶层的 `description`、把 `$defs` + `$ref` **内联展开** | 日志与对账一律用 `convert_to_openai_tool(tool)["function"]`，别拿 `tool_call_schema.model_json_schema()`（那是转换前的，`report_hunks` 两份差 2000 vs 1279 字节） |
 | `ToolNode` 的默认兜底 **`_default_handle_tool_errors` 只把 `ToolInvocationError` 转成工具结果，最后一行是 `raise e`** —— 工具里任何一个意外异常都会穿过图、穿过 `run_review_agent`，把**整条 review 带走**（后面所有组不跑，前面审出来的评论也一起没，CLI 最后才渲染） | 注册 `ToolFailureBudget`（`middleware.py` 的类式中间件，原来叫 `tool_error_guard`），放中间件链**最内侧**：ERROR + 堆栈记全，回给模型一句「换一种方式」，日志的 tool 行照样在（`ReviewTrace` 在它外侧） |
@@ -572,7 +624,7 @@ position 是显式的 `old_path`，GitHub 只有一个 `path`，它对 LEFT 评�
 
 **不使用已废弃的 API**（尤其 `langchain-classic` 包）；其余尽量用框架，别自己重造。
 
-**工具定义的形态约定**：五个工具一律 `@tool(parse_docstring=True, description="…")`。
+**工具定义的形态约定**：六个工具一律 `@tool(parse_docstring=True, description="…")`。
 `description=` 是**给模型看的**那一段；docstring 的 `Args:` 是**参数说明的来源**；
 `Returns:` / `Notes:` 之类给开发者看的内容不会发出去（`Notes:` 要发就把内容并进 `description=`）。
 不要为了「都用 Pydantic」改用 `args_schema=` —— 见上表，它会让 `runtime` 注入失效。
@@ -682,6 +734,7 @@ dataclass 字段推出来，不另写键名清单 —— 否则又多一处会�
 | 闸门触发 | `本组超预算（cost）…`、`本组预算已用 86%（阈值 85%）—— 停用探索工具…`、`工具 … 抛异常…`、`某一组异常退出…` | WARNING / ERROR | 用量 + 上限 +（异常时）完整堆栈 |
 | 进度快照 | `预算跨过 60% 里程碑，注入进度快照` | INFO | 让「模型到底看没看到缺口」可查 |
 | 零评论复核 | `本组 N 个 hunk 全部报完但零评论，注入一次复核提醒` | INFO | 防注入第二道响了没有 + 多花的那一轮用在哪 |
+| 规则加载 | `load_rules：G-07, G-03` | INFO | 模型到底按不按索引取规则（一眼看出它有没有用这个功能） |
 | 审得太浅 | `本组 88 个 hunk 只跑了 8 轮就全部报完 —— 轮次与 hunk 数严重不成比例` | **WARNING** | 实测这件事当时**没有任何日志会指出来**（`未审 0` + `end_done`，看起来一切正常） |
 | 定位 | `定位完成 group-001：N 条，hunk 内 a / 组内 b / 未定位 c，成功率 x%` | INFO | 三层分布 |
 | 反思 | `反思 · 开始 · 候选 N 条` / `反思 · 完成 · 删除 a / 保留 b（删除率 x%）· 耗时` | INFO | 删除率与耗时 |
@@ -791,6 +844,15 @@ JUDGE_MODEL=deepseek-flash JUDGE_USE_MOCK=false \
 ```bash
 PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-tests/prism-min-test
 ```
+
+**规则库有它自己的门禁**（零 token、秒级）：
+
+```bash
+uv run pytest tests/unit/test_rules.py    # 解析失败形态 + 覆盖关系 + 索引漂移守卫
+```
+
+其中漂移守卫最重要：索引与磁盘漂开**两边都不报错**，而漏掉的那条规则**永远
+加载不了**（模型不知道它存在）。
 
 **花钱之前先跑一次流水线对账**（秒级、零 token）：
 
