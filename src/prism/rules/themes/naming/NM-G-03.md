@@ -1,12 +1,12 @@
 ---
-rule_id: G-12
+rule_id: NM-G-03
 theme: naming
 default_severity: low
 keywords: [name, scope, 命名]
 source: google
 ---
 
-# G-12：名字长度与作用域匹配
+# NM-G-03：名字长度与作用域匹配
 
 **默认严重程度**：low
 

@@ -1,12 +1,12 @@
 ---
-rule_id: G-16
+rule_id: TS-G-01
 theme: testing
 default_severity: low
 keywords: [test, t.Run, table]
 source: google
 ---
 
-# G-16：测试用表驱动，失败信息要能直接定位
+# TS-G-01：测试用表驱动，失败信息要能直接定位
 
 **默认严重程度**：low
 

@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class CommentArg(BaseModel):
-    """LLM 报告的单条评论。"""
+    """一条审查评论（一个问题写一条）。"""
 
     # 类 docstring 会成为 schema 里的 description，**是模型看得到的**，所以只写
     # 一句给模型看的话；下面这条设计理由用注释写，别写进 docstring。
@@ -71,6 +71,24 @@ class CommentArg(BaseModel):
     )
     suggestion_code: str | None = Field(
         default=None, description="建议的修改代码（可选；能给出就直接可替换的那种）"
+    )
+    # 两个引用字段**分开**：一个是规范，一个是工具线索，来源与可信度都不同，
+    # 合成一个字段就再也分不出来了（消费方也没法分类统计）
+    rule_ref: str | None = Field(
+        default=None,
+        description=(
+            "这条评论依据的**规则代号**（可选），取自「代码审查规则索引」，"
+            "如 EH-G-03。判断源自某条规则时填；凭自己的经验发现的**留空**。"
+            "填了它，这条评论的严重程度就**不能高于**该规则的默认值（规则默认值见 "
+            "load_rules 返回的正文）"
+        ),
+    )
+    finding_ref: str | None = Field(
+        default=None,
+        description=(
+            "这条评论依据的**静态发现编号**（可选），如 S-01；只填给了你的那些编号、"
+            "且只有在它**成立**时填。正文里不必再重复这个编号"
+        ),
     )
 
 
@@ -248,6 +266,8 @@ def _to_comment(arg: CommentArg) -> CommentInput:
         content=arg.content.strip(),
         existing_code=arg.existing_code.strip(),
         suggestion_code=_optional_text(arg.suggestion_code),
+        rule_ref=_optional_text(arg.rule_ref),
+        finding_ref=_optional_text(arg.finding_ref),
     )
 
 

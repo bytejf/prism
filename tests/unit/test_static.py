@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from prism.core.rules.library import default_library
 from prism.core.static import analyzer
 from prism.core.static.analyzer import (
     LINTERS,
@@ -21,7 +22,7 @@ from prism.core.static.analyzer import (
     head_tree,
     select_for_group,
 )
-from prism.core.static.verify import verify_group
+from prism.core.static.verify import StaticVerdict, verify_group
 from prism.models.ast import HunkWithSymbol, Symbol
 from prism.models.comment import Comment
 from prism.models.diff import Hunk
@@ -564,12 +565,20 @@ def test_verify_accepts_sloppy_spelling() -> None:
     assert verdict.referenced == ("S-01",)
 
 
-def test_verify_without_findings_is_empty() -> None:
-    """这一组本来就没有静态发现时不产生任何结论。"""
+def test_verify_without_findings_flags_any_citation() -> None:
+    """本组没注入任何静态发现时，评论里**引用编号本身就是信号**。
+
+    校验集合是「本组注入过的那批」（模块注释里的口径）：一条都没注入，就没有
+    任何合法编号可引用 —— 这时引用了就是凭空来的，正该记下来。（旧实现在这里
+    直接返回空结论，等于把「凭空引用」放过去了。）
+    """
     verdict = verify_group([], [make_comment("[S-01] 成立")])
     assert verdict.referenced == ()
-    assert verdict.invalid == ()
+    assert verdict.invalid == ("S-01",)
     assert verdict.unhandled_count == 0
+
+    # 一条都没引用时，结论仍然是空的
+    assert verify_group([], [make_comment("没问题")]) == StaticVerdict()
 
 
 def test_verify_only_counts_kept_comments() -> None:
@@ -632,3 +641,95 @@ def test_linter_is_scoped_to_the_changed_packages(
 
     command = seen["command"]
     assert command[-2:] == ["./internal/ls", "."], "包参数要加在最后"
+
+
+# ---------- 后置校验：规则代号（与静态编号是两回事） ----------
+
+
+def rule_comment(
+    *,
+    rule_ref: str | None = None,
+    finding_ref: str | None = None,
+    severity: str = "medium",
+    content: str = "问题",
+) -> Comment:
+    """构造一条带引用的评论。
+
+    Args:
+        rule_ref: 规则代号
+        finding_ref: 静态发现编号
+        severity: 严重程度
+        content: 正文
+
+    Returns:
+        Comment
+    """
+    return Comment(
+        path="pkg/a/iface.go",
+        severity=severity,
+        category="bug",
+        content=content,
+        existing_code="x",
+        hunk_id="H-01",
+        locate_level="hunk",
+        rule_ref=rule_ref,
+        finding_ref=finding_ref,
+    )
+
+
+def test_verify_flags_a_rule_code_that_does_not_exist() -> None:
+    """编出来的规则代号要被点出来 —— 它在报告里和真的长得一模一样。
+
+    静态编号一直有这道校验，规则代号原来没有；加了 `rule_ref` 字段之后才做得了
+    （字段是结构化的，不用去猜模型把代号写成了什么形态）。
+    """
+    verdict = verify_group([], [rule_comment(rule_ref="EH-G-99")])
+
+    assert verdict.invalid_rules == ("EH-G-99",)
+    assert verdict.unhandled_count == 0
+
+
+def test_verify_accepts_a_rule_code_that_exists() -> None:
+    """真实存在的代号不算问题（随包规则库里的任一条）。"""
+    verdict = verify_group([], [rule_comment(rule_ref="EH-G-03")])
+
+    assert verdict.invalid_rules == ()
+
+
+def test_verify_flags_severity_above_the_rule_default() -> None:
+    """严重程度**高于**规则默认值 → 记下来（设计 §2.4 只许下调）。
+
+    EH-G-03（错误不许被静默丢掉）的默认值是 high，这条评论填了它又判 medium
+    —— 那是**下调**，允许；反过来（拿一条默认 low 的规则判 high）才是上调。
+    """
+    down = verify_group([], [rule_comment(rule_ref="EH-G-03", severity="medium")])
+    assert down.upgraded_rules == (), "下调是允许的"
+
+    rule = default_library().rules["PF-G-02"]
+    assert rule.default_severity == "medium"
+    up = verify_group([], [rule_comment(rule_ref="PF-G-02", severity="high")])
+    assert up.upgraded_rules == ("PF-G-02",)
+
+
+def test_verify_reads_the_structured_finding_ref_too() -> None:
+    """静态编号认**两种**写法：结构化字段与正文里的 `[S-01]`。
+
+    只认一种就会漏：实测模型把一条静态发现写在正文里（「S-01 的 G404 在这里
+    不成立」），而后置校验据此说「S-01 没有被任何评论引用」—— 报告自相矛盾。
+    """
+    findings = [make_finding("S-01")]
+
+    by_field = verify_group(findings, [rule_comment(finding_ref="S-01")])
+    assert by_field.referenced == ("S-01",)
+    assert by_field.unhandled_count == 0
+
+    by_text = verify_group(findings, [make_comment("[S-01] 成立")])
+    assert by_text.referenced == ("S-01",)
+
+
+def test_verify_normalizes_a_loosely_written_finding_ref() -> None:
+    """字段里写成 `s-1` 也认 —— 大小写与补零不是校验要抓的东西。"""
+    verdict = verify_group([make_finding("S-01")], [rule_comment(finding_ref="s-1")])
+
+    assert verdict.referenced == ("S-01",)
+    assert verdict.invalid == ()

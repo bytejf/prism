@@ -34,6 +34,7 @@ def build_report(
     comments: list[Comment],
     misses: list[PotentialMiss],
     static_gaps: list[StaticFinding],
+    invalid_rule_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     """把一次审查的产出组装成 JSON 可序列化的字典。
 
@@ -51,6 +52,7 @@ def build_report(
         comments: 保留的评论（含未定位的）
         misses: 疑似漏报信号
         static_gaps: 没被引用的高优先级静态发现
+        invalid_rule_refs: 评论里引用了、但规则库里没有的规则代号
 
     Returns:
         可直接 `json.dump` 的字典
@@ -84,6 +86,7 @@ def build_report(
             {"hunk_id": item.hunk_id, "path": item.path, "description": item.description}
             for item in misses
         ],
+        "invalid_rule_refs": list(invalid_rule_refs or ()),
         "static_gaps": [
             {
                 "finding_id": item.finding_id,
@@ -133,6 +136,10 @@ def _comment(item: Comment) -> dict[str, Any]:
         "end_line": item.end_line,
         "locate_reason": item.locate_reason,
         "suggestion_code": item.suggestion_code,
+        # 两个引用字段**分开**出现，不要合并成一个字符串：消费方（评测、
+        # 面板）要能分别按规则 / 静态发现统计
+        "rule_ref": item.rule_ref,
+        "finding_ref": item.finding_ref,
     }
 
 

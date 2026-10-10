@@ -28,6 +28,8 @@ def make_comment(
     locate_level: str = LOCATE_HUNK,
     side: str | None = SIDE_RIGHT,
     locate_reason: str | None = None,
+    rule_ref: str | None = None,
+    finding_ref: str | None = None,
 ) -> Comment:
     """构造测试用 Comment。
 
@@ -42,6 +44,8 @@ def make_comment(
         locate_level: 定位层级
         side: 行号属于哪一侧
         locate_reason: 未定位原因
+        rule_ref: 依据的规则代号
+        finding_ref: 依据的静态发现编号
 
     Returns:
         Comment 对象
@@ -57,6 +61,8 @@ def make_comment(
         side=side,
         locate_reason=locate_reason,
         suggestion_code=suggestion_code,
+        rule_ref=rule_ref,
+        finding_ref=finding_ref,
         start_line=start_line,
         end_line=end_line,
     )
@@ -427,3 +433,47 @@ def test_no_skipped_note_when_all_groups_ran() -> None:
     output = TerminalRenderer().render([make_comment()], make_stats())
 
     assert "未审" not in output
+
+
+# ---------- 引用（规则代号 / 静态发现编号） ----------
+
+
+def test_render_shows_the_two_references_separately() -> None:
+    """两个引用标在徽章后面，**分开写**：一个是规范、一个是工具线索。"""
+    text = TerminalRenderer().render(
+        [make_comment(rule_ref="EH-G-03", finding_ref="S-01")], make_stats()
+    )
+
+    assert "（规则 EH-G-03、静态 S-01）" in text
+
+
+def test_render_adds_nothing_when_there_is_no_reference() -> None:
+    """没有引用时连括号都不出现 —— 空括号会被读成「有依据但没写出来」。"""
+    text = TerminalRenderer().render([make_comment()], make_stats())
+
+    assert "（规则" not in text
+    assert "（静态" not in text
+
+
+def test_render_shows_references_on_unlocated_comments_too() -> None:
+    """未定位的那一段也是评论，引用照样要标出来。"""
+    text = TerminalRenderer().render(
+        [make_comment(rule_ref="CC-G-01", locate_level=LOCATE_FAILED, side=None)],
+        make_stats(),
+    )
+
+    assert "（规则 CC-G-01）" in text
+
+
+def test_render_lists_invalid_rule_references() -> None:
+    """引用了一个不存在的规则代号 → 单独一段提示人工确认。
+
+    引用是模型自己填的字段，**在界面里和真的一模一样** —— 不点出来的话，
+    读的人会以为那条评论背后真有一条规范撑着。
+    """
+    text = TerminalRenderer().render(
+        [make_comment(rule_ref="EH-G-99")], make_stats(), (), (), ["EH-G-99"]
+    )
+
+    assert "无效规则引用" in text
+    assert "EH-G-99" in text

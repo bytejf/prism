@@ -1,12 +1,12 @@
 ---
-rule_id: G-05
+rule_id: CC-G-01
 theme: concurrency
 default_severity: high
 keywords: [go, goroutine, ctx, close]
 source: google
 ---
 
-# G-05：goroutine 必须有退出路径
+# CC-G-01：goroutine 必须有退出路径
 
 **默认严重程度**：high
 

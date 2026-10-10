@@ -37,7 +37,7 @@ from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
 from prism.core.tools.file_read_diff import file_read_diff
 from prism.core.tools.paths import check_relative_path
-from prism.core.tools.report_hunks import CommentArg, report_hunks
+from prism.core.tools.report_hunks import CommentArg, _to_comment, report_hunks
 from prism.models.cost import UsageTotals
 from prism.observability.llm_trace import _describe_tool
 
@@ -55,9 +55,7 @@ def test_tools_keep_runtime_injectable() -> None:
     runtime（也正因此它是纯函数）。**这里反过来也钉一下** —— 数出来必须是 5，
     哪天有人顺手给所有工具加 runtime，这条会提醒他「哪些真的需要」。
     """
-    with_runtime = [
-        item for item in build_tools() if "runtime" in _input_fields(item)
-    ]
+    with_runtime = [item for item in build_tools() if "runtime" in _input_fields(item)]
     assert len(with_runtime) == 5, "吃 runtime 的应该正好是那五个审查工具"
     for item in with_runtime:
         # get_input_schema 的返回类型是 pydantic v1/v2 模型的联合，框架没写窄
@@ -1234,3 +1232,68 @@ def test_file_read_diff_has_nothing_to_escape() -> None:
 
     for path in ("../../etc/passwd", "/etc/passwd", "a\x00b"):
         assert "未找到" in tool.text({"path": path})
+
+
+def test_comment_fields_expose_the_two_reference_slots() -> None:
+    """评论的两个引用字段（规则代号 / 静态发现编号）在 schema 里**分开**露面，且都有说明。
+
+    它们来源不同（一条是规范、一条是工具线索），可信度也不同 —— 合成一个字段
+    就再也分不出来了。**说明必须写全**：模型不看代码，只看这些 description。
+
+    引用字段在**嵌套**的 `reports[].comments[]` 里，通用那几条用例扫不到，
+    所以这里单独看一眼。
+    """
+    reports = _nested(convert_to_openai_tool(report_hunks)["function"]["parameters"], "reports")
+    comments = _nested(reports, "comments")
+    assert {"rule_ref", "finding_ref"} <= set(comments["properties"])
+    for name in ("rule_ref", "finding_ref"):
+        assert comments["properties"][name]["description"], name
+    assert "规则" in comments["properties"]["rule_ref"]["description"]
+    assert "S-01" in comments["properties"]["finding_ref"]["description"]
+
+
+def _nested(schema: dict[str, Any], name: str) -> dict[str, Any]:
+    """取嵌套数组字段的元素 schema。
+
+    Args:
+        schema: 父级 schema
+        name: 字段名
+
+    Returns:
+        元素的 properties 所在的那一层 schema
+    """
+    return cast(dict[str, Any], schema["properties"][name]["items"])
+
+
+def test_reported_references_reach_the_comment_model() -> None:
+    """模型填的两个引用要原样传到 `CommentInput` 上（别在转换里丢掉）。"""
+    input_comment = _to_comment(
+        CommentArg(
+            severity="high",
+            category="边界条件",
+            content="空值没判",
+            existing_code="+if x",
+            rule_ref="EH-G-03",
+            finding_ref="S-01",
+        )
+    )
+
+    assert input_comment.rule_ref == "EH-G-03"
+    assert input_comment.finding_ref == "S-01"
+
+
+def test_blank_references_become_none() -> None:
+    """空字符串 / 只有空白 → None：不然「填了但什么都没填」会被当成引用了某条规则。"""
+    input_comment = _to_comment(
+        CommentArg(
+            severity="low",
+            category="其他",
+            content="x",
+            existing_code="+a",
+            rule_ref="   ",
+            finding_ref="",
+        )
+    )
+
+    assert input_comment.rule_ref is None
+    assert input_comment.finding_ref is None

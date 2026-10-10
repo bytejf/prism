@@ -1,12 +1,12 @@
 ---
-rule_id: G-22
+rule_id: SC-G-01
 theme: security
 default_severity: high
 keywords: [log, token, password, secret, header]
 source: google
 ---
 
-# G-22：敏感信息不许进日志、错误消息与响应
+# SC-G-01：敏感信息不许进日志、错误消息与响应
 
 **默认严重程度**：high
 

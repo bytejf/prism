@@ -46,6 +46,9 @@ class Comment:
             没有位置就没有侧可言。它与 locate_level 是正交的两个维度
         locate_reason: 未定位原因，仅 locate_level 为 failed 时非空
         suggestion_code: 建议的修改（可选）
+        rule_ref: 依据的规则代号（可选）。**模型填的，不是我们推的** ——
+            后置校验会核对它存不存在（见 `core/static/verify.py`）
+        finding_ref: 依据的静态发现编号（可选），如 `S-01`
         start_line: 起始行号，按 ``side`` 解释；未定位为 0
         end_line: 结束行号，按 ``side`` 解释；未定位为 0
     """
@@ -60,6 +63,8 @@ class Comment:
     side: str | None = None
     locate_reason: str | None = None
     suggestion_code: str | None = None
+    rule_ref: str | None = None
+    finding_ref: str | None = None
     start_line: int = 0
     end_line: int = 0
 

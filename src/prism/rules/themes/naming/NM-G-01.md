@@ -1,12 +1,12 @@
 ---
-rule_id: G-10
+rule_id: NM-G-01
 theme: naming
 default_severity: low
 keywords: [Url, Id, Http, URL, ID]
 source: google
 ---
 
-# G-10：缩略词大小写要一致
+# NM-G-01：缩略词大小写要一致
 
 **默认严重程度**：low
 

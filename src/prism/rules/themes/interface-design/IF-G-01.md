@@ -1,12 +1,12 @@
 ---
-rule_id: G-18
+rule_id: IF-G-01
 theme: interface-design
 default_severity: medium
 keywords: [interface, 接口]
 source: google
 ---
 
-# G-18：接口定义在使用方，而且要小
+# IF-G-01：接口定义在使用方，而且要小
 
 **默认严重程度**：medium
 
@@ -14,7 +14,7 @@ source: google
 - 接口由**使用方**定义（它只需要自己用得到的那几个方法），不要由实现方定义一个大接口
 - 接口方法越少越好：`io.Reader` 只有一条。使用方依赖的方法越多，实现方越难复用
 - 不要为了「将来能换实现」提前造接口 —— 那是 YAGNI；**第二个实现出现时**再抽
-- 实现方返回具体类型（见 G-19），使用方按需要收窄成接口
+- 实现方返回具体类型（见 IF-G-02），使用方按需要收窄成接口
 
 ## 正例
 ```go

@@ -17,6 +17,8 @@ class CommentInput:
         content: 评论正文
         existing_code: 用于定位的代码片段
         suggestion_code: 建议的修改（可选）
+        rule_ref: 依据的规则代号（可选，如 `EH-G-03`）
+        finding_ref: 依据的静态发现编号（可选，如 `S-01`）
     """
 
     severity: str
@@ -24,3 +26,5 @@ class CommentInput:
     content: str
     existing_code: str
     suggestion_code: str | None = None
+    rule_ref: str | None = None
+    finding_ref: str | None = None

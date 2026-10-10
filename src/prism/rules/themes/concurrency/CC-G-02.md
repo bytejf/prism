@@ -1,12 +1,12 @@
 ---
-rule_id: G-06
+rule_id: CC-G-02
 theme: concurrency
 default_severity: high
 keywords: [chan, close, range]
 source: google
 ---
 
-# G-06：channel 的关闭责任在发送方，且只关一次
+# CC-G-02：channel 的关闭责任在发送方，且只关一次
 
 **默认严重程度**：high
 

@@ -1,12 +1,12 @@
 ---
-rule_id: G-15
+rule_id: CM-G-03
 theme: comments
 default_severity: low
 keywords: [TODO, FIXME, XXX]
 source: google
 ---
 
-# G-15：`TODO` / `FIXME` 要写清是什么情况
+# CM-G-03：`TODO` / `FIXME` 要写清是什么情况
 
 **默认严重程度**：low
 

@@ -1,12 +1,12 @@
 ---
-rule_id: G-21
+rule_id: PF-G-02
 theme: performance
 default_severity: medium
 keywords: ["strings.Builder", concat, "[]byte", string]
 source: google
 ---
 
-# G-21：循环里别反复拼接与转换
+# PF-G-02：循环里别反复拼接与转换
 
 **默认严重程度**：medium
 

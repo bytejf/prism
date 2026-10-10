@@ -1,12 +1,12 @@
 ---
-rule_id: G-19
+rule_id: IF-G-02
 theme: interface-design
 default_severity: low
 keywords: [return, interface, 接口]
 source: google
 ---
 
-# G-19：返回具体类型，接收接口
+# IF-G-02：返回具体类型，接收接口
 
 **默认严重程度**：low
 

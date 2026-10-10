@@ -56,6 +56,12 @@ FAILED_GROUPS_NOTE = "⚠️ 有 {count} 个审查单元异常退出（结果缺
 # 徽章，如 [concurrency · high]
 BADGE_TEMPLATE = "[{category} · {severity}]"
 
+# 引用另外标在徽章后面，**不塞进徽章里**：徽章是「这是什么问题」，引用是
+# 「依据是什么」，两件事。两者都缺时连括号都不出现
+REF_TEMPLATE = "（{items}）"
+RULE_REF_LABEL = "规则 {ref}"
+FINDING_REF_LABEL = "静态 {ref}"
+
 # 未定位聚合段的标题与提示
 UNLOCATED_TITLE = "=== 未定位评论（{count} 条）==="
 UNLOCATED_NOTICE = "⚠️ 以下评论无法确定具体行号，请人工确认："
@@ -73,6 +79,11 @@ MISSES_NOTICE = "⚠️ 反思时发现下面这些改动可能没有被任何�
 STATIC_GAPS_TITLE = "=== 静态发现未处理（{count} 条）==="
 STATIC_GAPS_NOTICE = "⚠️ 以下高优先级静态发现没有被任何评论引用，建议人工核查："
 
+# 无效规则引用段的标题与提示。**要说明后果**：那条评论的「依据」在界面上和真的
+# 一模一样（引用是模型自己填的字段），所以这一句是给人工看的
+INVALID_RULES_TITLE = "=== 无效规则引用（{count} 个代号）==="
+INVALID_RULES_NOTICE = "⚠️ 以下规则代号被评论引用，但规则库里没有 —— 那条评论的依据需要人工确认："
+
 # 未定位原因 → 给人看的一句话。**报的是我们这边查不出匹配的原因**，
 # 不是「模型错了」——空片段和歧义都不一定是模型的锅
 REASON_LABELS: dict[str, str] = {
@@ -88,6 +99,26 @@ UNKNOWN_REASON_LABEL = "未定位"
 SEVERITY_ORDER: tuple[str, ...] = tuple(sorted(SEVERITY_RANK, key=lambda name: SEVERITY_RANK[name]))
 
 
+def ref_note(comment: Comment) -> str:
+    """评论的引用后缀（规则代号 / 静态发现编号），没有引用时是空串。
+
+    **两个引用分开写**，不合并成一个「依据」——它们的来源不同（一条是规范，
+    一条是工具线索），读的人要能分别判断该不该信。
+
+    Args:
+        comment: 评论
+
+    Returns:
+        形如 ``（规则 EH-G-03、静态 S-02）``；两者都没有时返回空串
+    """
+    items = []
+    if comment.rule_ref:
+        items.append(RULE_REF_LABEL.format(ref=comment.rule_ref))
+    if comment.finding_ref:
+        items.append(FINDING_REF_LABEL.format(ref=comment.finding_ref))
+    return REF_TEMPLATE.format(items="、".join(items)) if items else ""
+
+
 class TerminalRenderer:
     """终端渲染器。
 
@@ -101,6 +132,7 @@ class TerminalRenderer:
         stats: ReviewStats,
         misses: Sequence[PotentialMiss] = (),
         static_gaps: Sequence[StaticFinding] = (),
+        invalid_rule_refs: Sequence[str] = (),
     ) -> str:
         """渲染评论列表为终端文本。
 
@@ -110,6 +142,7 @@ class TerminalRenderer:
             misses: 反思阶段的疑似漏报信号（可为空）
             static_gaps: 没被任何评论引用的高优先级静态发现（可为空）。
                 静态分析被跳过或没跑出发现时都是空
+            invalid_rule_refs: 评论里引用了、但规则库里没有的规则代号（可为空）
 
         Returns:
             格式化后的终端文本
@@ -132,6 +165,8 @@ class TerminalRenderer:
             blocks.append(self._render_misses(misses))
         if static_gaps:
             blocks.append(self._render_static_gaps(static_gaps))
+        if invalid_rule_refs:
+            blocks.append(self._render_invalid_rule_refs(invalid_rule_refs))
         blocks.append(self._render_footer(comments))
 
         text = "\n\n".join(blocks)
@@ -189,7 +224,8 @@ class TerminalRenderer:
         return "\n".join(
             (
                 SEPARATOR_TEMPLATE.format(path=comment.path, span=span, note=note),
-                BADGE_TEMPLATE.format(category=comment.category, severity=comment.severity),
+                BADGE_TEMPLATE.format(category=comment.category, severity=comment.severity)
+                + ref_note(comment),
                 comment.content,
             )
         )
@@ -204,7 +240,7 @@ class TerminalRenderer:
         ⚠️ 以下评论无法确定具体行号，请人工确认：
 
         1. path
-           [category · severity]
+           [category · severity]（规则 EH-G-03）
            评论正文
            （原因：...）
 
@@ -221,7 +257,7 @@ class TerminalRenderer:
             lines.extend(
                 (
                     f"{index}. {comment.path}",
-                    f"   {badge}",
+                    f"   {badge}{ref_note(comment)}",
                     f"   {comment.content}",
                     f"   （原因：{reason}）",
                 )
@@ -275,6 +311,20 @@ class TerminalRenderer:
             badge = BADGE_TEMPLATE.format(category=item.linter, severity=item.priority)
             head = f"{index}. {item.finding_id} {item.path}:{item.line} {badge}"
             lines.extend((head, f"   {item.text}"))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_invalid_rule_refs(refs: Sequence[str]) -> str:
+        """渲染无效规则引用段。
+
+        Args:
+            refs: 规则库里没有的规则代号
+
+        Returns:
+            该段文本
+        """
+        lines = [INVALID_RULES_TITLE.format(count=len(refs)), "", INVALID_RULES_NOTICE]
+        lines.extend(f"- {ref}" for ref in refs)
         return "\n".join(lines)
 
     @staticmethod

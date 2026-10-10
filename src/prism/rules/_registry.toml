@@ -29,37 +29,46 @@ order = [
 ]
 
 [themes.error-handling]
+prefix = "EH"
 title = "错误处理"
 summary = "错误要带上上下文、能被判定，并且不允许被静默丢掉。"
 
 [themes.concurrency]
+prefix = "CC"
 title = "并发"
 summary = "goroutine 要有退出路径，共享状态的读写都要持锁。"
 
 [themes.context]
+prefix = "CX"
 title = "Context"
 summary = "ctx 从上层传入、走参数，不存进结构体。"
 
 [themes.naming]
+prefix = "NM"
 title = "命名"
 summary = "名字要符合 Go 惯例，长度与作用域匹配。"
 
 [themes.comments]
+prefix = "CM"
 title = "注释"
 summary = "注释解释为什么，且不能与代码实际行为脱节。"
 
 [themes.testing]
+prefix = "TS"
 title = "测试"
 summary = "测试要能定位失败、能独立跑，覆盖错误路径。"
 
 [themes.interface-design]
+prefix = "IF"
 title = "接口设计"
 summary = "接口定义在使用方、尽量小，返回具体类型。"
 
 [themes.performance]
+prefix = "PF"
 title = "性能"
 summary = "已知规模就预分配，别在热路径里反复分配。"
 
 [themes.security]
+prefix = "SC"
 title = "安全"
 summary = "敏感信息不外泄，随机数与外部输入都要按安全要求处理。"

@@ -1,12 +1,12 @@
 ---
-rule_id: G-14
+rule_id: CM-G-02
 theme: comments
 default_severity: low
 keywords: [comment, why, 注释]
 source: google
 ---
 
-# G-14：注释解释「为什么」，并且不能与代码实际行为脱节
+# CM-G-02：注释解释「为什么」，并且不能与代码实际行为脱节
 
 **默认严重程度**：low
 

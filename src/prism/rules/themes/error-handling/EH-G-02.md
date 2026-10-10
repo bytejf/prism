@@ -1,12 +1,12 @@
 ---
-rule_id: G-02
+rule_id: EH-G-02
 theme: error-handling
 default_severity: high
 keywords: [errors.Is, errors.As, error]
 source: google
 ---
 
-# G-02：判定错误用 `errors.Is` / `errors.As`，不要比字符串或 `==`
+# EH-G-02：判定错误用 `errors.Is` / `errors.As`，不要比字符串或 `==`
 
 **默认严重程度**：high
 

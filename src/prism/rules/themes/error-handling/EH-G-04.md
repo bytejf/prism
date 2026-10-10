@@ -1,12 +1,12 @@
 ---
-rule_id: G-04
+rule_id: EH-G-04
 theme: error-handling
 default_severity: medium
 keywords: [panic, recover, Must]
 source: google
 ---
 
-# G-04：`panic` 只用于不可恢复的错误
+# EH-G-04：`panic` 只用于不可恢复的错误
 
 **默认严重程度**：medium
 

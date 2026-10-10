@@ -1,12 +1,12 @@
 ---
-rule_id: G-09
+rule_id: CX-G-02
 theme: context
 default_severity: medium
 keywords: [ctx, context, struct]
 source: google
 ---
 
-# G-09：不要把 `ctx` 存进结构体
+# CX-G-02：不要把 `ctx` 存进结构体
 
 **默认严重程度**：medium
 

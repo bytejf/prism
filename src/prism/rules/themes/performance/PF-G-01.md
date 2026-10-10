@@ -1,12 +1,12 @@
 ---
-rule_id: G-20
+rule_id: PF-G-01
 theme: performance
 default_severity: low
 keywords: [make, append, cap]
 source: google
 ---
 
-# G-20：已知规模就预分配
+# PF-G-01：已知规模就预分配
 
 **默认严重程度**：low
 

@@ -1,12 +1,12 @@
 ---
-rule_id: G-01
+rule_id: EH-G-01
 theme: error-handling
 default_severity: medium
 keywords: [error, "%w", fmt.Errorf]
 source: google
 ---
 
-# G-01：错误要带上上下文，并且用 `%w` 包装
+# EH-G-01：错误要带上上下文，并且用 `%w` 包装
 
 **默认严重程度**：medium
 

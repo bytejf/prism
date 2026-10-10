@@ -50,5 +50,5 @@ def load_rules(rule_ids: list[str]) -> str:
     library = default_library()
     logger.info("load_rules：%s", ", ".join(rule_ids) or "（空）")
     if not rule_ids:
-        return "错误：没有给规则代号。请从「代码审查规则索引」里选，如 [\"G-01\"]。"
+        return '错误：没有给规则代号。请从「代码审查规则索引」里选，如 ["EH-G-03"]。'
     return library.render(list(rule_ids))

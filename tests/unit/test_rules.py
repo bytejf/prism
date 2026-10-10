@@ -21,8 +21,11 @@ from prism.core.rules.library import (
 from prism.core.tools.load_rules import load_rules
 from prism.models.rules import OVERRIDDEN_SUFFIX
 
-# 索引里出现的规则代号（`G-01` / `C-03` 这种形态）
-RULE_CODE = re.compile(r"\b[CG]-\d{2}\b")
+# 索引里出现的规则代号（`EH-G-01` / `CX-C-05` 这种形态：主题前缀 + 来源 + 组内序号）
+RULE_CODE = re.compile(r"\b[A-Z]{2}-[CG]-\d{2}\b")
+
+
+PREFIX_BY_THEME = {"error-handling": "EH", "concurrency": "CC", "context": "CX", "naming": "NM"}
 
 
 def make_library(tmp_path: Path, *, rules: dict[str, str], index: str) -> Path:
@@ -30,7 +33,7 @@ def make_library(tmp_path: Path, *, rules: dict[str, str], index: str) -> Path:
 
     Args:
         tmp_path: 临时目录
-        rules: 相对路径 → 规则文件内容（如 `{"error-handling/G-01.md": "..."}`）
+        rules: 相对路径 → 规则文件内容（如 `{"error-handling/EH-G-01.md": "..."}`）
         index: 索引文件内容
 
     Returns:
@@ -42,7 +45,11 @@ def make_library(tmp_path: Path, *, rules: dict[str, str], index: str) -> Path:
     registry = "\n".join(
         [
             f"order = [{', '.join(f'"{name}"' for name in themes)}]",
-            *[f'[themes."{name}"]\ntitle = "{name}"\nsummary = "说明"' for name in themes],
+            *[
+                f'[themes."{name}"]\nprefix = "{PREFIX_BY_THEME.get(name, name[:2].upper())}"'
+                f'\ntitle = "{name}"\nsummary = "说明"'
+                for name in themes
+            ],
         ]
     )
     (tmp_path / "_registry.toml").write_text(registry + "\n", encoding="utf-8")
@@ -54,7 +61,7 @@ def make_library(tmp_path: Path, *, rules: dict[str, str], index: str) -> Path:
 
 
 def rule_text(
-    rule_id: str = "G-01",
+    rule_id: str = "EH-G-01",
     *,
     theme: str = "error-handling",
     severity: str = "medium",
@@ -89,11 +96,15 @@ def _private(content: str) -> str:
     return content.replace("source: google", "source: company")
 
 
-INDEX = "# 索引\n\n## 错误处理\n说明\n\n| 代码特征 | 规则代号 |\n|---|---|\n| 忽略 err | G-01 |\n"
-INDEX_PRIVATE = (
-    "# 索引\n\n## 错误处理\n说明\n\n| 代码特征 | 规则代号 |\n|---|---|\n| 忽略 err | C-01 |\n"
+INDEX = (
+    "# 索引\n\n## 错误处理\n说明\n\n| 代码特征 | 规则代号 |\n|---|---|\n| 忽略 err | EH-G-01 |\n"
 )
-INDEX_CONTEXT = "# 索引\n\n## Context\n说明\n\n| 代码特征 | 规则代号 |\n|---|---|\n| ctx | G-08 |\n"
+INDEX_PRIVATE = (
+    "# 索引\n\n## 错误处理\n说明\n\n| 代码特征 | 规则代号 |\n|---|---|\n| 忽略 err | EH-C-01 |\n"
+)
+INDEX_CONTEXT = (
+    "# 索引\n\n## Context\n说明\n\n| 代码特征 | 规则代号 |\n|---|---|\n| ctx | CX-G-01 |\n"
+)
 
 
 # ---------- 随包发布的规则库 ----------
@@ -178,9 +189,9 @@ def test_frontmatter_rejects_unknown_fields_and_bad_values(tmp_path: Path) -> No
     """
     for index, (name, content, message) in enumerate(
         [
-            ("error-handling/G-01.md", rule_text(extra="unknown_key: 1\n"), "未知字段"),
-            ("error-handling/G-01.md", rule_text(severity="critical"), "default_severity"),
-            ("error-handling/G-02.md", rule_text("G-02", theme="naming"), "不一致"),
+            ("error-handling/EH-G-01.md", rule_text(extra="unknown_key: 1\n"), "未知字段"),
+            ("error-handling/EH-G-01.md", rule_text(severity="critical"), "default_severity"),
+            ("naming/NM-G-01.md", rule_text("NM-G-01", theme="error-handling"), "不一致"),
             ("error-handling/G-03.md", "没有 frontmatter\n", "必须"),
             ("error-handling/G-04.md", "---\nrule_id: G-04\n", "没有闭合"),
         ]
@@ -192,11 +203,11 @@ def test_frontmatter_rejects_unknown_fields_and_bad_values(tmp_path: Path) -> No
 
 def test_missing_theme_directory_is_reported(tmp_path: Path) -> None:
     """注册表里写了主题、磁盘上没有目录 → 报错（不是当成「这个主题没规则」）。"""
-    root = make_library(tmp_path, rules={"error-handling/G-01.md": rule_text()}, index=INDEX)
+    root = make_library(tmp_path, rules={"error-handling/EH-G-01.md": rule_text()}, index=INDEX)
     (root / "_registry.toml").write_text(
         'order = ["error-handling", "concurrency"]\n'
-        '[themes.error-handling]\ntitle = "错误处理"\nsummary = "x"\n'
-        '[themes.concurrency]\ntitle = "并发"\nsummary = "x"\n',
+        '[themes.error-handling]\nprefix = "EH"\ntitle = "错误处理"\nsummary = "x"\n'
+        '[themes.concurrency]\nprefix = "CC"\ntitle = "并发"\nsummary = "x"\n',
         encoding="utf-8",
     )
     with pytest.raises(RulesError, match="主题目录不存在"):
@@ -204,12 +215,19 @@ def test_missing_theme_directory_is_reported(tmp_path: Path) -> None:
 
 
 def test_duplicate_rule_id_is_reported(tmp_path: Path) -> None:
-    """两条规则用同一个代号 → 报错（后一条会静默盖掉前一条）。"""
+    """两条规则用同一个代号 → 报错（后一条会静默盖掉前一条）。
+
+    **要造出这个形态得靠一个名字不规范的文件**：代号自带主题前缀之后，跨主题
+    撞号已经不可能（前缀就不同），同主题同序号只可能来自「文件名没跟着改」
+    —— 比如有人复制了一份改名时漏了，于是 `EH-G-01-old.md` 里还写着 `EH-G-01`。
+    这正是这条校验要挡的现场：不报的话，前一条规则会被后一条**静默替代**，
+    而加载日志里看不出任何异常。
+    """
     root = make_library(
         tmp_path,
         rules={
-            "error-handling/G-01.md": rule_text(),
-            "concurrency/G-01.md": rule_text(theme="concurrency"),
+            "error-handling/EH-G-01.md": rule_text(),
+            "error-handling/EH-G-01-old.md": rule_text(),
         },
         index=INDEX,
     )
@@ -227,17 +245,17 @@ def test_fully_overridden_rule_drops_out_of_the_index_and_points_elsewhere(
     root = make_library(
         tmp_path,
         rules={
-            "error-handling/G-01.overridden.md": rule_text(extra="overridden_by: C-01\n"),
-            "error-handling/C-01.md": _private(rule_text("C-01")),
+            "error-handling/EH-G-01.overridden.md": rule_text(extra="overridden_by: EH-C-01\n"),
+            "error-handling/EH-C-01.md": _private(rule_text("EH-C-01")),
         },
         index=INDEX_PRIVATE,
     )
     library = load_library(root)
 
-    assert library.rules["G-01"].fully_overridden
-    assert "G-01" not in {item.rule_id for item in library.active()}
-    text = library.render(["G-01"])
-    assert "已被 C-01 完全覆盖" in text
+    assert library.rules["EH-G-01"].fully_overridden
+    assert "EH-G-01" not in {item.rule_id for item in library.active()}
+    text = library.render(["EH-G-01"])
+    assert "已被 EH-C-01 完全覆盖" in text
     assert "不再生效" in text
 
 
@@ -246,20 +264,22 @@ def test_partially_overridden_rule_returns_both_sides(tmp_path: Path) -> None:
     root = make_library(
         tmp_path,
         rules={
-            "context/G-08.md": rule_text(
-                "G-08", theme="context", extra='overridden_by: C-05\nremaining_parts: ["值传递"]\n'
+            "context/CX-G-01.md": rule_text(
+                "CX-G-01",
+                theme="context",
+                extra='overridden_by: CX-C-05\nremaining_parts: ["值传递"]\n',
             ),
-            "context/C-05.md": _private(rule_text("C-05", theme="context")),
+            "context/CX-C-05.md": _private(rule_text("CX-C-05", theme="context")),
         },
         index=INDEX_CONTEXT,
     )
     library = load_library(root)
 
-    assert not library.rules["G-08"].fully_overridden
-    text = library.render(["G-08"])
+    assert not library.rules["CX-G-01"].fully_overridden
+    text = library.render(["CX-G-01"])
     assert "部分覆盖" in text
     assert "值传递" in text, "仍然有效的部分要说出来"
-    assert "# C-05" in text, "覆盖者也一并发给模型"
+    assert "# CX-C-05" in text, "覆盖者也一并发给模型"
 
 
 def test_override_declaration_must_match_the_filename(tmp_path: Path) -> None:
@@ -269,11 +289,11 @@ def test_override_declaration_must_match_the_filename(tmp_path: Path) -> None:
     """
     root = make_library(
         tmp_path,
-        rules={"error-handling/G-01.md": rule_text()},
+        rules={"error-handling/EH-G-01.md": rule_text()},
         index=INDEX,
     )
-    (root / THEMES_DIR / "error-handling" / "G-01.md").rename(
-        root / THEMES_DIR / "error-handling" / f"G-01{OVERRIDDEN_SUFFIX}.md"
+    (root / THEMES_DIR / "error-handling" / "EH-G-01.md").rename(
+        root / THEMES_DIR / "error-handling" / f"EH-G-01{OVERRIDDEN_SUFFIX}.md"
     )
     with pytest.raises(RulesError, match="对不上"):
         load_library(root)
@@ -284,8 +304,10 @@ def test_only_private_rules_may_cover_public_ones(tmp_path: Path) -> None:
     root = make_library(
         tmp_path,
         rules={
-            "error-handling/G-01.md": rule_text(),
-            "error-handling/G-02.overridden.md": rule_text("G-02", extra="overridden_by: G-01\n"),
+            "error-handling/EH-G-01.md": rule_text(),
+            "error-handling/EH-G-02.overridden.md": rule_text(
+                "EH-G-02", extra="overridden_by: EH-G-01\n"
+            ),
         },
         index=INDEX,
     )
@@ -298,7 +320,7 @@ def test_override_target_must_exist(tmp_path: Path) -> None:
     root = make_library(
         tmp_path,
         rules={
-            "error-handling/G-01.overridden.md": rule_text(extra="overridden_by: C-99\n"),
+            "error-handling/EH-G-01.overridden.md": rule_text(extra="overridden_by: EH-C-99\n"),
         },
         index=INDEX,
     )
@@ -334,9 +356,9 @@ def test_system_carries_the_whole_index_and_the_load_hint() -> None:
 
 def test_load_rules_returns_the_rule_body() -> None:
     """工具返回规则正文（模型看到的就是规则文件里的那段）。"""
-    text = load_rules.invoke({"rule_ids": ["G-01"]})
+    text = load_rules.invoke({"rule_ids": ["EH-G-01"]})
 
-    assert "# G-01" in text
+    assert "# EH-G-01" in text
     assert "正例" in text and "反例" in text and "边界情况" in text
     assert "**默认严重程度**：medium" in text
 
@@ -347,18 +369,19 @@ def test_load_rules_rejects_more_than_five_at_once() -> None:
     截断会让模型以为自己看到了全部，而它恰恰是因为「命中太多」才需要被拦一下：
     一次要 6 条以上，说明这一处涉及的主题太杂，该先挑最对得上的那几条。
     """
-    text = load_rules.invoke({"rule_ids": [f"G-{index:02d}" for index in range(1, 7)]})
+    six = ["EH-G-01", "EH-G-02", "CC-G-01", "CX-G-01", "CM-G-01", "TS-G-01"]
+    text = load_rules.invoke({"rule_ids": six})
 
     assert "最多加载 5 条" in text
-    assert "# G-01" not in text, "拒绝就是整次不执行，不能给一半"
+    assert "# EH-G-01" not in text, "拒绝就是整次不执行，不能给一半"
 
 
 def test_load_rules_reports_unknown_ids_without_losing_the_valid_ones() -> None:
     """未知代号单独点出来，认得的那几条照常返回（部分成功好过整份失败）。"""
-    text = load_rules.invoke({"rule_ids": ["G-01", "G-99"]})
+    text = load_rules.invoke({"rule_ids": ["EH-G-01", "EH-G-99"]})
 
-    assert "# G-01" in text
-    assert "未找到规则：G-99" in text
+    assert "# EH-G-01" in text
+    assert "未找到规则：EH-G-99" in text
     assert "索引" in text, "要告诉它去哪儿找对的代号"
 
 

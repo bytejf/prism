@@ -1,12 +1,12 @@
 ---
-rule_id: G-07
+rule_id: CC-G-03
 theme: concurrency
 default_severity: high
 keywords: [sync.Mutex, RWMutex, Lock, race]
 source: google
 ---
 
-# G-07：共享状态的读也要持锁，锁要成对且同一把
+# CC-G-03：共享状态的读也要持锁，锁要成对且同一把
 
 **默认严重程度**：high
 

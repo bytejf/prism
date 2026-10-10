@@ -1,12 +1,12 @@
 ---
-rule_id: G-03
+rule_id: EH-G-03
 theme: error-handling
 default_severity: high
 keywords: [err, error, log, "_"]
 source: google
 ---
 
-# G-03：错误不许被静默丢掉
+# EH-G-03：错误不许被静默丢掉
 
 **默认严重程度**：high
 

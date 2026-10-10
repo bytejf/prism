@@ -332,6 +332,8 @@ def locate_group(group: Group, hunk_comments: dict[str, list[CommentInput]]) -> 
                     side=found.side,
                     locate_reason=found.reason,
                     suggestion_code=raw.suggestion_code,
+                    rule_ref=raw.rule_ref,
+                    finding_ref=raw.finding_ref,
                     start_line=found.start_line,
                     end_line=found.end_line,
                 )

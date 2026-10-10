@@ -1,12 +1,12 @@
 ---
-rule_id: G-23
+rule_id: SC-G-02
 theme: security
 default_severity: high
 keywords: [math/rand, crypto/rand, token, salt]
 source: google
 ---
 
-# G-23：安全用途的随机数必须用 `crypto/rand`
+# SC-G-02：安全用途的随机数必须用 `crypto/rand`
 
 **默认严重程度**：high
 

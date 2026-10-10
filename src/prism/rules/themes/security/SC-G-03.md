@@ -1,12 +1,12 @@
 ---
-rule_id: G-24
+rule_id: SC-G-03
 theme: security
 default_severity: high
 keywords: [exec, filepath, sql, input]
 source: google
 ---
 
-# G-24：外部输入进命令、路径、查询前必须校验
+# SC-G-03：外部输入进命令、路径、查询前必须校验
 
 **默认严重程度**：high
 

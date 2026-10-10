@@ -1,12 +1,12 @@
 ---
-rule_id: G-13
+rule_id: CM-G-01
 theme: comments
 default_severity: low
 keywords: [comment, doc, 注释]
 source: google
 ---
 
-# G-13：导出符号必须有注释，且以符号名开头
+# CM-G-01：导出符号必须有注释，且以符号名开头
 
 **默认严重程度**：low
 

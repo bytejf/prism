@@ -1,19 +1,19 @@
 ---
-rule_id: G-08
+rule_id: CX-G-01
 theme: context
 default_severity: medium
 keywords: [ctx, context, Background, Done]
 source: google
 ---
 
-# G-08：`ctx` 是第一个参数，且从上层传进来
+# CX-G-01：`ctx` 是第一个参数，且从上层传进来
 
 **默认严重程度**：medium
 
 ## 规则
 - 需要 `context.Context` 的函数，`ctx` 放**第一个参数**、名字就叫 `ctx`
 - 深层函数里凭空 `context.Background()` / `TODO()` 会把超时与取消整条链断掉：上层取消不了它
-- `Context` 走参数，不要用全局变量或结构体字段传（见 G-09）
+- `Context` 走参数，不要用全局变量或结构体字段传（见 CX-G-02）
 - 函数拿到 `ctx` 后要真的用它：至少把取消信号往下传，或检查 `ctx.Err()`
 
 ## 正例

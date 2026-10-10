@@ -9,9 +9,17 @@
 
 from dataclasses import dataclass, field
 
-# 两个来源前缀（设计 26 号 §2.5）：C 是私有规范，G 是公共规范，C 覆盖 G。
-PREFIX_PRIVATE = "C-"
-PREFIX_PUBLIC = "G-"
+# 代号形状：`<主题前缀>-<来源>-<组内序号>`，例如 `EH-G-01` / `CC-C-02`。
+#
+# - **主题前缀**（两字母）来自 `_registry.toml` 的 `prefix`，与目录名一一对应
+# - **来源**：`G` 是公共规范（Google 等），`C` 是私有规范 —— **C 覆盖 G**
+# - **组内序号**：每个主题内从 01 起，不复用全局序号 —— 这样加规则永远不用
+#   重排别处的编号（全局序号一改就是一整段错位，见反馈文档 27 号 §九）
+#
+# 判据写在「段」上而不是开头：`EH-C-01` 的私有标记在中间。
+SEGMENT_PRIVATE = "-C-"
+SEGMENT_PUBLIC = "-G-"
+CODE_PATTERN = r"[A-Z]{2}-[CG]-\d{2}"
 
 # 被覆盖的公共规则在磁盘上的后缀（`G-05.overridden.md`），扫描时认它
 OVERRIDDEN_SUFFIX = ".overridden"
@@ -43,6 +51,15 @@ class Rule:
     path: str
     overridden_by: str | None = None
     remaining_parts: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def is_private(self) -> bool:
+        """是否是私有规范（`<主题>-C-xx`）。
+
+        Returns:
+            True 表示来源是私有规范
+        """
+        return SEGMENT_PRIVATE in self.rule_id
 
     @property
     def fully_overridden(self) -> bool:

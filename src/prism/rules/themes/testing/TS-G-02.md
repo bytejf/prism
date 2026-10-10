@@ -1,12 +1,12 @@
 ---
-rule_id: G-17
+rule_id: TS-G-02
 theme: testing
 default_severity: medium
 keywords: [test, t.Parallel, t.Cleanup, global]
 source: google
 ---
 
-# G-17：测试要能独立跑，且不污染全局状态
+# TS-G-02：测试要能独立跑，且不污染全局状态
 
 **默认严重程度**：medium
 

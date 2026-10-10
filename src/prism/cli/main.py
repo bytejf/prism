@@ -459,6 +459,7 @@ class _GroupOutcome:
         comments: 本组保留的评论
         misses: 疑似漏报信号
         gaps: 没被引用的高优先级静态发现
+        invalid_rules: 本组评论里引用了、但规则库里没有的规则代号
         usage: 本组用量（审查循环 + 反思）
         exit_reason: 退出原因
         round_count: 实际轮次
@@ -476,6 +477,7 @@ class _GroupOutcome:
     comments: list[Comment]
     misses: list[PotentialMiss]
     gaps: list[StaticFinding]
+    invalid_rules: list[str]
     usage: UsageTotals
     exit_reason: str
     round_count: int
@@ -507,6 +509,7 @@ class _RunResult:
     comments: list[Comment]
     misses: list[PotentialMiss]
     gaps: list[StaticFinding]
+    invalid_rules: list[str]
     skipped_groups: int
     failed_groups: int
     pending_hunks: int
@@ -564,6 +567,7 @@ def _run_one_group(
         comments=list(outcome.kept),
         misses=list(outcome.misses),
         gaps=list(verdict.unhandled_high),
+        invalid_rules=list(verdict.invalid_rules),
         # 反思的用量也要进总账：组级闸看不到它（那时循环已经结束了），而它每组一次
         usage=add_usage(result.usage, outcome.usage),
         exit_reason=result.exit_reason,
@@ -660,12 +664,14 @@ def _run_groups(
     comments: list[Comment] = []
     misses: list[PotentialMiss] = []
     gaps: list[StaticFinding] = []
+    invalid_rules: list[str] = []
     total = UsageTotals()
     pending_hunks = 0
     for found in outcomes:
         comments.extend(found.comments)
         misses.extend(found.misses)
         gaps.extend(found.gaps)
+        invalid_rules.extend(found.invalid_rules)
         total = add_usage(total, found.usage)
         pending_hunks += found.pending_hunks
     skipped = len(groups) - len(outcomes) - failed
@@ -688,6 +694,7 @@ def _run_groups(
         comments=comments,
         misses=misses,
         gaps=gaps,
+        invalid_rules=sorted(set(invalid_rules)),
         skipped_groups=skipped,
         failed_groups=failed,
         pending_hunks=pending_hunks,
@@ -966,6 +973,7 @@ def _review(
             comments=[],
             misses=[],
             gaps=[],
+            invalid_rules=[],
             skipped_groups=0,
             failed_groups=0,
             pending_hunks=0,
@@ -984,7 +992,11 @@ def _review(
         failed_groups=outcome.failed_groups,
     )
     typer.echo("")
-    typer.echo(TerminalRenderer().render(comments, stats, outcome.misses, outcome.gaps))
+    typer.echo(
+        TerminalRenderer().render(
+            comments, stats, outcome.misses, outcome.gaps, outcome.invalid_rules
+        )
+    )
     typer.echo(f"\n审查完成：{len(comments)} 条评论")
     if json_out is not None:
         write_report(
@@ -999,6 +1011,7 @@ def _review(
                 comments=comments,
                 misses=outcome.misses,
                 static_gaps=outcome.gaps,
+                invalid_rule_refs=outcome.invalid_rules,
             ),
         )
     return stats

@@ -32,7 +32,7 @@ import tomllib
 from functools import lru_cache
 from pathlib import Path
 
-from prism.models.rules import OVERRIDDEN_SUFFIX, PREFIX_PUBLIC, Rule
+from prism.models.rules import OVERRIDDEN_SUFFIX, SEGMENT_PRIVATE, Rule
 
 logger = logging.getLogger(__name__)
 
@@ -144,18 +144,19 @@ def _unquote(raw: str, path: Path, key: str) -> str:
     return value
 
 
-def _read_rule(path: Path, theme: str) -> Rule:
+def _read_rule(path: Path, theme: str, prefix: str) -> Rule:
     """读一条规则文件。
 
     Args:
         path: 规则文件路径
         theme: 它所在主题目录的名字
+        prefix: 该主题的代号前缀（两字母）
 
     Returns:
         规则对象
 
     Raises:
-        RulesError: 字段缺失、类型不符、`theme` 与目录名不一致
+        RulesError: 字段缺失、类型不符、`theme` 与目录名不一致、代号前缀与主题不符
     """
     fields, body = _split_frontmatter(path.read_text(encoding="utf-8"), path)
     missing = REQUIRED_KEYS - fields.keys()
@@ -175,8 +176,13 @@ def _read_rule(path: Path, theme: str) -> Rule:
 
     keywords = fields["keywords"]
     remaining = fields.get("remaining_parts", ())
+    rule_id = str(fields["rule_id"])
+    # **代号前缀必须与主题一致**：不然「EH-G-03 出现在并发目录下」这种事只能靠
+    # 人眼发现，而它会让索引、目录、加载回来的正文三处互相打架
+    if not rule_id.startswith(f"{prefix}-"):
+        raise RulesError(f"{path}: 代号 {rule_id} 的前缀与主题 {theme!r} 不符（应为 {prefix}-…）")
     return Rule(
-        rule_id=str(fields["rule_id"]),
+        rule_id=rule_id,
         theme=declared_theme,
         default_severity=severity,
         keywords=tuple(keywords) if isinstance(keywords, tuple) else (str(keywords),),
@@ -281,14 +287,14 @@ class RuleLibrary:
         return "\n\n".join(parts)
 
 
-def _read_registry(root: Path) -> list[str]:
-    """读主题枚举（顺序也来自它）。
+def _read_registry(root: Path) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """读主题枚举（顺序与代号前缀都来自它）。
 
     Args:
         root: 规则库根目录
 
     Returns:
-        主题名列表
+        (主题名顺序, 主题名 → {title, summary, prefix})
 
     Raises:
         RulesError: 文件缺失或形状不对
@@ -298,10 +304,16 @@ def _read_registry(root: Path) -> list[str]:
         raise RulesError(f"规则库缺少 {REGISTRY_NAME}：{path}")
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     order = list(data.get("order", []))
-    themes = dict(data.get("themes", {}))
+    themes: dict[str, dict[str, str]] = dict(data.get("themes", {}))
     if not order or set(order) != set(themes):
         raise RulesError(f"{path}: order 与 [themes] 的键必须一致（不重不漏）")
-    return order
+    missing = [name for name in order if not themes[name].get("prefix")]
+    if missing:
+        raise RulesError(f"{path}: 这些主题没有 prefix：{', '.join(missing)}")
+    prefixes = [themes[name]["prefix"] for name in order]
+    if len(set(prefixes)) != len(prefixes):
+        raise RulesError(f"{path}: 主题前缀有重复，代号会撞车：{prefixes}")
+    return order, themes
 
 
 def _read_index(root: Path) -> str:
@@ -339,14 +351,15 @@ def load_library(root: Path | None = None) -> RuleLibrary:
         RulesError: 任何一处读不了 —— 见 `RulesError` 的说明
     """
     base = RULES_ROOT if root is None else root
-    themes = _read_registry(base)
+    themes, registry = _read_registry(base)
     rules: dict[str, Rule] = {}
     for theme in themes:
         theme_dir = base / THEMES_DIR / theme
         if not theme_dir.is_dir():
             raise RulesError(f"主题目录不存在：{theme_dir}")
+        prefix = str(registry[theme]["prefix"])
         for path in sorted(theme_dir.glob("*.md")):
-            rule = _read_rule(path, theme)
+            rule = _read_rule(path, theme, prefix)
             if rule.rule_id in rules:
                 raise RulesError(f"规则代号重复：{rule.rule_id}（{path}）")
             rules[rule.rule_id] = rule
@@ -384,8 +397,10 @@ def _check_override_target(rule: Rule, rules: dict[str, Rule]) -> None:
     target = str(rule.overridden_by)
     if target not in rules:
         raise RulesError(f"{rule.path}: 声明的覆盖者 {target} 不存在")
-    if rule.rule_id.startswith(PREFIX_PUBLIC) and not target.startswith("C-"):
-        raise RulesError(f"{rule.path}: 只有私有规则（C-）能覆盖公共规则，{target} 不是私有规则")
+    if SEGMENT_PRIVATE not in rule.rule_id and SEGMENT_PRIVATE not in target:
+        raise RulesError(
+            f"{rule.path}: 只有私有规则（<主题>-C-xx）能覆盖公共规则，{target} 不是私有规则"
+        )
 
 
 @lru_cache(maxsize=1)

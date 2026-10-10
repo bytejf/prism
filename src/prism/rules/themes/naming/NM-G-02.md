@@ -1,12 +1,12 @@
 ---
-rule_id: G-11
+rule_id: NM-G-02
 theme: naming
 default_severity: low
 keywords: [Get, Set, Name]
 source: google
 ---
 
-# G-11：导出的取值方法不要带 `Get` 前缀
+# NM-G-02：导出的取值方法不要带 `Get` 前缀
 
 **默认严重程度**：low
 
