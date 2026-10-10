@@ -54,7 +54,9 @@ PACKAGE_ARROW = " → "
 
 
 def group_by_package(
-    hunks: list[HunkWithSymbol], findings: Sequence[StaticFinding] = ()
+    hunks: list[HunkWithSymbol],
+    findings: Sequence[StaticFinding] = (),
+    description: str = "",
 ) -> list[Group]:
     """把 hunk 按包分组，再按 token 预算装箱。
 
@@ -66,14 +68,16 @@ def group_by_package(
         hunks: 带归属符号的 hunk 列表
         findings: 全量静态发现。**参与预算**：某个 hunk 关联的发现要占额度，
             所以静态发现多的组会更早被切开
+        description: 审查描述（进 system，所以占固定开销）。**必须跟 `review`
+            传同一个值**，否则干跑分组与真审的分组会不一样
 
     Returns:
         Group 列表，按顺序编号；无输入时返回空列表
     """
     ordered = sorted(hunks, key=_hunk_sort_key)
     budget = settings.review.max_group_tokens
-    pieces = _pieces(ordered, findings, budget)
-    groups = _pack(pieces, findings, budget)
+    pieces = _pieces(ordered, findings, budget, description)
+    groups = _pack(pieces, findings, budget, description)
 
     logger.info(
         "分组完成：%d 个包，%d 个 hunk → %d 组（预算 %d token/组）",
@@ -151,7 +155,11 @@ def group_tokens(hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFindi
     )
 
 
-def group_cost(hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFinding]) -> int:
+def group_cost(
+    hunks: Sequence[HunkWithSymbol],
+    findings: Sequence[StaticFinding],
+    description: str = "",
+) -> int:
     """一组的**总**成本：固定开销 + 内容。
 
     **装箱的每一处判断都必须用它**，不要拿 `group_tokens` 单独跟预算比 ——
@@ -161,23 +169,28 @@ def group_cost(hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFinding
     Args:
         hunks: 这一组的 hunk
         findings: 全量静态发现
+        description: 审查描述（进 system，算进固定开销）
 
     Returns:
         估算 token 数
     """
-    return fixed_prompt_tokens() + group_tokens(hunks, findings)
+    return fixed_prompt_tokens(description) + group_tokens(hunks, findings)
 
 
-def fixed_prompt_tokens() -> int:
-    """量一组的固定开销：system 段（角色 + 主任务 + 工作方式 + 硬约束 + 收尾）。
+def fixed_prompt_tokens(description: str = "") -> int:
+    """量一组的固定开销：system 段（角色 + 背景 + 主任务 + 工作方式 + 收尾…）。
 
     它每轮都要重发，所以是**每一轮的地板价** —— 组数越多，这笔钱付得越多。
     通用约束整段搬进 system 之后，这里就只剩一项（原来还要加 user 里的要求块）。
 
+    Args:
+        description: 审查描述。它进 system，所以**必须算进来** ——
+            漏了它，预算账与真实渲染就差了那一截，对账脚本会红
+
     Returns:
         估算 token 数
     """
-    return estimate_tokens(build_system())
+    return estimate_tokens(build_system(description))
 
 
 def _findings_for_files(
@@ -214,7 +227,10 @@ def _probe(hunks: Sequence[HunkWithSymbol]) -> Group:
 
 
 def _pieces(
-    hunks: Sequence[HunkWithSymbol], findings: Sequence[StaticFinding], budget: int
+    hunks: Sequence[HunkWithSymbol],
+    findings: Sequence[StaticFinding],
+    budget: int,
+    description: str = "",
 ) -> list[list[HunkWithSymbol]]:
     """把有序 hunk 切成「不可再切的片」。
 
@@ -225,6 +241,7 @@ def _pieces(
         hunks: 已排序的 hunk
         findings: 全量静态发现
         budget: 单组预算
+        description: 审查描述（进 system，算进固定开销）
 
     Returns:
         片的列表
@@ -235,7 +252,7 @@ def _pieces(
 
     pieces: list[list[HunkWithSymbol]] = []
     for path, items in by_file.items():
-        cost = group_cost(items, findings)
+        cost = group_cost(items, findings, description)
         if cost <= budget:
             pieces.append(items)
             continue
@@ -254,6 +271,7 @@ def _pack(
     pieces: Sequence[Sequence[HunkWithSymbol]],
     findings: Sequence[StaticFinding],
     budget: int,
+    description: str = "",
 ) -> list[Group]:
     """把片按顺序装进组：装不下就封口，下一片开新组。
 
@@ -261,6 +279,7 @@ def _pack(
         pieces: 有序的片
         findings: 全量静态发现（参与预算）
         budget: 单组预算
+        description: 审查描述（进 system，算进固定开销）
 
     Returns:
         组装好的审查单元列表
@@ -269,17 +288,17 @@ def _pack(
     current: list[HunkWithSymbol] = []
     for piece in pieces:
         # 唯一的封口条件：这一片装不下了。包只决定顺序，不决定边界
-        if current and group_cost([*current, *piece], findings) > budget:
+        if current and group_cost([*current, *piece], findings, description) > budget:
             packed.append(current)
             current = []
         current.extend(piece)
-        if group_cost(current, findings) > budget:
+        if group_cost(current, findings, description) > budget:
             # 一片（单文件或单 hunk）自己就超：它单独成组，只提醒不改预算 ——
             # 到这一层已经没有更细的边界，硬拆只会把上下文切碎
             logger.warning(
                 "单组预算 %d 装不下这一片（约 %d token，%d 个 hunk）：它单独成组",
                 budget,
-                group_cost(current, findings),
+                group_cost(current, findings, description),
                 len(current),
             )
     if current:

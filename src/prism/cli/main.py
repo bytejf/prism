@@ -327,6 +327,15 @@ def group(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
     path: RepoPath = None,
+    description: Annotated[
+        str,
+        typer.Option(
+            "--description",
+            help="本次改动的说明（PR 描述 / commit message / 需求背景）。会作为"
+            "「本次改动的背景」写进系统提示词，供「意图与实现的一致性」核验；"
+            "不给就不渲染那一段",
+        ),
+    ] = "",
 ) -> None:
     """按包路径分组并按预算装箱，打印审查单元（静态分析要跑，但不调用 LLM）。
 
@@ -339,7 +348,7 @@ def group(
     mapped = _map_or_exit(root, base, head)
     report = analyze(root, head, sorted({item.file_path for item in mapped}), mapped)
     _echo_static(report)
-    groups = group_by_package(mapped, report.findings)
+    groups = group_by_package(mapped, report.findings, description)
 
     if not groups:
         typer.echo("没有可审查的 hunk")
@@ -349,7 +358,7 @@ def group(
     blocks = []
     for index, item in enumerate(groups, start=1):
         tokens = group_tokens(item.hunks, report.findings)
-        total = tokens + fixed_prompt_tokens()
+        total = tokens + fixed_prompt_tokens(description)
         over = "  ⚠️ 超过预算" if total > budget else ""
         header = (
             f"第 {index} 组：{package_label(item)}"
@@ -512,6 +521,7 @@ def _run_one_group(
     head_rev: str,
     diff_index: Mapping[str, Diff],
     static_report: StaticReport,
+    description: str = "",
 ) -> _GroupOutcome:
     """跑一个审查单元：审查 → 定位 → 反思 → 后置校验。
 
@@ -543,6 +553,7 @@ def _run_one_group(
         settings.compression,
         diff_index,
         injected,
+        description,
     )
     located = locate_group(item, result.hunk_comments)
     outcome = reflect(llm.model, item, located)
@@ -606,6 +617,7 @@ def _run_groups(
     diff_index: Mapping[str, Diff],
     static_report: StaticReport,
     started: float,
+    description: str = "",
 ) -> _RunResult:
     """跑完所有审查单元，每组跑完立刻定位与反思。
 
@@ -843,6 +855,15 @@ def review(
     base: str = typer.Option("main", "--base", help="base 分支 / 版本"),
     head: str = typer.Option("HEAD", "--head", help="head 分支 / 版本"),
     path: RepoPath = None,
+    description: Annotated[
+        str,
+        typer.Option(
+            "--description",
+            help="本次改动的说明（PR 描述 / commit message / 需求背景）。会作为"
+            "「本次改动的背景」写进系统提示词，供「意图与实现的一致性」核验；"
+            "不给就不渲染那一段",
+        ),
+    ] = "",
     trace_attr: Annotated[
         list[str] | None,
         typer.Option(
@@ -872,7 +893,7 @@ def review(
 
     with tracer.start_as_current_span("prism_review") as span:
         set_attributes(span, {sc.PRISM_BASE_REV: base, sc.PRISM_HEAD_REV: head, **extra})
-        stats = _review(base, head, path, json_out)
+        stats = _review(base, head, path, json_out, description)
         set_attributes(
             span,
             {
@@ -884,7 +905,13 @@ def review(
         )
 
 
-def _review(base: str, head: str, path: Path | None, json_out: Path | None = None) -> ReviewStats:
+def _review(
+    base: str,
+    head: str,
+    path: Path | None,
+    json_out: Path | None = None,
+    description: str = "",
+) -> ReviewStats:
     """`prism review` 的主体（根 span 由调用方开）。
 
     Args:
@@ -926,14 +953,14 @@ def _review(base: str, head: str, path: Path | None, json_out: Path | None = Non
     _echo_static(static_report)
 
     typer.echo(f"按包分组…（{len(reviewable)} 个可审查文件）")
-    groups = group_by_package(mapped, static_report.findings)
+    groups = group_by_package(mapped, static_report.findings, description)
 
     if not groups:
         typer.echo("没有可审查的 hunk。")
 
     # 没有分组时不去构造 LLM 客户端：`prism review` 在空 diff 上不该要求密钥
     if groups:
-        outcome = _run_groups(groups, root, head, diff_index, static_report, started)
+        outcome = _run_groups(groups, root, head, diff_index, static_report, started, description)
     else:
         outcome = _RunResult(
             comments=[],

@@ -330,14 +330,19 @@ class Compressor:
     `build_review_agent` 每组造一份。
     """
 
-    def __init__(self, model: BaseChatModel, config: CompressionConfig) -> None:
+    def __init__(
+        self, model: BaseChatModel, config: CompressionConfig, description: str = ""
+    ) -> None:
         """初始化。
 
         Args:
             model: 主模型。摘要用它生成 —— 压缩是信息搬运不是判断，不需要第二个视角
             config: 阈值与容错参数
+            description: 审查描述。摘要时会把它连同 system 段一起交给压缩器 ——
+                不传这一份，摘要就看不到本次改动的背景，可能把相关的上下文压掉
         """
         self._config = config
+        self._description = description
         # 重试交给框架：`with_retry` 默认 3 次、指数退避。
         # 它管的是**瞬态错误**（超时、限流）；格式错误另有一层，见 `_summarize`
         self._model = model.with_retry()
@@ -510,7 +515,7 @@ class Compressor:
             摘要正文；两次都不合格时返回 None
         """
         prompt = tpl.COMPRESSION_USER.format(
-            review_system=build_system(),
+            review_system=build_system(self._description),
             background=background,
             history=render_history(history),
             status=status,

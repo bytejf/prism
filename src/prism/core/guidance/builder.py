@@ -87,26 +87,35 @@ def build_static_block(findings: Sequence[StaticFinding]) -> str:
     return "\n\n" + tpl.STATIC_SECTION.format(rows=rows)
 
 
-def build_system() -> str:
+def build_system(description: str = "") -> str:
     """组装 system 提示词：审查的全部通用约束，**顺序即信息**。
 
-    七段都不随审查单元变化 —— 随组变化的东西全在 user 消息（diff）里。
+    各段都不随审查单元变化 —— 随组变化的东西全在 user 消息（diff）里。
     顺序按「抽象 → 具体」：
 
     1. 角色（我是谁）
-    2. 主任务（**要找什么** —— 维度清单）
-    3. 输入格式（材料长什么样 —— 标签含义；下面几段要用到它的术语）
-    4. 工作方式（怎么读）
-    5. 硬约束（红线：评论只能落在哪、必填哪些字段）
-    6. existing_code 怎么写（输出契约）
-    7. 结束审查（收尾）
+    2. **本次改动的背景**（可选：调用方给了审查描述才有这一段）
+    3. 主任务（**要找什么** —— 维度清单）
+    4. 输入格式（材料长什么样 —— 标签含义；下面几段要用到它的术语）
+    5. 工作方式（怎么读）
+    6. 硬约束（红线：评论只能落在哪、必填哪些字段）
+    7. existing_code 怎么写（输出契约）
+    8. 结束审查（收尾）
+
+    Args:
+        description: 审查描述（PR 描述 / commit message / 需求说明）。
+            **空白串表示没给** —— 那时整段不渲染，system 与没有这个功能时
+            逐字节一致。注意它**必须**跟着走：`fixed_prompt_tokens()` 拿它算
+            固定开销，漏了账就漂。
 
     Returns:
         system 提示词全文
     """
-    return "\n\n".join(
+    sections = [tpl.SYSTEM_ROLE]
+    if description.strip():
+        sections.append(tpl.SYSTEM_DESCRIPTION.format(description=description.strip()))
+    sections.extend(
         (
-            tpl.SYSTEM_ROLE,
             _render_main_task(),
             tpl.SYSTEM_INPUT_FORMAT,
             _render_workflow(),
@@ -115,6 +124,7 @@ def build_system() -> str:
             tpl.FINISH,
         )
     )
+    return "\n\n".join(sections)
 
 
 def _render_main_task() -> str:

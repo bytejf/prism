@@ -96,12 +96,17 @@ def build_tools() -> list[BaseTool]:
 Agent = CompiledStateGraph[ReviewState, ReviewContext, ReviewState, ReviewState]
 
 
-def build_review_agent(model: BaseChatModel, compression: CompressionConfig | None = None) -> Agent:
+def build_review_agent(
+    model: BaseChatModel,
+    compression: CompressionConfig | None = None,
+    description: str = "",
+) -> Agent:
     """组装审查 Agent。
 
     Args:
         model: LangChain ChatModel
         compression: 压缩配置；传 None 表示本组不压缩（测试里常用）
+        description: 审查描述。给定时会多渲染一段「本次改动的背景」进 system
 
     Returns:
         编译好的 agent 图
@@ -116,7 +121,7 @@ def build_review_agent(model: BaseChatModel, compression: CompressionConfig | No
         create_agent(
             model=model,
             tools=build_tools(),
-            system_prompt=build_system(),
+            system_prompt=build_system(description),
             middleware=cast(
                 list[AgentMiddleware[Any, Any, Any]],
                 [
@@ -128,7 +133,9 @@ def build_review_agent(model: BaseChatModel, compression: CompressionConfig | No
                     # 压缩器同理：压缩次数、连续失败数、熔断标记都是每组的，
                     # 共用一个实例会把上一组的熔断带到下一组
                     ReviewProgress(
-                        Compressor(model, compression) if compression is not None else None
+                        Compressor(model, compression, description)
+                        if compression is not None
+                        else None
                     ),
                     review_pacing,
                     # 兜住工具异常 + 给「失败」本身设预算。
@@ -206,6 +213,7 @@ def run_review_agent(
     compression: CompressionConfig | None = None,
     diff_index: Mapping[str, Diff] | None = None,
     static_findings: Sequence[StaticFinding] = (),
+    description: str = "",
 ) -> MainLoopResult:
     """跑一个审查单元的循环。
 
@@ -222,6 +230,8 @@ def run_review_agent(
             不传时该工具只能回「不可用」—— 只有测试会这样传
         static_findings: 注入本组的静态发现。**由调用方先算好**（挑文件 + 按预算
             截断），这里只管渲染 —— 后置校验要用同一批编号，各算一次就会漂
+        description: 审查描述（PR 描述 / commit message / 需求说明）。给定时会
+            多渲染一段「本次改动的背景」进 system
 
     Returns:
         循环产出（退出原因、评论、未审 hunk 等）
@@ -238,7 +248,7 @@ def run_review_agent(
     )
 
     started = time.monotonic()
-    agent = build_review_agent(model, compression or settings.compression)
+    agent = build_review_agent(model, compression or settings.compression, description)
     initial = initial_state(group, static_findings)
     with tracer.start_as_current_span("group_review") as span:
         set_attributes(

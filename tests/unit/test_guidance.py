@@ -486,6 +486,40 @@ def test_workflow_plans_first_and_keeps_reporting_as_an_output_contract() -> Non
     assert "理解没建立起来之前不要报结论" not in text
 
 
+def test_system_carries_review_description_only_when_given() -> None:
+    """审查描述进 system 的第 2 段；**不给时整段不存在**。
+
+    它在 system 而不是 user，依据是本项目自己的判据「不随组变化的东西进 system」
+    —— 描述整次审查都一样，而且它不是材料（材料是 diff 与静态发现），是任务设定。
+    **不给时必须是逐字节一致的**：否则每一局的 system 都多一段空标题，
+    而那个位置正好是缓存前缀。
+    """
+    plain = build_system()
+    # 用**段落标题**判断，不用「本次改动的背景」这四个字 —— 后者也是
+    # 「意图与实现的一致性」那条维度里指向它的说法，会误命中
+    assert "## 本次改动的背景" not in plain
+    assert plain == build_system(""), "空白描述要与不传完全一样"
+    assert plain == build_system("   \n  "), "只有空白的描述也算没给"
+
+    described = build_system("这次改动是为了让 mongo 的日志打对主机名。")
+    assert "## 本次改动的背景" in described
+    assert "这次改动是为了让 mongo 的日志打对主机名。" in described
+    # 顺序：角色 → 背景 → 主任务（先知道这次在审什么，再知道要找什么）
+    assert described.index("你是一名资深 Go 代码审查员") < described.index("## 本次改动的背景")
+    assert described.index("## 本次改动的背景") < described.index("## 你的主任务")
+    # **必须点明它是声称不是事实** —— 它正是「意图与实现的一致性」要核验的对象
+    assert "声称，不是事实" in described
+
+
+def test_review_description_counts_into_the_prompt_budget() -> None:
+    """描述进 system，就**必须**算进固定开销 —— 漏了预算账与真实渲染会差一截。"""
+    from prism.core.grouping.packages import fixed_prompt_tokens
+
+    plain = fixed_prompt_tokens()
+    assert fixed_prompt_tokens("这次改动是为了让 mongo 的日志打对主机名。") > plain
+    assert fixed_prompt_tokens("") == plain
+
+
 def test_requirements_never_mention_the_static_tool() -> None:
     """主任务段与工作方式段**一个字都不提静态工具**。
 
