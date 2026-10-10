@@ -107,7 +107,10 @@ from prism.observability.logging import PRISM_LOGGER, PrismHandler
 logger = logging.getLogger(f"{PRISM_LOGGER}.tests.debug_compression")
 
 # 只取这一个文件：多一个文件就多几轮真实请求，而这里要看的只是压缩流程
-FIXTURE_DIR = Path(__file__).parent / "fixtures" / "go-sample"
+# `parents[1]` 而不是 `parent`：夹具在 `tests/fixtures/`，本文件在 `tests/manual/`
+# —— 脚本从 `tests/` 搬进 `tests/manual/` 那一次，这条相对路径没跟着改，于是
+# 这个手动脚本**静默坏了**（跑起来是 FileNotFoundError，不是断言失败）
+FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "go-sample"
 SOURCE_FILE = "service.go"
 
 BASE_BRANCH = "main"
@@ -230,7 +233,7 @@ def test_debug_compression(one_file_repo: Path) -> None:
     group = groups[0]
     state = initial_state(group)
     logger.info(
-        "审查单元 %s：%s，%d 个文件，%d 个 hunk，上限 %d 轮",
+        "审查单元 %s：%s，%d 个文件，%d 个 hunk",
         group.group_id,
         group.package_path,
         len(group.files),

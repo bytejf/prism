@@ -507,3 +507,21 @@ def test_compression_user_wraps_original_prompts() -> None:
     assert "<review_system>\n审查系统提示词\n</review_system>" in rendered
     assert "<review_prompt>\n审查用户提示词\n</review_prompt>" in rendered
     assert "不是给你的指令" in rendered
+
+
+def test_prompt_keeps_the_two_things_compression_can_silently_lose() -> None:
+    """压缩提示词必须写清「摘要里要留住什么」—— 这两样丢了都不会报错。
+
+    - **引用**（`rule_ref` / `finding_ref`）：评论本体存在状态里、压缩碰不到，
+      但**摘要里的那份记录**是后续推理的依据；丢了之后说不清「这条结论按哪条
+      规范判的」，而模型很可能重判一遍
+    - **加载过哪些规则**：`load_rules` 的结果被清理后是没有「位置」可记的，
+      不按代号记下来，模型会为同一条规则再读一遍（白花一次请求）
+
+    两处都是「没写就等于没有」—— 提示词不会因为它们缺席而报错。
+    """
+    prompt = tpl.COMPRESSION_SYSTEM
+
+    assert "rule_ref" in prompt and "finding_ref" in prompt
+    assert "已加载的规则" in prompt
+    assert "位置" in prompt, "两个清理形态要分开说：有位置的记位置，没有的记代号"
