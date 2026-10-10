@@ -10,8 +10,8 @@ import re
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from prism.core.agent.agent import build_tools
-from prism.core.guidance import templates as tpl
 from prism.core.guidance.builder import build_diff_block, build_static_block, build_system
+from prism.core.guidance.loader import PROMPTS_DIR
 from prism.core.guidance.templates import MAIN_TASK_DIMENSIONS, REFLECTION_SYSTEM, WORKFLOW
 from prism.core.guidance.tokens import estimate_tokens
 from prism.models.ast import HunkWithSymbol, Symbol
@@ -653,7 +653,7 @@ def test_reading_guidance_names_the_measured_failure_mode() -> None:
 WRAP_OK_END = ("。", "！", "？", "：", "；", "，", "、", "——", "`", "）", "」", "】", "**")
 
 # 结构行：这些行的断行是排版，不是「句中硬换行」
-WRAP_STRUCTURAL = re.compile(r"^\s*(#{1,6} |\||[-*] |\d+\. |\*\*[①②③④⑤⑥⑦]|\s{3,}\S)")
+WRAP_STRUCTURAL = re.compile(r"^\s*(#{1,6} |\||[-*] |\d+\. |<|\{|\*\*[①②③④⑤⑥⑦]|\s{3,}\S)")
 
 
 def mid_sentence_breaks(text: str) -> list[tuple[int, str, str]]:
@@ -698,13 +698,13 @@ def test_prompts_break_lines_only_at_punctuation() -> None:
     覆盖四份提示词 + 六个工具的描述与参数说明 —— 它们都是模型每轮都要读的文本，
     排版不一致的话，读起来像不同人写的（而实际就是同一份提示词的不同段落）。
     """
+    # 正文的唯一来源是 `src/prism/prompts/*.md` —— 直接查文件，不查渲染结果：
+    # 渲染会把 `{diff}` / `{comments}` 之类填成内容，那些内容的换行不是提示词的事
     targets = {
-        "system": build_system(),
-        "COMPRESSION_SYSTEM": tpl.COMPRESSION_SYSTEM,
-        "REFLECTION_SYSTEM": tpl.REFLECTION_SYSTEM,
-        # 占位符填空串：只查模板自己的散文，不查被塞进去的 diff / 评论
-        "REFLECTION_USER": tpl.REFLECTION_USER.format(diff="", comments=""),
+        f"prompts/{path.name}": path.read_text(encoding="utf-8")
+        for path in sorted(PROMPTS_DIR.glob("*.md"))
     }
+    targets["system（渲染结果）"] = build_system()
     for tool in build_tools():
         schema = convert_to_openai_tool(tool)["function"]
         targets[f"工具 {tool.name}"] = schema["description"]
