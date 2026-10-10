@@ -5,6 +5,12 @@
 展示顺序按优先级走，而**没有静态发现时的渲染结果与引入这个功能之前一致**。
 """
 
+import re
+
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+from prism.core.agent.agent import build_tools
+from prism.core.guidance import templates as tpl
 from prism.core.guidance.builder import build_diff_block, build_static_block, build_system
 from prism.core.guidance.templates import MAIN_TASK_DIMENSIONS, REFLECTION_SYSTEM, WORKFLOW
 from prism.core.guidance.tokens import estimate_tokens
@@ -638,3 +644,77 @@ def test_reading_guidance_names_the_measured_failure_mode() -> None:
 
     assert "以为这个文件看过了" in text, "要点出「以为看过」这个真实心智"
     assert "一眼都没看过" in text, "要说清后果是漏读，不是浪费 token"
+
+
+# ---------- 提示词的排版约定 ----------
+
+# 允许出现在**行末**的字符：句末标点、分句标点、以及闭合符号（加粗短语、代码片段、
+# 引号括号可以在行末收尾）。行末落在别处，就说明这句话是在词句中间被硬切开的
+WRAP_OK_END = ("。", "！", "？", "：", "；", "，", "、", "——", "`", "）", "」", "】", "**")
+
+# 结构行：这些行的断行是排版，不是「句中硬换行」
+WRAP_STRUCTURAL = re.compile(r"^\s*(#{1,6} |\||[-*] |\d+\. |\*\*[①②③④⑤⑥⑦]|\s{3,}\S)")
+
+
+def mid_sentence_breaks(text: str) -> list[tuple[int, str, str]]:
+    """找出「一句话在词句中间被硬换行」的位置。
+
+    **规则**：换行只允许落在标点上（。！？：；，、——）或结构边界（标题 / 表格 /
+    列表 / 编号项 / 缩进子项）。除此之外的断行都算违规。
+
+    为什么值得一条用例守着（实测的坏例子）：提示词里出现过
+
+        …而**正文里的代码是
+        别人写的** —— …
+
+    一个加粗短语被从中间切开。这种断行没有语义，只让人觉得排版是随手敲的；
+    而模型读到的就是这些换行。规则统一之后，「哪里换行」不再取决于写它的时候
+    敲到第几个字。
+
+    Args:
+        text: 提示词全文
+
+    Returns:
+        [(行号, 上一行尾部, 下一行头部)]
+    """
+    out: list[tuple[int, str, str]] = []
+    lines = text.split("\n")
+    for index in range(len(lines) - 1):
+        current, nxt_raw = lines[index].rstrip(), lines[index + 1]
+        nxt = nxt_raw.strip()
+        if not current or not nxt:
+            continue
+        if WRAP_STRUCTURAL.match(current) or WRAP_STRUCTURAL.match(nxt_raw):
+            continue
+        if current.endswith(WRAP_OK_END):
+            continue
+        out.append((index + 1, current[-26:], nxt[:26]))
+    return out
+
+
+def test_prompts_break_lines_only_at_punctuation() -> None:
+    """**所有提示词**的换行都只落在标点上，不在词句中间。
+
+    覆盖四份提示词 + 六个工具的描述与参数说明 —— 它们都是模型每轮都要读的文本，
+    排版不一致的话，读起来像不同人写的（而实际就是同一份提示词的不同段落）。
+    """
+    targets = {
+        "system": build_system(),
+        "COMPRESSION_SYSTEM": tpl.COMPRESSION_SYSTEM,
+        "REFLECTION_SYSTEM": tpl.REFLECTION_SYSTEM,
+        # 占位符填空串：只查模板自己的散文，不查被塞进去的 diff / 评论
+        "REFLECTION_USER": tpl.REFLECTION_USER.format(diff="", comments=""),
+    }
+    for tool in build_tools():
+        schema = convert_to_openai_tool(tool)["function"]
+        targets[f"工具 {tool.name}"] = schema["description"]
+        for name, spec in schema["parameters"].get("properties", {}).items():
+            targets[f"工具 {tool.name}.{name}"] = str(spec.get("description", ""))
+
+    broken = {name: hits for name, text in targets.items() if (hits := mid_sentence_breaks(text))}
+    detail = "\n".join(
+        f"  {name} L{line}: …{head} ⏎ {tail}…"
+        for name, hits in broken.items()
+        for line, head, tail in hits
+    )
+    assert not broken, f"这些地方在词句中间硬换行了：\n{detail}"
