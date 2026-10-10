@@ -673,9 +673,13 @@ WRAP_UP_MESSAGE = (
     "或 end_done。请立即报告。"
 )
 
-# 走查期间可以被停用的工具 = 三个只读工具。report_hunks / end_done 是**出路**，
-# 任何时候都放行 —— 收尾闸的目的是让它交结论，不是把路堵死
-EXPLORE_TOOLS = frozenset({"file_read", "file_read_diff", "code_search"})
+# 走查期间可以被停用的工具 = 只读工具。report_hunks / end_done 是**出路**，
+# 任何时候都放行 —— 收尾闸的目的是让它交结论，不是把路堵死。
+#
+# `load_rules` 在名单里：它也是「读」（一条 200~500 token），目标一样是「别再读了，
+# 把已有结论交出来」。已经加载过的规则不受影响 —— 清了还能重新加载，而这一闸只在
+# 预算最后 15% 生效
+EXPLORE_TOOLS = frozenset({"file_read", "file_read_diff", "code_search", "load_rules"})
 
 
 @wrap_tool_call

@@ -1,0 +1,65 @@
+# 规则库注册表：**主题枚举**。
+#
+# 什么进这个文件、什么不进，判据与 default.toml 一致（改它会不会改变契约）：
+#
+# - **进**：主题的编号、中文标题、一行说明 —— 索引（`index.md`）按这份清单
+#   分节与排序，所以它是**排序与文案的唯一来源**，别在 index.md 里再写一遍编号
+# - **不进**：每个主题底下有哪些规则。那是**目录内容的函数** ——
+#   `themes/<主题>/*.md` 的文件名就是规则清单，写进注册表就变成第二份会漂的账
+#
+# 主题名 = 目录名 = 规则文件 frontmatter 里的 `theme`（三者必须一致，有用例钉住）。
+# 所以主题里**不带编号**：编号只在本文件出现一次。
+#
+# 选规则时的另一条口径：**优先收静态工具抓不到的**。我们跑的是
+# errcheck / govet / ineffassign / bodyclose / sqlclosecheck / unused
+# （见 `core/static/analyzer.py`），它们已经覆盖了「`_ :=` 忽略 error」
+# 「无效赋值」「未使用符号」「copylocks」这类语法级模式 —— 规则库再收一遍，
+# 只会让同一处被报两遍（设计 26 号 §8.3）。
+
+order = [
+    "error-handling",
+    "concurrency",
+    "context",
+    "naming",
+    "comments",
+    "testing",
+    "interface-design",
+    "performance",
+    "security",
+]
+
+[themes.error-handling]
+title = "错误处理"
+summary = "错误要带上上下文、能被判定，并且不允许被静默丢掉。"
+
+[themes.concurrency]
+title = "并发"
+summary = "goroutine 要有退出路径，共享状态的读写都要持锁。"
+
+[themes.context]
+title = "Context"
+summary = "ctx 从上层传入、走参数，不存进结构体。"
+
+[themes.naming]
+title = "命名"
+summary = "名字要符合 Go 惯例，长度与作用域匹配。"
+
+[themes.comments]
+title = "注释"
+summary = "注释解释为什么，且不能与代码实际行为脱节。"
+
+[themes.testing]
+title = "测试"
+summary = "测试要能定位失败、能独立跑，覆盖错误路径。"
+
+[themes.interface-design]
+title = "接口设计"
+summary = "接口定义在使用方、尽量小，返回具体类型。"
+
+[themes.performance]
+title = "性能"
+summary = "已知规模就预分配，别在热路径里反复分配。"
+
+[themes.security]
+title = "安全"
+summary = "敏感信息不外泄，随机数与外部输入都要按安全要求处理。"

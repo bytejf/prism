@@ -173,6 +173,26 @@ def test_clean_replaces_file_read_diff() -> None:
     assert str(cleaned[2].content) == PLACEHOLDER.format(call="file_read_diff(path='b.go')")
 
 
+def test_clean_replaces_loaded_rules() -> None:
+    """测试：`load_rules` 的返回也换成占位符，且占位符里**带着规则代号**。
+
+    判据与三个读工具完全一样：规则文件是静态的，清了还能重新加载。占位符里带上
+    代号，模型才知道这条规则**已经加载过**、可以按需重取，而不是当成没看过。
+    """
+    history = [
+        HumanMessage(content="指导 + diff", id="m0"),
+        call_message("load_rules", {"rule_ids": ["G-01", "G-03"]}, "c1"),
+        ToolMessage(content="# G-01：错误要带上下文\n……", tool_call_id="c1"),
+    ]
+
+    cleaned = clean_history(history)
+
+    assert str(cleaned[2].content) == PLACEHOLDER.format(
+        call="load_rules(rule_ids=['G-01', 'G-03'])"
+    )
+    assert "G-01" in str(cleaned[2].content), "占位符要说得清原来加载的是哪几条"
+
+
 def test_clean_keeps_end_done_rejection() -> None:
     """测试：end_done 被拒绝的返回必须保留。
 

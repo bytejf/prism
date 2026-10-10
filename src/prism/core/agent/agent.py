@@ -56,6 +56,7 @@ from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
 from prism.core.tools.file_read_diff import file_read_diff
+from prism.core.tools.load_rules import load_rules
 from prism.core.tools.report_hunks import report_hunks
 from prism.models.compression import CompressionConfig
 from prism.models.cost import UsageTotals
@@ -73,15 +74,16 @@ tracer = trace.get_tracer(__name__)
 
 
 def build_tools() -> list[BaseTool]:
-    """构造 5 个审查工具。
+    """构造 6 个审查工具。
 
-    工具通过 `ToolRuntime` 取静态上下文与状态（框架注入，模型看不到该参数），
+    其中 5 个通过 `ToolRuntime` 取静态上下文与状态（框架注入，模型看不到该参数），
     因此不需要按运行时构造 —— 图构建时定一次即可。
+    `load_rules` 是例外：规则库随包发布，与被审查仓库无关，所以它不吃 runtime。
 
     Returns:
         工具列表
     """
-    return [file_read, file_read_diff, code_search, report_hunks, end_done]
+    return [file_read, file_read_diff, code_search, load_rules, report_hunks, end_done]
 
 
 # 交给 `create_agent` 的那个图和它的实际类型不一样，这里手写一份更精确的。

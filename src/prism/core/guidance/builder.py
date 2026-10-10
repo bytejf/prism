@@ -31,6 +31,7 @@ import logging
 from collections.abc import Sequence
 
 from prism.core.guidance import templates as tpl
+from prism.core.rules.library import default_library
 from prism.models.ast import HunkWithSymbol
 from prism.models.grouping import Group
 from prism.models.static import NO_HUNK_MARK, PRIORITY_RANK, StaticFinding
@@ -96,11 +97,12 @@ def build_system(description: str = "") -> str:
     1. 角色（我是谁）
     2. **本次改动的背景**（可选：调用方给了审查描述才有这一段）
     3. 主任务（**要找什么** —— 维度清单）
-    4. 输入格式（材料长什么样 —— 标签含义；下面几段要用到它的术语）
-    5. 工作方式（怎么读）
-    6. 硬约束（红线：评论只能落在哪、必填哪些字段）
-    7. existing_code 怎么写（输出契约）
-    8. 结束审查（收尾）
+    4. 规则索引（更细的规则：代码特征 → 规则代号，正文用 `load_rules` 取）
+    5. 输入格式（材料长什么样 —— 标签含义；下面几段要用到它的术语）
+    6. 工作方式（怎么读）
+    7. 硬约束（红线：评论只能落在哪、必填哪些字段）
+    8. existing_code 怎么写（输出契约）
+    9. 结束审查（收尾）
 
     Args:
         description: 审查描述（PR 描述 / commit message / 需求说明）。
@@ -117,6 +119,7 @@ def build_system(description: str = "") -> str:
     sections.extend(
         (
             _render_main_task(),
+            _render_rules(),
             tpl.SYSTEM_INPUT_FORMAT,
             _render_workflow(),
             tpl.SYSTEM_CONSTRAINTS,
@@ -137,6 +140,18 @@ def _render_main_task() -> str:
         f"{index}. {text}" for index, text in enumerate(tpl.MAIN_TASK_DIMENSIONS, start=1)
     )
     return tpl.MAIN_TASK.format(items=items)
+
+
+def _render_rules() -> str:
+    """渲染规则索引段（L1）。
+
+    索引文本从 `rules/index.md` 读，**进程内缓存一份**（`default_library`）：
+    本函数在分组装箱里会被反复调用（O(k²) 次渲染量成本），不能每次读盘。
+
+    Returns:
+        规则索引段落
+    """
+    return tpl.SYSTEM_RULES.format(rules_index=default_library().index_body)
 
 
 def _render_workflow() -> str:

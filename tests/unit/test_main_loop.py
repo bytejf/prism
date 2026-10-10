@@ -417,10 +417,17 @@ def test_initial_state_builds_user_message_and_round_budget(project_root: str) -
     assert "\n\n\n" not in user_text
 
 
-def test_build_tools_exposes_five_tools() -> None:
-    """测试 5 个工具都构造出来且名字正确。"""
+def test_build_tools_exposes_six_tools() -> None:
+    """测试 6 个工具都构造出来且名字正确。"""
     names = sorted(tool.name for tool in build_tools())
-    assert names == ["code_search", "end_done", "file_read", "file_read_diff", "report_hunks"]
+    assert names == [
+        "code_search",
+        "end_done",
+        "file_read",
+        "file_read_diff",
+        "load_rules",
+        "report_hunks",
+    ]
 
 
 # ---------- review_status ----------
@@ -484,11 +491,11 @@ def test_main_loop_exits_on_end_done(project_root: str) -> None:
 
 
 def test_main_loop_passes_tools_to_llm(project_root: str) -> None:
-    """测试每轮都把 5 个工具传给 LLM。"""
+    """测试每轮都把 6 个工具传给 LLM。"""
     llm = ScriptedChatModel(responses=[report_call(["H-01"]), *zero_comment_exit()])
     run_review_agent(make_group(["H-01"]), llm, project_root)
 
-    assert [len(tools) for tools in llm.tools_seen] == [5, 5, 5]
+    assert [len(tools) for tools in llm.tools_seen] == [6, 6, 6]
 
 
 def test_diff_index_reaches_the_tool(project_root: str) -> None:

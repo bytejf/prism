@@ -45,18 +45,38 @@ CONTEXT_WITHOUT_ROOT = ReviewContext(project_root="")
 
 
 def test_tools_keep_runtime_injectable() -> None:
-    """测试五个工具都还能拿到 `runtime` 注入，且它不出现在模型看到的 schema 里。
+    """测试吃 `runtime` 的五个工具都还能拿到注入，且它不出现在模型看到的 schema 里。
 
     回归用例：**不能改用 `args_schema=`**。显式给了它，框架就不再从函数签名
     推导，`runtime` 会从 `get_input_schema()` 里消失 —— 注入断掉，调用时报
     `TypeError: missing 1 required positional argument: 'runtime'`。
+
+    `load_rules` 不在这一组里：规则库随包发布，与被审查仓库无关，所以它没有
+    runtime（也正因此它是纯函数）。**这里反过来也钉一下** —— 数出来必须是 5，
+    哪天有人顺手给所有工具加 runtime，这条会提醒他「哪些真的需要」。
     """
-    for item in build_tools():
+    with_runtime = [
+        item for item in build_tools() if "runtime" in _input_fields(item)
+    ]
+    assert len(with_runtime) == 5, "吃 runtime 的应该正好是那五个审查工具"
+    for item in with_runtime:
         # get_input_schema 的返回类型是 pydantic v1/v2 模型的联合，框架没写窄
         input_schema = cast(type[BaseModel], item.get_input_schema())
         assert "runtime" in input_schema.model_fields, item.name
         parameters = convert_to_openai_tool(item)["function"]["parameters"]
         assert "runtime" not in parameters.get("properties", {}), item.name
+
+
+def _input_fields(item: BaseTool) -> set[str]:
+    """工具入参 schema 里的字段名。
+
+    Args:
+        item: 工具
+
+    Returns:
+        字段名集合
+    """
+    return set(cast(type[BaseModel], item.get_input_schema()).model_fields)
 
 
 def test_tool_descriptions_are_only_for_the_model() -> None:
