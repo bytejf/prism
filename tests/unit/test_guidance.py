@@ -465,12 +465,19 @@ def test_workflow_plans_first_and_keeps_reporting_as_an_output_contract() -> Non
     # 这条是对的：它是**判断**（别在 import、常量上也查调用方），不是过程步骤
     assert "花多少力气可以不一样" in text
 
-    # 第二遍：四条线索仍在（读全符号 → 查上游调用方 → 看下游影响 → 下结论）
+    # 第二遍：四条线索仍在（算范围再读 → 查上游调用方 → 看下游影响 → 下结论）
     assert "第二遍 · 逐个 hunk 核对" in text
-    assert "读全它归属的符号" in text
+    assert "先算出要读的范围，再读" in text
     assert "往上游查调用方" in text
     assert "往下游看影响" in text
     assert "**④ 下结论**" in text
+
+    # **反「通读」的引导**（按真实日志量出来的形态加的，见下面那条用例）：
+    # 要在两处各说一遍（工作方式 + 硬约束），并带上具体例子
+    assert text.count("不要从第 1 行开始通读") == 1
+    assert text.count("不要从第 1 行通读") == 1
+    assert "start_line=1, end_line=45" in text, "要给出「不该这么读」的具体例子"
+    assert "一个文件里有几个 hunk 就要看到几处" in text
 
     # 交卷节奏是**输出契约**（同一处几条评论），不是过程顺序
     assert "发现几个问题就写几条评论（行号相同也可以）" in text
@@ -612,3 +619,22 @@ def test_budget_account_matches_the_real_prompt() -> None:
             str(initial_state(group, injected)["messages"][0].content)
         )
         assert abs(real - account) <= 2, f"账 {account} vs 真实 {real}（超出取整误差）"
+
+
+def test_reading_guidance_names_the_measured_failure_mode() -> None:
+    """反通读那条引导必须写出**实测到的形态**，而不是泛泛地劝。
+
+    数据（`prism-bench` 里 22 份真实日志、21 个审查单元、392 个不重复 hunk）：
+    只有 **48%** 的 hunk 被至少一次 `file_read` 覆盖到，52% 一次都没被读过；
+    分档看更清楚 —— 1~5 个 hunk 的组覆盖 **92%**、6~20 的 **86%**、
+    **21 个以上的只有 39%**。而 100 次 file_read 里有 **43 次从第 1 行读起**、
+    46 次一次读了 100 行以上。也就是：**从头读一大段 → 以为看过了 → 交卷**，
+    后面那几个 hunk 一眼没看过。
+
+    这条用例只钉「提示词里有没有把这个形态说出来」—— 数值会随日志更新，
+    所以不把百分比写进断言（写进去就会因为重跑基准而变红，那种红没有信息）。
+    """
+    text = build_system()
+
+    assert "以为这个文件看过了" in text, "要点出「以为看过」这个真实心智"
+    assert "一眼都没看过" in text, "要说清后果是漏读，不是浪费 token"

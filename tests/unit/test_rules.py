@@ -254,9 +254,12 @@ def test_fully_overridden_rule_drops_out_of_the_index_and_points_elsewhere(
 
     assert library.rules["EH-G-01"].fully_overridden
     assert "EH-G-01" not in {item.rule_id for item in library.active()}
+    # 问它要一条被取代的规则 → **直接把现行那一条的正文给回去**，不让模型再发
+    # 一次请求（设计 §6.1 写的是「告诉它去加载 X」，那一版要多花一轮）
     text = library.render(["EH-G-01"])
-    assert "已被 EH-C-01 完全覆盖" in text
-    assert "不再生效" in text
+    assert "已被取代，以下是现行规则" in text
+    assert "# EH-C-01" in text, "现行规则的正文要一并发出来"
+    assert "# EH-G-01" not in text, "被取代的那条内容不再生效，不要混进来"
 
 
 def test_partially_overridden_rule_returns_both_sides(tmp_path: Path) -> None:
@@ -396,3 +399,22 @@ def test_load_rules_description_explains_the_cap() -> None:
 
     assert "一次最多 5 条" in description
     assert "代码审查规则索引" in description
+
+
+def test_index_themes_are_demoted_one_level_when_injected() -> None:
+    """索引里的主题标题注进提示词时**降一级**（`## 错误处理` → `### 错误处理`）。
+
+    不降级的话，九个主题会与「## 代码审查规则索引」**同级** —— 读起来像九段并列
+    的内容，而不是「索引里的九个主题」。文件里保留 `##`（它自己的 H1 是
+    `# 代码审查规则索引`，对一份独立文档来说层级是对的）。
+    """
+    library = load_library()
+    system = build_system()
+
+    assert "### 错误处理" in library.index_body
+    assert "\n## 错误处理" not in library.index_body, "注入的正文里不该再有一级标题"
+    assert "\n## 错误处理" not in system
+    assert "### 错误处理" in system, "降级后的标题要真的进到提示词"
+    # 文件自身仍是 `##`（给人读的那份没被动）
+    raw = (RULES_ROOT / "index.md").read_text(encoding="utf-8")
+    assert "\n## 错误处理\n" in raw
