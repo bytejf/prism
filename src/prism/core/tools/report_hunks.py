@@ -42,7 +42,26 @@ class CommentArg(BaseModel):
             "medium=有风险或明显的维护性问题；low=风格与可读性"
         )
     )
-    category: str = Field(description="问题类别，如 并发安全 / 边界条件 / 跨文件一致性 / 可维护性")
+    # 取值 = 主任务里那 7 条**审查维度的原名** + 「其他」。
+    #
+    # **为什么用维度的原名而不是另起一套短标签**：原样复用同一套词，
+    # 漂移就没法发生（`test_comment_categories_match_review_dimensions` 钉住），
+    # 而且模型不用学第二套概念。代价是徽章略长（`[意图与实现的一致性 · medium]`）。
+    #
+    # **「其他」不是退路，是指标**：它用得越多，说明这 7 条维度越不够用 ——
+    # 比如性能问题在这套维度里没有归宿，只能落「其他」。所以它满了就该加维度，
+    # 而不是继续让它兜底。（OCR 的做法相反：另有一套 8 类通用标签
+    # bug/security/performance/maintainability/…，和它的检查清单不是一套词。）
+    category: Literal[
+        "业务逻辑正确性",
+        "跨文件一致性",
+        "意图与实现的一致性",
+        "副作用与隐式契约",
+        "边界条件",
+        "可维护性",
+        "安全",
+        "其他",
+    ] = Field(description="问题类别：选最贴近的那一条审查维度；**都不贴近才用「其他」**")
     content: str = Field(description="评论正文：说清问题、影响与依据。**一条评论只讲一件事**")
     existing_code: str = Field(
         description=(

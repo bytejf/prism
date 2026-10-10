@@ -8,7 +8,7 @@
 import logging
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import pytest
 from langchain_core.tools import BaseTool
@@ -31,12 +31,13 @@ from prism.core.agent.state import (
 )
 from prism.core.diff.loader import build_diff_index
 from prism.core.diff.parser import parse_diff_text
+from prism.core.guidance.templates import MAIN_TASK_DIMENSIONS
 from prism.core.tools.code_search import code_search
 from prism.core.tools.end_done import end_done
 from prism.core.tools.file_read import file_read
 from prism.core.tools.file_read_diff import file_read_diff
 from prism.core.tools.paths import check_relative_path
-from prism.core.tools.report_hunks import report_hunks
+from prism.core.tools.report_hunks import CommentArg, report_hunks
 from prism.models.cost import UsageTotals
 from prism.observability.llm_trace import _describe_tool
 
@@ -808,7 +809,7 @@ def test_report_hunks_records_comments_and_marks_done() -> None:
                     "comments": [
                         {
                             "severity": "high",
-                            "category": "concurrency",
+                            "category": "边界条件",
                             "content": "goroutine 缺少退出路径",
                             "existing_code": "go func() {}()",
                         }
@@ -841,7 +842,11 @@ def test_report_hunks_ignores_unknown_hunk_id() -> None:
 
 
 def test_report_hunks_normalizes_optional_fields() -> None:
-    """测试可选字段留空时转成 None，必填字段去掉首尾空白。"""
+    """测试可选字段留空时转成 None。
+
+    **`category` 不再参与这条**：它是枚举，Pydantic 按字面量精确匹配，
+    带空白的变体在进到工具之前就被拦下（见 `test_report_hunks_rejects_bad_category`）。
+    """
     tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
 
     update = tool.update(
@@ -852,7 +857,7 @@ def test_report_hunks_normalizes_optional_fields() -> None:
                     "comments": [
                         {
                             "severity": "high",
-                            "category": "  x  ",
+                            "category": "边界条件",
                             "content": "y",
                             "existing_code": "z",
                             "suggestion_code": "  ",
@@ -864,7 +869,7 @@ def test_report_hunks_normalizes_optional_fields() -> None:
     )
     saved = update["hunk_status"]["H-01"].comments[0]
     assert saved.severity == "high"
-    assert saved.category == "x"
+    assert saved.category == "边界条件"
     assert saved.suggestion_code is None
 
 
@@ -880,7 +885,7 @@ def test_report_hunks_rejects_invalid_severity() -> None:
             {
                 "hunk_id": "H-01",
                 "comments": [
-                    {"severity": "", "category": "x", "content": "y", "existing_code": "z"}
+                    {"severity": "", "category": "边界条件", "content": "y", "existing_code": "z"}
                 ],
             }
         ]
@@ -893,7 +898,7 @@ def test_report_hunks_rejects_invalid_severity() -> None:
         "reports": [
             {
                 "hunk_id": "H-01",
-                "comments": [{"category": "x", "content": "y", "existing_code": "z"}],
+                "comments": [{"category": "边界条件", "content": "y", "existing_code": "z"}],
             }
         ]
     }
@@ -906,13 +911,59 @@ def test_report_hunks_rejects_invalid_severity() -> None:
             {
                 "hunk_id": "H-01",
                 "comments": [
-                    {"severity": "CRITICAL", "category": "x", "content": "y", "existing_code": "z"}
+                    {
+                        "severity": "CRITICAL",
+                        "category": "边界条件",
+                        "content": "y",
+                        "existing_code": "z",
+                    }
                 ],
             }
         ]
     }
     with pytest.raises(ValidationError, match="severity"):
         tool.invoke(wrong)
+
+
+def test_report_hunks_rejects_bad_category() -> None:
+    """测试非法 category 被 schema 拦下 —— 它是**枚举**，不是自由字符串。
+
+    改动前它是 `str`：模型可以写任何东西，徽章会渲染成 `[随便什么 · high]`，
+    而且我们没法按类别统计（「哪条维度从不被使用」这个信号拿不到）。
+    """
+    tool = ToolUnderTest(report_hunks, ReviewContext(), make_state("H-01"))
+    bad = {
+        "reports": [
+            {
+                "hunk_id": "H-01",
+                "comments": [
+                    {
+                        "severity": "high",
+                        "category": "并发安全",  # 曾是示例值，现在不在枚举里
+                        "content": "y",
+                        "existing_code": "z",
+                    }
+                ],
+            }
+        ]
+    }
+    with pytest.raises(ValidationError, match="category"):
+        tool.invoke(bad)
+
+
+def test_comment_categories_match_review_dimensions() -> None:
+    """评论类别的取值必须与主任务里的审查维度**同一套词**（漂移守卫）。
+
+    不另立一套短标签（OCR 用的是 bug / security / performance… 那套通用分类），
+    图两件事：① **漂移没法发生** —— 维度改了而类别没改，这条立刻红；
+    ② **「其他」的占比变成一个指标** —— 它高了就说明维度清单缺东西
+    （比如性能问题在这套维度里没有归宿，只能全落「其他」）。
+    """
+    values = set(get_args(CommentArg.model_fields["category"].annotation))
+    # 每条维度的首行是 `**维度名**`，取中间那段就是维度名
+    dimensions = {item.split("**")[1] for item in MAIN_TASK_DIMENSIONS}
+
+    assert values - {"其他"} == dimensions
 
 
 def test_report_hunks_schema_is_visible_to_model() -> None:
@@ -925,6 +976,9 @@ def test_report_hunks_schema_is_visible_to_model() -> None:
     assert set(comment) >= {"severity", "category", "content", "existing_code"}
     assert comment["severity"]["enum"] == ["high", "medium", "low"]
     assert "必填" in comment["severity"]["description"]
+    # category 同样是枚举 —— 模型看得到取值，不用猜
+    assert "业务逻辑正确性" in comment["category"]["enum"]
+    assert "其他" in comment["category"]["enum"]
     assert "hunk_id" in props
 
 
@@ -937,7 +991,9 @@ def test_report_hunks_ignores_an_identical_repeat() -> None:
     """
     state = make_state("H-01", "H-02")
     tool = ToolUnderTest(report_hunks, ReviewContext(), state)
-    one_comment = [{"severity": "high", "category": "x", "content": "问题", "existing_code": "y"}]
+    one_comment = [
+        {"severity": "high", "category": "边界条件", "content": "问题", "existing_code": "y"}
+    ]
     first = tool.update({"reports": [{"hunk_id": "H-01", "comments": one_comment}]})
     assert len(first["hunk_status"]["H-01"].comments) == 1
 
@@ -963,14 +1019,16 @@ def test_report_hunks_accepts_new_comments_on_a_reported_hunk() -> None:
     """
     state = make_state("H-01", "H-02")
     tool = ToolUnderTest(report_hunks, ReviewContext(), state)
-    first = [{"severity": "high", "category": "x", "content": "问题一", "existing_code": "y"}]
+    first = [
+        {"severity": "high", "category": "边界条件", "content": "问题一", "existing_code": "y"}
+    ]
     later = [
         # 内容一字不差 —— 会被去重丢掉
-        {"severity": "high", "category": "x", "content": "问题一", "existing_code": "y"},
+        {"severity": "high", "category": "边界条件", "content": "问题一", "existing_code": "y"},
         # 换行差异不算新评论（归一化后相同）
-        {"severity": "low", "category": "x", "content": " 问题一 ", "existing_code": "y"},
+        {"severity": "low", "category": "边界条件", "content": " 问题一 ", "existing_code": "y"},
         # 真的新结论 —— 要收
-        {"severity": "medium", "category": "y", "content": "问题二", "existing_code": "z"},
+        {"severity": "medium", "category": "其他", "content": "问题二", "existing_code": "z"},
     ]
     tool.update({"reports": [{"hunk_id": "H-01", "comments": first}]})
 

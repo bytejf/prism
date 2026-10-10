@@ -614,7 +614,7 @@ def test_main_loop_collects_comments(project_root: str) -> None:
                     "comments": [
                         {
                             "severity": "high",
-                            "category": "concurrency",
+                            "category": "边界条件",
                             "content": "goroutine 缺少退出路径",
                             "existing_code": "go func() {}()",
                         }
@@ -628,7 +628,7 @@ def test_main_loop_collects_comments(project_root: str) -> None:
 
     assert len(result.comments) == 1
     assert result.comments[0].severity == "high"
-    assert result.comments[0].category == "concurrency"
+    assert result.comments[0].category == "边界条件"
 
 
 def test_main_loop_injects_review_status_after_report(project_root: str) -> None:
@@ -771,7 +771,7 @@ def test_main_loop_feeds_back_schema_error_and_continues(project_root: str) -> N
                 {
                     "hunk_id": "H-01",
                     "complete": True,
-                    "comments": [{"category": "x", "content": "y", "existing_code": "z"}],
+                    "comments": [{"category": "边界条件", "content": "y", "existing_code": "z"}],
                 }
             ]
         },
