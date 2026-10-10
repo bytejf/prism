@@ -16,10 +16,15 @@ rules/
 **目录名即主题**：规则文件 frontmatter 里的 `theme` 必须等于它所在的目录名，
 所以主题里不带编号 —— 编号只出现在 `_registry.toml` 里，一处，不会两头漂。
 
-**覆盖关系只有一处来源**：写在**被覆盖的公共规则**自己的 frontmatter 上
-（`overridden_by` + `remaining_parts`）。设计文档里另有一张 `OVERRIDE_MAP`（§6.2），
-这里没有照做 —— 那张表与规则文件说的是同一件事，两份就会漂，而工具层要的正是
-「现在这条规则到底算不算数」这个事实，它只能有一个出处。
+**覆盖关系只有一处来源**：写在**被取代的公共规则**自己的 frontmatter 上
+（`overridden_by`）。设计文档里另有一张 `OVERRIDE_MAP`（§6.2），这里没有照做 ——
+那张表与规则文件说的是同一件事，两份就会漂，而工具层要的正是「现在这条规则到底
+算不算数」这个事实，它只能有一个出处。
+
+**只有「整条被取代」，没有「部分覆盖」**（设计 §2.5 那一档已废弃）：它本该在
+**整理规则时**解决 —— 私有规则把公共规则里仍然有效的内容合并进自己的正文，
+索引只列私有那条。运行时不合并、不解释优先级：模型看到的索引里每一条都是自洽的
+现行规则。
 
 **frontmatter 用自带的严格解析器**，不引 PyYAML：只认 `键: 值`、`键: [值, "值"]`
 这两种形状，写别的就报错。文件本身仍是合法 YAML（别处用 YAML 工具照样能读），
@@ -50,7 +55,6 @@ RULE_KEYWORDS = frozenset(
         "keywords",
         "source",
         "overridden_by",
-        "remaining_parts",
     }
 )
 REQUIRED_KEYS = frozenset({"rule_id", "theme", "default_severity", "keywords", "source"})
@@ -96,8 +100,14 @@ def _split_frontmatter(text: str, path: Path) -> tuple[dict[str, object], str]:
             raise RulesError(f"{path}: frontmatter 这一行不是 `键: 值`：{line!r}")
         key = key.strip()
         if key not in RULE_KEYWORDS:
+            hint = ""
+            if key == "remaining_parts":
+                hint = (
+                    "。**这个字段已废弃**：部分覆盖不再在运行时合并 —— 请把公共规则里"
+                    "仍然有效的内容合并进这条私有规则自己的正文，索引只列私有那条"
+                )
             raise RulesError(
-                f"{path}: 未知字段 {key!r}（可用：{', '.join(sorted(RULE_KEYWORDS))}）"
+                f"{path}: 未知字段 {key!r}（可用：{', '.join(sorted(RULE_KEYWORDS))}）{hint}"
             )
         fields[key] = _parse_value(raw.strip(), path, key)
     return fields, "\n".join(lines[end + 1 :]).strip()
@@ -175,7 +185,6 @@ def _read_rule(path: Path, theme: str, prefix: str) -> Rule:
         raise RulesError(f"{path}: frontmatter 之后没有正文")
 
     keywords = fields["keywords"]
-    remaining = fields.get("remaining_parts", ())
     rule_id = str(fields["rule_id"])
     # **代号前缀必须与主题一致**：不然「EH-G-03 出现在并发目录下」这种事只能靠
     # 人眼发现，而它会让索引、目录、加载回来的正文三处互相打架
@@ -190,7 +199,6 @@ def _read_rule(path: Path, theme: str, prefix: str) -> Rule:
         body=body,
         path=str(path),
         overridden_by=str(fields["overridden_by"]) if fields.get("overridden_by") else None,
-        remaining_parts=(tuple(remaining) if isinstance(remaining, tuple) else (str(remaining),)),
     )
 
 
@@ -222,14 +230,13 @@ class RuleLibrary:
         Returns:
             按代号排序的规则列表
         """
-        return [item for _, item in sorted(self.rules.items()) if not item.fully_overridden]
+        return [item for _, item in sorted(self.rules.items()) if not item.is_overridden]
 
     def render(self, rule_ids: list[str]) -> str:
         """渲染 `load_rules` 的返回文本。
 
-        三种情况（设计 26 号的 §6.1 有一处已经不用了，见 `render` 里那段注释）：
-        **生效的**直接给正文、**部分被覆盖的**两份都给并说清以谁为准、
-        **没见过的代号**（含被完全覆盖的）点名让它回索引看。
+        两种情况（设计 26 号的 §6.1 那条已废弃，见 `render` 里那段注释）：
+        **生效的**直接给正文；**没见过的代号**（含已被取代的）点名让它回索引看。
 
         Args:
             rule_ids: 模型给的规则代号列表
@@ -244,7 +251,7 @@ class RuleLibrary:
             if rule is None:
                 unknown.append(rule_id)
                 continue
-            if rule.fully_overridden:
+            if rule.is_overridden:
                 # **按「没有这条规则」处理**：索引里列的都是**现行**规则 ——
                 # 有私有规则覆盖时，那一行的代号在整理规则时就换成了私有代号，
                 # 所以模型正常问不到被覆盖的代号。真问到，只说明它手里的是旧
@@ -253,9 +260,6 @@ class RuleLibrary:
                 # **这里不解释「谁覆盖了谁」**：那套优先级语义模型不需要理解，
                 # 端出来只会让它去推理两套来源的关系，而它要的只是现行内容
                 unknown.append(rule_id)
-                continue
-            if rule.overridden_by is not None:
-                blocks.append(self._render_partial(rule))
                 continue
             blocks.append(rule.body)
 
@@ -266,30 +270,6 @@ class RuleLibrary:
                 f"可用的代号在「代码审查规则索引」那张表里，照表里的写。"
             )
         return "\n\n".join(parts) if parts else "没有可返回的规则。"
-
-    def _render_partial(self, rule: Rule) -> str:
-        """渲染「部分被覆盖」的规则：覆盖者的全文 + 本规则仍然有效的部分。
-
-        不做机械合并（把 G 的正文按 `remaining_parts` 切开）：那些标签是**人写的
-        主题名**，和正文的段落没有可靠对应关系，硬切会切错。两份都给、并说清
-        冲突时以谁为准，是这里唯一不会骗人的做法。
-
-        Args:
-            rule: 部分被覆盖的规则
-
-        Returns:
-            渲染文本
-        """
-        covered = self.rules.get(str(rule.overridden_by))
-        parts = [
-            f"{rule.rule_id} 已被 {rule.overridden_by} **部分覆盖**。"
-            f"本规则中**仍然有效**的部分：{'、'.join(rule.remaining_parts)}；"
-            f"其余部分以 {rule.overridden_by} 为准。",
-            rule.body,
-        ]
-        if covered is not None:
-            parts.append(f"以下是覆盖它的那一条：\n\n{covered.body}")
-        return "\n\n".join(parts)
 
 
 def _read_registry(root: Path) -> tuple[list[str], dict[str, dict[str, str]]]:
@@ -380,18 +360,16 @@ def load_library(root: Path | None = None) -> RuleLibrary:
     if not rules:
         raise RulesError(f"规则库是空的：{base / THEMES_DIR}")
 
-    # `.overridden` 这个后缀只给**完全被覆盖**的规则（设计 §三）：它们不再生效、
+    # `.overridden` 这个后缀只给**已被取代**的规则（设计 §三）：它们不再生效、
     # 只作备查。部分是部分覆盖的仍然生效，文件名保持原样 —— 后缀与「还生效吗」
     # 必须一一对应，否则「这条规则算不算数」就要靠读 frontmatter 才知道，
     # 而 glob 出来的文件名list 会给出相反的印象
     for rule in rules.values():
         marked = Path(rule.path).stem.endswith(OVERRIDDEN_SUFFIX)
-        if marked != rule.fully_overridden:
+        if marked != rule.is_overridden:
             raise RulesError(
                 f"{rule.path}: 文件名与它的覆盖声明对不上"
-                f"（文件名带 .overridden={marked}，实际完全覆盖={rule.fully_overridden}；"
-                f"overridden_by={rule.overridden_by}，"
-                f"remaining_parts={list(rule.remaining_parts)}）"
+                f"（文件名带 .overridden={marked}，frontmatter overridden_by={rule.overridden_by}）"
             )
         if rule.overridden_by is not None:
             _check_override_target(rule, rules)

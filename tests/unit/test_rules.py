@@ -252,7 +252,7 @@ def test_fully_overridden_rule_drops_out_of_the_index_and_points_elsewhere(
     )
     library = load_library(root)
 
-    assert library.rules["EH-G-01"].fully_overridden
+    assert library.rules["EH-G-01"].is_overridden
     assert "EH-G-01" not in {item.rule_id for item in library.active()}
     # 问它要一条被取代的规则 → **按「没有这条规则」处理**：索引里列的都是现行
     # 规则（覆盖发生时整理规则的人会把那一行的代号换成私有代号），所以模型正常
@@ -265,27 +265,29 @@ def test_fully_overridden_rule_drops_out_of_the_index_and_points_elsewhere(
     assert "# EH-C-01" not in text, "也别把别的代号的正文塞回来"
 
 
-def test_partially_overridden_rule_returns_both_sides(tmp_path: Path) -> None:
-    """部分覆盖：给出仍然有效的部分 + 覆盖者的正文（不做机械拼接，见实现注释）。"""
+def test_partial_coverage_field_is_rejected_with_a_way_out(tmp_path: Path) -> None:
+    """`remaining_parts` 已废弃 —— 写了它**加载就报错**，并说清该怎么做。
+
+    覆盖只有「整条被取代」一种。设计 §2.5 的「部分覆盖」本该在**整理规则时**
+    解决：私有规则把公共规则里仍然有效的内容合并进自己的正文，索引只列私有那条。
+    运行时不合并、不解释优先级 —— 模型看到的索引里每一条都是自洽的现行规则。
+
+    所以这个字段不是「不读了」而是「不认了」：留着它，写的人会以为运行时还会
+    替他合并，而实际发生的是**那些内容没人管**。报错要给出替代做法。
+    """
     root = make_library(
         tmp_path,
         rules={
             "context/CX-G-01.md": rule_text(
                 "CX-G-01",
                 theme="context",
-                extra='overridden_by: CX-C-05\nremaining_parts: ["值传递"]\n',
+                extra="overridden_by: CX-C-05\nremaining_parts: [\"值传递\"]\n",
             ),
-            "context/CX-C-05.md": _private(rule_text("CX-C-05", theme="context")),
         },
         index=INDEX_CONTEXT,
     )
-    library = load_library(root)
-
-    assert not library.rules["CX-G-01"].fully_overridden
-    text = library.render(["CX-G-01"])
-    assert "部分覆盖" in text
-    assert "值传递" in text, "仍然有效的部分要说出来"
-    assert "# CX-C-05" in text, "覆盖者也一并发给模型"
+    with pytest.raises(RulesError, match="已废弃"):
+        load_library(root)
 
 
 def test_override_declaration_must_match_the_filename(tmp_path: Path) -> None:

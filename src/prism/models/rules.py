@@ -7,7 +7,7 @@
 中途加工一手就说不清模型看到的到底是哪一版。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # 代号形状：`<主题前缀>-<来源>-<组内序号>`，例如 `EH-G-01` / `CC-C-02`。
 #
@@ -38,8 +38,9 @@ class Rule:
         source: 来源（company / google）
         body: 规则正文（frontmatter 之后的全部内容，原样）
         path: 规则文件在仓库内的相对路径（报错与排查时用）
-        overridden_by: 被哪条私有规则覆盖；None 表示没被覆盖
-        remaining_parts: 被覆盖时**仍然有效**的部分（空 = 完全覆盖）
+        overridden_by: 被哪条私有规则取代；None 表示这条仍然生效。
+            **只有「被取代」一种** —— 没有「部分覆盖」这个运行时的概念
+            （见 `is_overridden` 的说明）
     """
 
     rule_id: str
@@ -50,7 +51,6 @@ class Rule:
     body: str
     path: str
     overridden_by: str | None = None
-    remaining_parts: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def is_private(self) -> bool:
@@ -62,10 +62,15 @@ class Rule:
         return SEGMENT_PRIVATE in self.rule_id
 
     @property
-    def fully_overridden(self) -> bool:
-        """是否被**完全**覆盖（覆盖者存在，且没有留下仍然有效的部分）。
+    def is_overridden(self) -> bool:
+        """这条规则是否已被私有规则取代（取代了就是**整条不再生效**）。
+
+        **没有「部分覆盖」**：那本该在**整理规则时**解决 —— 写私有规则的人把
+        公共规则里仍然有效的内容合并进自己的文件里，索引只列私有的那一条，
+        运行时不合并。理由是「索引即真相」：索引里列出来的每一条都是自洽的
+        现行规则，模型不需要理解「两套来源谁压谁」。
 
         Returns:
             True 表示这条规则在当前规则库里已经不生效
         """
-        return self.overridden_by is not None and not self.remaining_parts
+        return self.overridden_by is not None
