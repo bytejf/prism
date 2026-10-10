@@ -54,7 +54,8 @@ from prism.models.grouping import Group
 
 # 走查目标：2 个 Go 文件、6 个 hunk、**单审查单元**、约 5 轮收尾 —— 最小的那个
 # 仓库，一次审查的 token 成本最低。`NOTES.md` 列了埋的 6 处问题
-REPO = Path(os.getenv("PRISM_MIN_TEST_DIR", Path.home() / "Projects/python/prism-min-test"))
+WALKTHROUGH = Path.home() / "Projects/python/prism-tests"
+REPO = Path(os.getenv("PRISM_MIN_TEST_DIR", str(WALKTHROUGH / "prism-min-test")))
 BASE = "main"
 HEAD = "HEAD"
 

@@ -21,7 +21,7 @@
         tests/manual/test_full_review_walkthrough.py -s
 
     # 换仓库 / 换版本（默认 prism-min-test 的 main → HEAD）
-    PRISM_WALKTHROUGH_REPO=~/Projects/python/prism-tests \
+    PRISM_WALKTHROUGH_REPO=~/Projects/python/prism-tests/prism-diff \
     PRISM_WALKTHROUGH_BASE=main PRISM_WALKTHROUGH_HEAD=HEAD \
         uv run pytest tests/manual/test_full_review_walkthrough.py -s
 
@@ -54,7 +54,7 @@
 | 反思删了哪几条 | `core/reflection/reflect.py` 的 `reflect` |
 
 **想先零成本对账再花钱**：`uv run python tests/manual/audit_pipeline.py
-~/Projects/python/prism-min-test` —— 它跑前半段并核对四条不变量（hunk 不重不漏 /
+~/Projects/python/prism-tests/prism-min-test` —— 它跑前半段并核对四条不变量（hunk 不重不漏 /
 预算账 == 真实渲染 / 提示词自洽 / 定位同源），秒级、零 token。
 """
 
@@ -67,7 +67,8 @@ from prism.observability.logging import setup_logging
 from prism.observability.tracing import setup_tracing
 
 # 走查目标与版本。都用环境变量兜一层，方便换仓库时不用改文件
-REPO = Path(os.getenv("PRISM_WALKTHROUGH_REPO", "~/Projects/python/prism-min-test")).expanduser()
+WALKTHROUGH_REPO = "~/Projects/python/prism-tests/prism-min-test"
+REPO = Path(os.getenv("PRISM_WALKTHROUGH_REPO", WALKTHROUGH_REPO)).expanduser()
 BASE = os.getenv("PRISM_WALKTHROUGH_BASE", "main")
 HEAD = os.getenv("PRISM_WALKTHROUGH_HEAD", "HEAD")
 

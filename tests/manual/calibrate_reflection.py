@@ -52,7 +52,8 @@ from prism.core.llm.client import LLMClient
 from prism.core.reflection.reflect import reflect
 from prism.models.comment import LOCATE_HUNK, SIDE_RIGHT, Comment
 
-REPO = Path(os.getenv("PRISM_MIN_TEST_DIR", Path.home() / "Projects/python/prism-min-test"))
+WALKTHROUGH = Path.home() / "Projects/python/prism-tests"
+REPO = Path(os.getenv("PRISM_MIN_TEST_DIR", str(WALKTHROUGH / "prism-min-test")))
 
 
 def build(hunk_id: str, content: str, existing_code: str, category: str = "逻辑错误") -> Comment:

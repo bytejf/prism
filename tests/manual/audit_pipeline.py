@@ -4,7 +4,7 @@
 任何一项不对就先别跑 LLM（白烧 token 之前先发现）。
 
     跑法（不花钱、秒级）：
-        uv run python tests/manual/audit_pipeline.py ~/Projects/python/prism-tests
+        uv run python tests/manual/audit_pipeline.py ~/Projects/python/prism-tests/prism-diff
 
     看什么：
         1) hunk 不重不漏：跨组 hunk 数 == 映射结果数，且无重复
@@ -34,7 +34,8 @@ from prism.core.output.locate import locate_group
 from prism.models.comment import Comment  # noqa: F401  （仅供类型参考）
 from prism.models.tool import CommentInput
 
-ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else "~/Projects/python/prism-tests").expanduser()
+DEFAULT_ROOT = "~/Projects/python/prism-tests/prism-diff"
+ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ROOT).expanduser()
 BUDGET = 3000  # 故意压小：逼出多组，才能验装箱
 BASE, HEAD = "main", "HEAD"
 

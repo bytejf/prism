@@ -18,7 +18,7 @@ LLM 用**脚本化的假实现**（不打真实 API）：可复现、秒级完�
 
 要跑真实 LLM 看完整效果，用 CLI：
 
-    cd ~/Projects/python/prism-tests
+    cd ~/Projects/python/prism-tests/prism-diff
     prism review --base main --head feature
 
 在 IDE 里直接 Run/Debug 这个文件即可；命令行跑时加 `-s` 才能看到 print：
@@ -53,7 +53,8 @@ from prism.models.comment import ReviewStats
 from prism.models.grouping import Group
 
 # 被审查的仓库：prism 之外的独立 git 仓库，main 是基线、feature 引入问题
-PRISM_TESTS = Path(os.getenv("PRISM_TESTS_DIR", Path.home() / "Projects/python/prism-tests"))
+WALKTHROUGH = Path.home() / "Projects/python/prism-tests"
+PRISM_TESTS = Path(os.getenv("PRISM_TESTS_DIR", str(WALKTHROUGH / "prism-diff")))
 BASE_BRANCH = "main"
 HEAD_BRANCH = "feature"
 

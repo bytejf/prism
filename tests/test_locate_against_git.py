@@ -26,17 +26,19 @@ from prism.core.output.locate import locate, normalize
 from prism.models.ast import HunkWithSymbol
 from prism.models.comment import LOCATE_HUNK, SIDE_LEFT, SIDE_RIGHT
 
+_WALKTHROUGH = Path.home() / "Projects/python/prism-tests"
+
 # (名字, 仓库, base, head)
 CASES: tuple[tuple[str, Path, str, str], ...] = (
     (
         "min-test",
-        Path(os.getenv("PRISM_MIN_TEST_DIR", Path.home() / "Projects/python/prism-min-test")),
+        Path(os.getenv("PRISM_MIN_TEST_DIR", str(_WALKTHROUGH / "prism-min-test"))),
         "main",
         "HEAD",
     ),
     (
-        "prism-tests",
-        Path(os.getenv("PRISM_TESTS_DIR", Path.home() / "Projects/python/prism-tests")),
+        "prism-diff",
+        Path(os.getenv("PRISM_TESTS_DIR", str(_WALKTHROUGH / "prism-diff"))),
         "main",
         "feature",
     ),

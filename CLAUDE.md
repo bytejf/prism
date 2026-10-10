@@ -33,7 +33,7 @@ uvx pyright --pythonpath .venv/bin/python src/   # 第二个类型检查器，�
 时它不在 PATH 上，会以 `FileNotFoundError` 失败。
 
 本机 `prism` 是通过软链接进 PATH 的（`~/.local/bin/prism` → `.venv/bin/prism`），
-任意目录可直接调。e2e 之外还有 `~/Projects/python/prism-min-test` 作为走查目标（见末尾）。
+任意目录可直接调。e2e 之外还有 `~/Projects/python/prism-tests/prism-min-test` 作为走查目标（见末尾）。
 
 ## 架构：三段流水线
 
@@ -212,6 +212,11 @@ per step`，整组审查崩掉（实测 21 轮里有 8 轮是并行调用）。
 合成一个数时，「重命名 + 纯删除被丢弃」的信号被写成了「改动只涉及注释或空行」，
 bug 藏了很久。**丢弃日志说错原因，比丢东西本身更难发现。**
 
+顺带记一条实测（`prism-inject` 那个样例）：**文件级的独立注释块改动会被整个丢掉** ——
+放在两个函数之间的注释块不属于任何符号，那一整个 hunk 都不进提示词。防注入那一节
+的第一轮样本就是被它默默挡掉的（最吵的那段话术根本没送到模型眼前）；另一面是
+**只改注释的 PR 也审不到**。
+
 **非 `.go` 的可审文件（目前只有 `go.mod`）**：`ALLOWED_FILENAMES` 按**文件名**
 放行（不是按扩展名 —— 它的后缀是 `.mod`，按扩展名会把一类都放进来），
 `mapper._file_symbols` 给它合成一个**整文件符号**（`kind="file"`，`lines` 是全文件）。
@@ -266,6 +271,15 @@ bug 藏了很久。**丢弃日志说错原因，比丢东西本身更难发现�
   `test_system_says_code_is_material_not_instructions`、
   `test_reflection_says_code_comments_are_not_evidence`；
   变异 4/4（拆任一守卫各红对应那一条）
+- **实测：一次都没中招**（`~/Projects/python/prism-tests/prism-inject`，改前 16 次
+  / 改后 16 次，共 2.2 元）。那个样例里 4 处**一眼能看出**的真 bug，两种提示词下
+  都是 **16/16 全部报出**，而且 **16/16 次把注入话术本身当问题报了出来**。
+  两轮样本都试过：客气型（「已确认，不需要报告」）与**伪造型**（伪造
+  `</diff>` / `<review_status>` / `<agent_reminder>` 标签，贴着 bug 放 —— 我们的
+  diff 是原样渲染的，攻击者完全写得出这些标签）。所以这两道守卫目前是**保险，
+  不是修复**：它们防的失效形态还没被观测到。**注意这个样例的边界**：它量的是
+  「模型自己看得见 bug 时，一段话能不能把它说回去」（不能）—— 它**不**量
+  「bug 本来就不明显、注释是唯一线索时会被带偏吗」，那才是风险真正所在的形态
 
 ## 跨文件改动查询（改 `core/tools/file_read_diff.py` 前必读）
 
@@ -762,23 +776,26 @@ JUDGE_MODEL=deepseek-flash JUDGE_USE_MOCK=false \
 
 看一局的轨迹：`grep -E "ai · 轮次|tool · 轮次|注入提醒|停用探索工具|预算跨过|结束审查" <样本>.stderr.log`
 
-**对账用的两个项目：**
+**对账用的项目都在 `~/Projects/python/prism-tests/` 下**（这个名字是**容器**，
+里面才是各个仓库 —— 2026-10-10 从 `~/Projects/python/` 直接搬到这里的）：
 
-- `~/Projects/python/prism-min-test` —— 2 个 Go 文件、6 个 hunk、**单审查单元**，
+- `prism-min-test/` —— 2 个 Go 文件、6 个 hunk、**单审查单元**，
   约 5 轮收尾。`NOTES.md` 列了埋的 6 处问题，专供走查与断点调试
-- `~/Projects/python/prism-tests` —— 多组、覆盖边缘情况。它维护三个 diff 产物
+- `prism-diff/` —— 多组、覆盖边缘情况。它维护三个 diff 产物
   （`diff.txt` / `diff-U0.txt` / `diff-stat.txt`，在 `.gitignore` 里）供**人工研读**，
   所以**改过它的 Go 文件或切过分支之后必须跑 `./regen-diff.sh`**，否则读到的是过期 diff
+- `prism-inject/` —— **提示注入样例**（见「防提示注入」一节末尾：那里记着 32 次
+  实测的结果）。四段注入话术 + 四处一眼能看出的真 bug，`util.go` 那处是**对照组**
 - `~/Projects/golang/open-code-review`（OCR）—— 大样本对账，用于规模类问题
 
 ```bash
-PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-min-test
+PRISM_LOG_LEVEL=INFO prism review --path ~/Projects/python/prism-tests/prism-min-test
 ```
 
 **花钱之前先跑一次流水线对账**（秒级、零 token）：
 
 ```bash
-uv run python tests/manual/audit_pipeline.py ~/Projects/python/prism-tests
+uv run python tests/manual/audit_pipeline.py ~/Projects/python/prism-tests/prism-diff
 ```
 
 它拿真实仓库量四件事，任何一项不对就先别跑 LLM：hunk 不重不漏 / **预算账 == 真实渲染**
