@@ -152,6 +152,22 @@ def done_count(hunk_status: dict[str, HunkStatus]) -> int:
     return sum(1 for item in hunk_status.values() if item.status == STATUS_DONE)
 
 
+def comment_count(hunk_status: dict[str, HunkStatus]) -> int:
+    """已收集的评论总数（含已报过 hunk 后续补充的）。
+
+    零评论是**一个需要复核的信号**：`review` 的报告头会把「未审 N 个」写出来，
+    但「评论数：0」本身看起来就像一个干净的分支 —— 见 middleware 的
+    `_remind_no_comments`。
+
+    Args:
+        hunk_status: hunk 状态表
+
+    Returns:
+        评论总条数
+    """
+    return sum(len(item.comments) for item in hunk_status.values())
+
+
 def end_done_verdict(end_done_count: int, pending: list[str]) -> tuple[bool, list[str]]:
     """判定 end_done 是否接受结束。
 
