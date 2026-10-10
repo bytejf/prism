@@ -471,6 +471,14 @@ NUL、`--` 挡住选项注入），变异 9/9（`/tmp/mutate_paths.py`）。
   bodyclose / sqlclosecheck / unused 已经覆盖了「`_ :=` 忽略 error」「无效赋值」
   「copyleft 拷贝」这类语法级模式，规则库再收一遍就是同一处报两遍（设计 §8.3）
 
+**与压缩的集成**：`load_rules` 进 `REFETCHABLE_TOOLS`（规则正文静态，清了能重取），
+清理后的占位符自带代号（`[内容已清理：原为 load_rules(rule_ids=['EH-G-03'])，可重新获取]`）。
+另外 `COMPRESSION_SYSTEM` 有两处是**为规则库补的**：`Key Findings` 要连
+`rule_ref` / `finding_ref` 一起留，`Files Examined` 要单列一行「已加载的规则：…」
+—— 被清理的 `load_rules` 结果没有「位置」可记。**实测过**：摘要里确实写出了代号，
+而模型压缩后又取回了其中两条 —— 那是**对的**（正文被清掉后要判断就得重取），
+不是「记了没用」。
+
 `load_rules` 是**唯一不吃 `runtime` 的审查工具**（规则库与被审查仓库无关，
 所以它是纯函数），因此在 `tests/unit/test_tools.py` 那条「吃 runtime 的工具」
 用例里被数出来排除掉。它进了两处名单：`REFETCHABLE_TOOLS`（规则文件静态，清了
