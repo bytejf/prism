@@ -455,9 +455,14 @@ def test_workflow_plans_first_and_keeps_reporting_as_an_output_contract() -> Non
     """
     text = build_system()
 
-    # 第一遍：理解 + 定计划
-    assert "第一遍 · 理解 + 定计划" in text
-    assert "读完之后先想清楚这一趟打算怎么查" in text
+    # 第一遍：只剩「理解」。「定计划」那版已被推翻 —— 实测它**没有产出**
+    # （两局逐轮扫过模型思考与正文，计划类措辞 2 段 → 3 段且都不是计划，
+    # 回头引用计划的 0 段；6/6 个 PR 的第一轮都是「Let me start by reading」），
+    # 而且计划一直留在上下文里会变成覆盖天花板（OCR 为此专程在第 2 轮剥掉它）。
+    assert "第一遍 · 理解**" in text
+    assert "定计划" not in text
+    assert "打算怎么查" not in text
+    # 这条是对的：它是**判断**（别在 import、常量上也查调用方），不是过程步骤
     assert "花多少力气可以不一样" in text
 
     # 第二遍：四条线索仍在（读全符号 → 查上游调用方 → 看下游影响 → 下结论）
