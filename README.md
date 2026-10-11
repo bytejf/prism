@@ -121,6 +121,51 @@ max_lines = 500
 
 配置读错时**直接报错**并指出是哪个文件、哪一段、哪个键，不静默回落到默认值。
 
+## GitHub Action
+
+仓库根有 `action.yml`（composite action）：跑一次审查，把结论**发到 PR 的行内评论**，
+并维护**一条 sticky 摘要**（每次 push 更新同一条，不刷屏）。
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 必须：Prism 要算 merge-base
+      - uses: ./
+        with:
+          api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          prism_ref: ${{ github.event.pull_request.base.sha }}
+```
+
+四条值得知道的：
+
+- **每次 push 全量重审**，发之前**先删掉我们上次发的行内评论**（按隐藏标记认）——
+  PR 上永远只有「当前这次审查」的结论。不做增量：diff 是
+  `merge-base(base, head)..head`，**base 一动被审的集合就变了**，上一轮的结论对应
+  的是另一批 hunk
+- **只审同仓库 PR**：fork 的 PR 拿不到密钥，会跳过并在 job 里说明。原因是 Prism 是
+  **要安装的 Python 包** —— 用 `pull_request_target` 让 fork 也拿到密钥，等于「在持有
+  密钥与写权限的进程里执行任意外部 PR 提供的构建配置」
+- **未定位的评论不进内联**（它们没有行号可锚），改成进摘要的折叠块。GitHub 的
+  批量发是**原子的** —— 一条坐标不合法，整批 422
+- **模型与 API 地址写在 `config/default.toml`**，不是环境变量（Prism 只从环境变量
+  读密钥）。CI 里换模型 = 改那个文件并提交，是一次看得见的改动
+
+**私有仓库的注意点**：`uv tool install git+https://…` 需要匿名可读，所以 action 改成
+「带 token 检出到 `.prism-source` 再本地装」。这在**本仓库自己用**没问题；**别的仓库**
+要用的话，`bytejf/prism` 得是公开的，或者使用者传一个有读权限的 PAT 当 `github_token`。
+
 ## 规则库
 
 `src/prism/rules/` 随包发布：`index.md` 是索引（L1），`themes/<主题>/<代号>.md`

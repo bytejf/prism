@@ -1,0 +1,59 @@
+# 用 Prism 审自己的 PR —— 这既是仓库的日常配置，也是 action 的活样本。
+#
+# 三个前提（少一个都会以「跳过」而不是「失败」收场，所以它们写在最上面）：
+#
+# 1. 仓库 secret 里有 `DEEPSEEK_API_KEY`
+# 2. **PR 来自本仓库**（不是 fork）—— fork 的 PR 拿不到 secret，本 workflow 会
+#    在 job 里明确说明并跳过（见下面那道判断）
+# 3. 本 workflow 与 action 一起位于默认分支上
+#
+# 为什么不支持 fork：我们的 action 要**安装 Python 包**，而 fork 的 PR 能改
+# `pyproject.toml`。用 `pull_request_target`（让 fork 也拿到 secret）意味着
+# 「在持有密钥与写权限的进程里执行 PR 提供的构建配置」—— 那是教科书级的凭据
+# 外泄路径。宁可外部 PR 不审（job 里说清楚），也不冒这个险。
+
+name: Prism Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  # 同一个 PR 只留最新一次：连推两次时取消旧的那次（旧的一次可能已经发过评论，
+  # 而新的一次会先删掉我们上次发的，所以取消不会留下半份结论）
+  group: prism-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      # **必须 fetch-depth: 0**：prism 要算 merge-base，两个 SHA 都得在本地
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./
+        with:
+          api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          # **用 base 分支的提交，不要用 github.sha**：pull_request 事件里
+          # `github.sha` 是 GitHub 造的**合并提交**，它只存在于 runner 上，
+          # `uv tool install git+...@<sha>` 会拉不到那个提交。
+          # 取 base 的 tip 还顺带保证了一件事：**跑的是 base 分支上的 Prism**，
+          # 而不是这个 PR 里可能被改过的版本
+          prism_ref: ${{ github.event.pull_request.base.sha }}
+          description: ${{ github.event.pull_request.body }}
+
+  # fork 来的 PR：不审，但**要说明**——静默跳过会让人以为「这次审查没问题」
+  skipped-fork:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    steps:
+      - run: |
+          echo "::notice::本 PR 来自 fork，未审查。Prism 需要安装 Python 包，而 fork 的 PR 可以修改构建配置 —— 为了不让密钥暴露给任意提 PR 的人，这里只审本仓库的 PR。"

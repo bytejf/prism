@@ -1,0 +1,145 @@
+name: Prism Code Review
+description: >-
+  AI-powered Go PR review. Reviews the pull request's changes and posts the
+  findings as inline review comments plus one sticky summary comment.
+  Model and API base URL come from the repository's config/default.toml — Prism
+  reads no env var for them (only the API key), so changing the model is a
+  deliberate, reviewable commit.
+author: bytejf
+branding:
+  icon: eye
+  color: purple
+
+inputs:
+  api_key:
+    description: >-
+      LLM API key (DeepSeek). Pass it from a repository secret; never commit it.
+    required: true
+  github_token:
+    description: >-
+      Token used to post review comments. Needs `pull-requests: write`.
+      Defaults to the workflow's own token.
+    required: false
+    default: ${{ github.token }}
+  prism_ref:
+    description: >-
+      Git ref of the Prism repository to install (tag, branch or SHA). Defaults
+      to the ref this action was loaded from, so `uses: bytejf/prism@v0.1.0`
+      installs exactly that version. Point it at the **base branch** for PR
+      reviews: the reviewer itself is then not something the PR can change.
+    required: false
+    default: ${{ github.action_ref || 'main' }}
+  description:
+    description: >-
+      Change background injected into the prompt (usually the PR body).
+      Mapped to `prism review --description`.
+    required: false
+    default: ""
+  python_version:
+    description: Python version used to install Prism.
+    required: false
+    default: "3.12"
+  review_timeout_minutes:
+    description: >-
+      Step-level guard. Prism has its own wall-clock budget (whole run defaults
+      to 20 minutes) — this only stops a hung job.
+    required: false
+    default: "30"
+
+outputs:
+  comments:
+    description: Number of comments Prism produced.
+    value: ${{ steps.review.outputs.comments }}
+
+runs:
+  using: composite
+  steps:
+    # 主版本号（`@v10`）是这类官方 action 的常规用法：补丁级自动跟上，破坏性变更
+    # 才需要动这里
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v10
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    # **从固定 ref 装 Prism，绝不从被审的那棵树装**：跑的是哪个版本必须可复现，
+    # 否则「昨天还好好的」会变成悬案。默认 ref 是「本 action 被加载的那个 ref」，
+    # 于是 `uses: bytejf/prism@v0.1.0` 装的就是 v0.1.0
+    #
+    # **为什么是「检出到子目录再本地装」而不是 `uv tool install git+https://…`**：
+    # 后者要匿名克隆，而本仓库是私有的（实测：`could not read Username for
+    # 'https://github.com'`）。带 `github.token` 检出走的是认证路径，公开私有都能用，
+    # 而且拿到的是**我们指定的那个 ref**，不是 PR 里的代码
+    - name: Fetch Prism source
+      uses: actions/checkout@v4
+      with:
+        repository: bytejf/prism
+        ref: ${{ inputs.prism_ref }}
+        path: .prism-source
+        token: ${{ inputs.github_token }}
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Install Prism
+      shell: bash
+      run: |
+        set -euo pipefail
+        # `--force`：同一个 job 里重跑这一步（比如重试）时，已装过不会报错
+        uv tool install --force "$GITHUB_WORKSPACE/.prism-source"
+        uv tool list
+
+    - name: Run review
+      id: review
+      shell: bash
+      timeout-minutes: ${{ inputs.review_timeout_minutes }}
+      env:
+        DEEPSEEK_API_KEY: ${{ inputs.api_key }}
+      run: |
+        set -euo pipefail
+        base="${{ github.event.pull_request.base.sha }}"
+        head="${{ github.event.pull_request.head.sha }}"
+        # Prism 以 merge-base 为基准取 diff，所以两个提交都必须在本地 ——
+        # 调用方的 workflow 要先 checkout 且 `fetch-depth: 0`
+        for rev in "$base" "$head"; do
+          if ! git cat-file -e "${rev}^{commit}" 2>/dev/null; then
+            echo "::error::提交 $rev 不在本地。请在 workflow 里用 actions/checkout 并设置 fetch-depth: 0"
+            exit 1
+          fi
+        done
+        report="${{ runner.temp }}/prism-report.json"
+        args=(review --path . --base "$base" --head "$head" --json-out "$report")
+        if [ -n "${{ inputs.description }}" ]; then
+          args+=(--description "${{ inputs.description }}")
+        fi
+        prism "${args[@]}"
+        # 评论条数从报告里读，不从终端输出里抠 —— 终端格式是给人看的，会变
+        count=$(python3 -c "import json;print(len(json.load(open('$report'))['comments']))")
+        {
+          echo "comments=$count"
+          echo "report=$report"
+        } >> "$GITHUB_OUTPUT"
+        echo "Prism 产出 $count 条评论"
+
+    - name: Post review comments
+      id: post
+      # `outcome == 'success'`：投递只在审查真的跑出报告时做。审查失败时下面那条
+      # 上传步骤仍然会把日志/报告带出去，供人排查
+      if: ${{ steps.review.outcome == 'success' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        set -euo pipefail
+        # 投递与审查分开：投递失败可以单独重跑，而不是再花一次钱重审
+        prism gh-post "${{ steps.review.outputs.report }}" \
+          --repo "${{ github.repository }}" \
+          --pr "${{ github.event.pull_request.number }}" \
+          --head-sha "${{ github.event.pull_request.head.sha }}"
+
+    - name: Upload report
+      id: upload
+      if: ${{ always() && steps.review.outputs.report != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: prism-report-${{ github.event.pull_request.number || github.run_id }}
+        path: ${{ steps.review.outputs.report }}
+        if-no-files-found: ignore

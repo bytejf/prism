@@ -761,6 +761,52 @@ dataclass 字段推出来，不另写键名清单 —— 否则又多一处会�
 - `exit_reason` / `pending_hunks` 挂在 **`group_review`** 上而不是根 span：一次审查
   有多个组，根本身没有单一的退出原因（设计文档把它们画在根上，多组时不成立）
 
+## GitHub Action（改 `action.yml` / `core/github/` 前必读）
+
+`action.yml`（composite）跑 `prism review --json-out`，再由 `prism gh-post` 投递。
+**投递与审查分成两步不是洁癖**：投递失败要能单独重跑，而不是再花一次钱重审。
+
+### 四个已经定掉的取舍（都别改回去）
+
+- **每次 push 全量重审 + 发之前删掉我们上次发的行内评论**。不做增量：diff 是
+  `merge-base(base, head)..head`，**base 一动被审的集合就变了**，上一轮的结论对应的
+  是另一批 hunk，而且行号可能已经不再是改动行。删的前提是每条评论都埋了
+  `<!-- prism-review -->`（认「我们发的」只看它 —— 作者登录名会变）
+- **只审同仓库 PR**（`pull_request` 触发）。**这是全项目最大的一处安全取舍**：
+  Prism 是**要安装的 Python 包**，装它就会执行 `pyproject.toml` 里的构建配置。
+  用 `pull_request_target` 让 fork 也拿到密钥，等于「在持有密钥与写权限的进程里执行
+  任意外部 PR 提供的构建配置」——OCR 敢用它是因为它跑的是**下载来的二进制**，
+  我们不是。fork 走 `skipped-fork` 那个 job，**明确说明**而不是静默跳过
+- **未定位的评论不进内联**：它们的 `side` 是 `None`，给不出坐标。GitHub 的批量
+  **是原子的**（一条不合法整批 422），而这件事**我们静态就知道** —— 不需要像 OCR
+  那样在 422 之后再去拉 diff 反推
+- **建议改法用普通代码块，不用 ```suggestion**：suggestion 是**一键提交**的，而它
+  替换的是整段行区间，我们的 `suggestion_code` 与区间未必严格对齐 —— 一键提交就
+  写错代码了
+
+### 三处踩过/验过的坑
+
+- **私有仓库不能匿名 clone**：`uv tool install git+https://…` 会以
+  `could not read Username` 失败（实测）。所以是「`actions/checkout` 带 token 检出到
+  `.prism-source` + `uv tool install --force <path>`」。副作用：别的仓库要用得让仓库
+  公开，或传 PAT
+- **`github.sha` 不能用**：`pull_request` 事件里它是 GitHub 造的**合并提交**，只存在于
+  runner 上，`git+…@<那个 SHA>` 拉不到。取 `pull_request.base.sha`（还顺带保证
+  「跑的 Prism 是 base 分支上的版本」，不是 PR 里可能改过的）
+- **`hashFiles` 看不到 `runner.temp`**：第一版用它当门条件，于是投递那一步
+  **永远不执行且不报错**。现在报告路径由 review 那一步输出，投递用
+  `steps.review.outcome == 'success'` 把门
+
+### 守门
+
+`tests/unit/test_action_contract.py`（12 条，**照着 OCR 的 `action-contract.test.js` 学的**）
+把「本地跑不出来」的那类错钉住：引用不存在的输入、声明 Prism 不读的环境变量
+（`PRISM_LLM_MODEL` 我第一版就写错了 —— 只有密钥走环境变量）、密钥进命令行、
+批量上限、投递门条件、YAML 形状。**不用 `importorskip`**：跳过等于这道守卫不跑。
+
+`tests/unit/test_github_post.py`（17 条）用假客户端验投递逻辑：删旧 → 发内联 →
+更新摘要的顺序、422 回退（去掉 LEFT 侧重试）、未定位不进内联、摘要把缺口排在结论之前。
+
 ## 日志
 
 两个模块分工明确：`observability/logging.py` 只管**怎么渲染**（`PrismHandler`），

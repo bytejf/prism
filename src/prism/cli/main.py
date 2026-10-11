@@ -79,7 +79,9 @@
 （见 core/agent/context.py 的 head_rev）。
 """
 
+import json
 import logging
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -855,6 +857,73 @@ def _review_budget_stop(finished: Sequence[_GroupOutcome], started: float, remai
         f"已用 {time.monotonic() - started:.0f} 秒 —— 剩余 {remaining} 组不再审查"
     )
     return True
+
+
+@app.command("gh-post")
+def gh_post(
+    report: Annotated[
+        Path,
+        typer.Argument(help="`prism review --json-out` 写出来的报告文件"),
+    ],
+    pr: Annotated[
+        int,
+        typer.Option(
+            "--pr", help="PR 编号（GitHub Actions 里是 github.event.pull_request.number）"
+        ),
+    ],
+    repo: Annotated[
+        str, typer.Option("--repo", help="`owner/name`（GitHub Actions 里是 github.repository）")
+    ],
+    head_sha: Annotated[
+        str, typer.Option("--head-sha", help="评论锚在哪个提交上；一般就是 PR 的 head SHA")
+    ],
+    note: Annotated[str, typer.Option("--note", help="要写进摘要的额外说明")] = "",
+    token_env: Annotated[str, typer.Option("--token-env", help="从哪个环境变量读令牌")] = (
+        "GITHUB_TOKEN"
+    ),
+) -> None:
+    """把一份审查报告发到 GitHub PR 上（删旧评论 → 发内联 → 更新 sticky 摘要）。
+
+    **这个子命令只做投递，不重新审查** —— 审查的结果来自 `prism review --json-out`。
+    分开的理由：投递要的是「已经算好的结论」，而审查要钱；把两者绑在一起会让
+    「重发一次结论」变成「再花一次钱」。
+
+    每次都会**先删掉上次我们自己发的行内评论**（按标记认），所以 PR 上永远只有
+    当前这次的结论 —— 与「每次 push 全量重审」的语义一致。
+    """
+    from prism.github.client import GitHubClient, GitHubError
+    from prism.github.post import post_report
+
+    token = os.environ.get(token_env, "").strip()
+    if not token:
+        typer.echo(
+            f"错误：环境变量 {token_env} 里没有令牌（GitHub Actions 里由 github-token 注入）",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if not report.exists():
+        typer.echo(f"错误：报告文件不存在：{report}", err=True)
+        raise typer.Exit(code=1)
+
+    data = json.loads(report.read_text(encoding="utf-8"))
+    client = GitHubClient(token, repo)
+    logger.info("投递到 %s#%d：报告 %s", repo, pr, report)
+    try:
+        outcome = post_report(client, pr, data, head_sha=head_sha, note=note)
+    except GitHubError as exc:
+        typer.echo(f"投递失败：{exc}\n{exc.body[:400]}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"投递完成：删旧 {outcome.deleted} 条，发内联 {outcome.posted} 条，"
+        f"未定位 {outcome.routed_to_summary} 条进摘要，"
+        f"摘要{'已更新' if outcome.summary_updated else '新发'}，"
+        f"回退{'用过' if outcome.fallback_used else '没用过'}"
+    )
+    if outcome.errors:
+        for item in outcome.errors:
+            typer.echo(f"⚠️ {item}", err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command()

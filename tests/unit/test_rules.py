@@ -281,7 +281,7 @@ def test_partial_coverage_field_is_rejected_with_a_way_out(tmp_path: Path) -> No
             "context/CX-G-01.md": rule_text(
                 "CX-G-01",
                 theme="context",
-                extra="overridden_by: CX-C-05\nremaining_parts: [\"值传递\"]\n",
+                extra='overridden_by: CX-C-05\nremaining_parts: ["值传递"]\n',
             ),
         },
         index=INDEX_CONTEXT,
