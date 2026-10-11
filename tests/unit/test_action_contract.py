@@ -203,3 +203,48 @@ def test_workflow_checks_out_full_history(workflow: dict[str, Any]) -> None:
     checkout = workflow["jobs"]["review"]["steps"][0]
     assert checkout["uses"].startswith("actions/checkout@")
     assert checkout["with"]["fetch-depth"] == 0
+
+
+# composite action 的步骤**只允许这些键**（GitHub runner 的清单校验是硬的：
+# 出现别的键时它**在加载阶段就拒掉整个 action**，日志里只有一句
+# `Unexpected value 'xxx'`）。第一版我把 `timeout-minutes` 写在步骤上，就是这么炸的
+COMPOSITE_STEP_KEYS = frozenset(
+    {
+        "name",
+        "id",
+        "if",
+        "uses",
+        "run",
+        "shell",
+        "env",
+        "with",
+        "working-directory",
+        "continue-on-error",
+    }
+)
+
+
+def test_composite_steps_only_use_supported_keys(action: dict[str, Any]) -> None:
+    """composite 的每个步骤只能用 GitHub 支持的键。
+
+    **这条用例是有来历的**：第一版在「Run review」那步写了 `timeout-minutes`，
+    本地 YAML 解析得好好的、`actionlint` 也没跑，直到真推一个 PR 才报
+
+        action.yml (Line: 101, Col: 7): Unexpected value 'timeout-minutes'
+
+    —— 而且是在**加载 action 的阶段**就失败，连第一步都没跑。这类错本地跑不出来，
+    只能靠把 runner 的规则写成用例。
+    """
+    for step in action["runs"]["steps"]:
+        name = step.get("name")
+        unknown = set(step) - COMPOSITE_STEP_KEYS
+        assert not unknown, f"步骤 {name!r} 用了 composite 不支持的键：{sorted(unknown)}"
+        assert "shell" in step or "uses" in step, f"步骤 {name!r} 既没有 shell 也没有 uses"
+
+
+def test_job_timeout_lives_in_the_calling_workflow(workflow: dict[str, Any]) -> None:
+    """卡死由**调用方的 job** 兜（`timeout-minutes` 在 job 上是支持的）。
+
+    Prism 自己有整条 20 分钟的预算；这里是第二道 —— 防的是「job 卡住不动」。
+    """
+    assert workflow["jobs"]["review"]["timeout-minutes"] == 30

@@ -5,6 +5,9 @@ description: >-
   Model and API base URL come from the repository's config/default.toml — Prism
   reads no env var for them (only the API key), so changing the model is a
   deliberate, reviewable commit.
+  Wall-clock guards: Prism has its own whole-run budget (20 minutes by default);
+  for a hung job, set `timeout-minutes` on the **calling job** — composite action
+  steps do not support that key (the runner rejects the manifest).
 author: bytejf
 branding:
   icon: eye
@@ -47,13 +50,6 @@ inputs:
     description: Python version used to install Prism.
     required: false
     default: "3.12"
-  review_timeout_minutes:
-    description: >-
-      Step-level guard. Prism has its own wall-clock budget (whole run defaults
-      to 20 minutes) — this only stops a hung job.
-    required: false
-    default: "30"
-
 outputs:
   comments:
     description: Number of comments Prism produced.
@@ -98,7 +94,6 @@ runs:
     - name: Run review
       id: review
       shell: bash
-      timeout-minutes: ${{ inputs.review_timeout_minutes }}
       env:
         DEEPSEEK_API_KEY: ${{ inputs.api_key }}
       run: |
