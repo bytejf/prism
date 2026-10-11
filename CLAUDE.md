@@ -788,8 +788,10 @@ dataclass 字段推出来，不另写键名清单 —— 否则又多一处会�
 
 - **私有仓库不能匿名 clone**：`uv tool install git+https://…` 会以
   `could not read Username` 失败（实测）。所以是「`actions/checkout` 带 token 检出到
-  `.prism-source` + `uv tool install --force <path>`」。副作用：别的仓库要用得让仓库
-  公开，或传 PAT
+  `.prism-source` + `uv tool install --force <path>`」
+- **取源码与发评论是两个 token**（`source_token` / `github_token`）：运行自带的
+  token **只能读它自己那个仓库**，所以「Prism 在另一个私有仓库」时必须单独传一个
+  只读 PAT。合成一个输入就会被迫给「取源码」这件事多余的写权限
 - **`github.sha` 不能用**：`pull_request` 事件里它是 GitHub 造的**合并提交**，只存在于
   runner 上，`git+…@<那个 SHA>` 拉不到。取 `pull_request.base.sha`（还顺带保证
   「跑的 Prism 是 base 分支上的版本」，不是 PR 里可能改过的）

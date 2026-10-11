@@ -162,9 +162,18 @@ jobs:
 - **模型与 API 地址写在 `config/default.toml`**，不是环境变量（Prism 只从环境变量
   读密钥）。CI 里换模型 = 改那个文件并提交，是一次看得见的改动
 
-**私有仓库的注意点**：`uv tool install git+https://…` 需要匿名可读，所以 action 改成
-「带 token 检出到 `.prism-source` 再本地装」。这在**本仓库自己用**没问题；**别的仓库**
-要用的话，`bytejf/prism` 得是公开的，或者使用者传一个有读权限的 PAT 当 `github_token`。
+**私有仓库的注意点**：`uv tool install git+https://…` 需要匿名可读，所以 action 是
+「带 token 检出到 `.prism-source` 再本地装」。而**运行自带的 token 只能读它自己那个
+仓库** —— 所以：
+
+| Prism 在哪 | `source_token` |
+|---|---|
+| 同一个仓库（本仓库自用） | 不用传（默认就是运行自带的 token） |
+| 公开仓库 | 不用传 |
+| **另一个私有仓库** | 传一个**只读**该仓库的 fine-grained PAT |
+
+`github_token`（发评论用）与 `source_token`（取源码用）**是两个输入**：发评论需要
+`pull-requests: write`，取源码只需要读 —— 合成一个就会被迫给源码那份多余的权限。
 
 ## 规则库
 

@@ -141,7 +141,10 @@ def test_prism_is_installed_from_a_pinned_ref(action: dict[str, Any]) -> None:
     assert fetch["uses"].startswith("actions/checkout@")
     assert fetch["with"]["ref"] == "${{ inputs.prism_ref }}"
     assert fetch["with"]["path"] == ".prism-source"
-    assert fetch["with"]["token"] == "${{ inputs.github_token }}", "私有仓库要认证才能检出"
+    # **读源码与发评论是**两个** token**：运行自带的 token 只能读它自己那个仓库，
+    # 所以「从别的私有仓库取源码」要单独传一个只读 token —— 发评论那份保持最小权限
+    assert fetch["with"]["token"] == "${{ inputs.source_token }}", "私有仓库要认证才能检出"
+    assert fetch["with"]["token"] != "${{ inputs.github_token }}", "两个用途别共用一个 token"
     install = steps["Install Prism"]["run"]
     assert "uv tool install --force" in install and ".prism-source" in install
 

@@ -18,7 +18,15 @@ inputs:
   github_token:
     description: >-
       Token used to post review comments. Needs `pull-requests: write`.
-      Defaults to the workflow's own token.
+      Defaults to the workflow's own token — that is enough for comments.
+    required: false
+    default: ${{ github.token }}
+  source_token:
+    description: >-
+      Token used to fetch the Prism source (see prism_ref). The workflow's own
+      token can only read **its own** repository, so when Prism lives in another
+      **private** repository, pass a read-only token for it here. Leave empty
+      when Prism is public or is the same repository.
     required: false
     default: ${{ github.token }}
   prism_ref:
@@ -75,7 +83,7 @@ runs:
         repository: bytejf/prism
         ref: ${{ inputs.prism_ref }}
         path: .prism-source
-        token: ${{ inputs.github_token }}
+        token: ${{ inputs.source_token }}
         fetch-depth: 1
         persist-credentials: false
 
