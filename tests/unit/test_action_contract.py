@@ -248,3 +248,21 @@ def test_job_timeout_lives_in_the_calling_workflow(workflow: dict[str, Any]) -> 
     Prism 自己有整条 20 分钟的预算；这里是第二道 —— 防的是「job 卡住不动」。
     """
     assert workflow["jobs"]["review"]["timeout-minutes"] == 30
+
+
+def test_setup_uv_is_pinned_to_a_full_version(action: dict[str, Any]) -> None:
+    """`setup-uv` 必须写**完整版本号**（`@v10.3.0`），不能写 `@v10`。
+
+    **这条是实测出来的**：它与 `actions/checkout@v4` 那种「滚动主版本」不同 ——
+    只发不可变标签（`v10.3.0` / `v10.2.0` / …）。写 `@v10` 的后果是
+
+        Error: Unable to resolve action `astral-sh/setup-uv@v10`, unable to find version `v10`
+
+    而且它出现在**准备步骤**阶段，连第一步都没跑。本地同样跑不出来 —— 只能把
+    「我们验过的那个 ref」写进用例（不写远程校验：单测不该依赖网络）。
+    """
+    uses = [step["uses"] for step in action["runs"]["steps"] if "uses" in step]
+    setup_uv = [ref for ref in uses if ref.startswith("astral-sh/setup-uv@")]
+    assert len(setup_uv) == 1, f"应当只在一处装 uv：{uses}"
+    ref = setup_uv[0].split("@", 1)[1]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", ref), f"setup-uv 要写完整版本号，现在是 {ref!r}"

@@ -58,10 +58,12 @@ outputs:
 runs:
   using: composite
   steps:
-    # 主版本号（`@v10`）是这类官方 action 的常规用法：补丁级自动跟上，破坏性变更
-    # 才需要动这里
+    # **写全版本号，不能写 `@v10`**：setup-uv 只发不可变标签
+    # （`v10.3.0` / `v10.2.0` / …），没有滚动主版本 —— 实测 `@v10` 会以
+    # `Unable to resolve action ... unable to find version v10` 失败。
+    # 写死版本还顺带满足本项目那条「跑的是哪个版本必须可复现」
     - name: Set up uv
-      uses: astral-sh/setup-uv@v10
+      uses: astral-sh/setup-uv@v10.3.0
       with:
         python-version: ${{ inputs.python_version }}
 
