@@ -126,10 +126,31 @@ max_lines = 500
 仓库根有 `action.yml`（composite action）：跑一次审查，把结论**发到 PR 的行内评论**，
 并维护**一条 sticky 摘要**（每次 push 更新同一条，不刷屏）。
 
+接进任意仓库只要三步，不需要 PAT、不需要装 Go、不需要本机跑过 Prism。
+
+### 1. 加一个 secret
+
+仓库 `Settings → Secrets and variables → Actions → New repository secret`：
+
+| 名字 | 值 |
+|---|---|
+| `DEEPSEEK_API_KEY` | 你的 DeepSeek API key |
+
+### 2. 放一个 workflow
+
+新建 `.github/workflows/prism-review.yml`：
+
 ```yaml
+name: Prism Review
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+
+concurrency:
+  # 同一个 PR 只留最新一次 —— 连推两次时取消旧的那次
+  group: prism-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -138,42 +159,75 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # 只审本仓库的 PR（fork 的拿不到密钥，见下面「已知限制」）
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # 必须：Prism 要算 merge-base
-      - uses: ./
+          fetch-depth: 0          # 必须：Prism 要算 merge-base，两个提交都得在本地
+
+      - uses: bytejf/prism@v0.1.0
         with:
           api_key: ${{ secrets.DEEPSEEK_API_KEY }}
-          prism_ref: ${{ github.event.pull_request.base.sha }}
+          description: ${{ github.event.pull_request.body }}
 ```
 
-四条值得知道的：
+`description` 是可选的，一般传 PR 正文 —— 它会作为「本次改动的背景」进提示词，
+让模型能拿「声称的意图」和「实际实现」比对。它**是声称、不是事实**，提示词里
+写明了这一点。
 
-- **每次 push 全量重审**，发之前**先删掉我们上次发的行内评论**（按隐藏标记认）——
-  PR 上永远只有「当前这次审查」的结论。不做增量：diff 是
-  `merge-base(base, head)..head`，**base 一动被审的集合就变了**，上一轮的结论对应
-  的是另一批 hunk
-- **只审同仓库 PR**：fork 的 PR 拿不到密钥，会跳过并在 job 里说明。原因是 Prism 是
-  **要安装的 Python 包** —— 用 `pull_request_target` 让 fork 也拿到密钥，等于「在持有
-  密钥与写权限的进程里执行任意外部 PR 提供的构建配置」
+### 3. 开一个 PR
+
+推分支、开 PR，几十秒到几分钟后 PR 上出现行内评论 + 一条 sticky 摘要。
+每次 push 都会**全量重审**，重发之前先删掉自己上次发的行内评论（按隐藏标记认），
+所以 PR 上永远只有「当前这次审查」的结论，不会越堆越多。
+
+### 输入
+
+| 输入 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `api_key` | ✅ | —— | LLM 密钥，从 secret 传 |
+| `prism_ref` | | `uses:` 里那个 ref | 装哪个版本的 Prism（tag / 分支 / SHA）。**推荐用 tag**，跑的是哪个版本必须可复现 |
+| `description` | | `""` | 本次改动的背景（一般传 PR 正文） |
+| `github_token` | | `${{ github.token }}` | 发评论用，需要 `pull-requests: write` |
+| `source_token` | | `${{ github.token }}` | 取 Prism 源码用。**公开仓库不用传**；Prism 在另一个私有仓库时才要一个只读 PAT |
+| `python_version` | | `3.12` | 装 Prism 用的 Python 版本 |
+
+输出 `comments`（本次产出多少条评论）。
+
+### 已知限制与注意点
+
+- **不审 fork 来的 PR**：fork 的 PR 拿不到 secret，workflow 会在 job 里**明确说明**
+  并跳过（静默跳过会让人以为「这次审查没问题」）。原因是 Prism 是**要安装的 Python
+  包** —— 装它就会执行 `pyproject.toml` 里的构建配置。改用 `pull_request_target`
+  让 fork 也拿到密钥，等于「在持有密钥与写权限的进程里执行任意外部 PR 提供的构建
+  配置」。宁可外部 PR 不审，也不冒这个险
 - **未定位的评论不进内联**（它们没有行号可锚），改成进摘要的折叠块。GitHub 的
   批量发是**原子的** —— 一条坐标不合法，整批 422
 - **模型与 API 地址写在 `config/default.toml`**，不是环境变量（Prism 只从环境变量
   读密钥）。CI 里换模型 = 改那个文件并提交，是一次看得见的改动
+- **`prism_ref` 必须指向 Prism 仓库里的一个 ref**：`bytejf/prism@v0.1.0` 那个
+  `v0.1.0` 才是它的默认值。**别传被审仓库的 SHA** —— 同一个仓库里自审时
+  （`uses: ./` + `prism_ref: ${{ github.event.pull_request.base.sha }}`）那是合法的，
+  跨仓库时 Prism 里根本没有那个提交。好消息是跨仓库时**不需要**它：`bytejf/prism@v0.1.0`
+  是另一个仓库的 ref，PR 改不到它
 
-**私有仓库的注意点**：`uv tool install git+https://…` 需要匿名可读，所以 action 是
-「带 token 检出到 `.prism-source` 再本地装」。而**运行自带的 token 只能读它自己那个
-仓库** —— 所以：
+**私有仓库的注意点**：取源码走的是「带 token 检出到 `.prism-source` 再本地装」，
+不用匿名 clone。而**运行自带的 token 只能读它自己那个仓库** —— 所以：
 
 | Prism 在哪 | `source_token` |
 |---|---|
-| 同一个仓库（本仓库自用） | 不用传（默认就是运行自带的 token） |
-| 公开仓库 | 不用传 |
+| 公开仓库（本文的例子） | 不用传 |
+| 同一个仓库（Prism 仓库自审） | 不用传（默认就是运行自带的 token） |
 | **另一个私有仓库** | 传一个**只读**该仓库的 fine-grained PAT |
 
 `github_token`（发评论用）与 `source_token`（取源码用）**是两个输入**：发评论需要
 `pull-requests: write`，取源码只需要读 —— 合成一个就会被迫给源码那份多余的权限。
+
+**成本**：按 PR 的 diff 规模计费，实测一个 7 条评论的小 PR 约 **0.13 元**
+（默认模型 `deepseek-flash`）。Prism 自己带整条 20 分钟的预算闸，超了就带缺口退出
+并把缺口写进摘要，不会失控。
 
 ## 规则库
 
