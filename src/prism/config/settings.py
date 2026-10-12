@@ -40,7 +40,7 @@ from typing import Any
 
 from prism.models.compression import CompressionConfig
 from prism.models.cost import CostConfig
-from prism.models.llm import API_KEY_ENV, LLMConfig
+from prism.models.llm import API_KEY_ENV, REASONING_EFFORTS, LLMConfig
 
 # 配置本体。与 `__file__` 同级 —— 走 editable 安装时是 `src/prism/config/`，
 # 打进 wheel 时也在包里，两种情况都读得到
@@ -348,6 +348,29 @@ class _Section:
             raise self._fail(f"{key} 必须在 {low}..{high} 之间，实为 {value}")
         return value
 
+    def choice(self, key: str, *, allowed: tuple[str, ...]) -> str:
+        """读一个取值受限的字符串。
+
+        与 `bounded_count` 同一条判据：不在允许集合里就**就地报错**，不回落、
+        不降级。这类值配错的后果是**静默的** —— 实测把 `reasoning_effort`
+        写成一个 API 不认的档位，请求照发，只是安静地按默认档跑，
+        而「跑的是哪个档」直接决定花多少钱。
+
+        Args:
+            key: 键名
+            allowed: 允许的取值（顺序即报错信息里的展示顺序）
+
+        Returns:
+            字符串值
+
+        Raises:
+            ValueError: 缺失、类型不符或不在允许集合内
+        """
+        value = self.text(key)
+        if value not in allowed:
+            raise self._fail(f"{key} 必须是 {'/'.join(allowed)} 之一，实为 {value!r}")
+        return value
+
     def numbers(self, key: str) -> tuple[int, ...]:
         """读一个整数数组。
 
@@ -409,7 +432,7 @@ def load(path: Path = PATH) -> Settings:
         model=llm.text("model"),
         base_url=llm.text("base_url"),
         api_key=api_key,
-        reasoning_effort=llm.text("reasoning_effort"),
+        reasoning_effort=llm.choice("reasoning_effort", allowed=REASONING_EFFORTS),
         max_retries=llm.count("max_retries"),
         timeout=llm.count("timeout"),
         context_window=llm.count("context_window"),

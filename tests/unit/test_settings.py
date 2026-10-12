@@ -290,3 +290,34 @@ def test_concurrency_accepts_the_boundaries(tmp_path: Path) -> None:
     for value in (1, 8):
         path = write_config(tmp_path, with_line("concurrency = 1", f"concurrency = {value}"))
         assert load(path).review.concurrency == value
+
+
+def test_reasoning_effort_default_is_low() -> None:
+    """默认档位是 low —— 显式压下来，不让 API 的默认值决定我们花多少钱。"""
+    assert settings.llm.reasoning_effort == "low"
+
+
+@pytest.mark.parametrize("value", ["ultra", "LOW", "off", ""])
+def test_reasoning_effort_out_of_set_is_a_hard_error(tmp_path: Path, value: str) -> None:
+    """取值不在 API 认的集合里 → **硬报错**，不静默按默认档跑。
+
+    这条是实测出来的：往 API 传一个它不认的档位（`ultra`）**不报错**，请求照发，
+    只是安静地按默认档执行。而「跑的是哪个档」直接决定花多少钱 ——
+    配错了看不见，正是本项目最不能忍的那类失效。
+    """
+    path = write_config(
+        tmp_path, with_line('reasoning_effort = "low"', f'reasoning_effort = "{value}"')
+    )
+
+    with pytest.raises(ValueError, match=r"reasoning_effort 必须是"):
+        load(path)
+
+
+@pytest.mark.parametrize("value", ["none", "high", "max", "minimal"])
+def test_reasoning_effort_accepts_every_documented_value(tmp_path: Path, value: str) -> None:
+    """官方定义的四个值 + 兼容别名都要能过 —— 校验不比 API 自己更窄。"""
+    path = write_config(
+        tmp_path, with_line('reasoning_effort = "low"', f'reasoning_effort = "{value}"')
+    )
+
+    assert load(path).llm.reasoning_effort == value

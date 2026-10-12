@@ -40,7 +40,8 @@ base_url = "https://api.deepseek.com"
 # 所以换模型时只改这一处，不要在压缩逻辑里另写一个数
 context_window = 1000000
 
-# 思考强度。取值 minimal / low / medium / high / xhigh / max / ultra。
+# 思考强度。取值 none / low / high / max（另有官方兼容别名 minimal / medium /
+# xhigh）；`none` 关闭思考，其余只控制强度。**配错会硬报错**，不静默降级。
 # DeepSeek 的思考模式**默认开启且默认档位是 high**（不传参数也会有 reasoning
 # token），所以这里显式降到 low：审查的绝大多数轮次只是「读文件 → 报告结论」，
 # 不需要深推理，而思考 token 计费、且会让 prompt 一起变长
