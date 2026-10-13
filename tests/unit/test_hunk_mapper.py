@@ -78,28 +78,56 @@ def test_display_range_falls_back_to_old_side_for_pure_deletion() -> None:
     assert display_range(make_hunk(10, 3, 9, 0)) == (10, 12)
 
 
-def test_changed_lines_reads_header_for_modification() -> None:
-    """测试改动行直接来自头字段（-U0 下头字段就是改动行）。
+def test_changed_lines_are_counted_from_the_body() -> None:
+    """改动行从**正文**数出来，不读头字段。
 
-    只给四个数字，不传 content —— changed_lines 不读正文。
+    头字段是「该侧总行数」（改动 + 上下文），本来就回答不了「哪些行改了」。
+    只给四个数字、不传正文的话，这里什么也数不出来。
     """
-    added, removed = changed_lines(make_hunk(11, 1, 13, 2))
+    hunk = make_hunk(11, 1, 13, 2, "\n".join(["-\told()", "+\tnew()", "+\tmore()"]))
+
+    added, removed = changed_lines(hunk)
+
     assert added == [13, 14]
     assert removed == [11]
 
 
 def test_changed_lines_pure_addition_has_no_removed() -> None:
     """测试纯新增 hunk（旧文件侧行数为 0）。"""
-    added, removed = changed_lines(make_hunk(14, 0, 16, 1))
+    added, removed = changed_lines(make_hunk(14, 0, 16, 1, "+\tnew()"))
     assert added == [16]
     assert removed == []
 
 
 def test_changed_lines_pure_deletion_has_no_added() -> None:
     """测试纯删除 hunk（新文件侧行数为 0）。"""
-    added, removed = changed_lines(make_hunk(10, 3, 9, 0))
-    assert added == []
-    assert removed == [10, 11, 12]
+    hunk = make_hunk(10, 3, 9, 0, "\n".join(["-\ta()", "-\tb()", "-\tc()"]))
+
+    assert changed_lines(hunk) == ([], [10, 11, 12])
+
+
+def test_changed_lines_skips_context_lines() -> None:
+    """**上下文行不算改动行。**
+
+    ``@@ -10,2 +10,2 @@`` 里的 ``2`` 是那一侧的**总行数**（改动 + 上下文），
+    照头字段取区间会把上下文行算成改动。`-U0` 下两者恰好相等，所以这个错在
+    我们的主路径上完全不显形 —— 换一种 diff 来源就会。
+
+    （`-U0` 由 `loader.CONTEXT_LINES = 0` 保证，见那条常量的注释。）
+    """
+    hunk = make_hunk(10, 2, 10, 2, "\n".join([" \tctx()", "-\told()", "+\tnew()"]))
+
+    added, removed = changed_lines(hunk)
+
+    assert added == [11], "上下文行占掉了第 10 行"
+    assert removed == [11]
+
+
+def test_changed_lines_ignores_no_newline_marker() -> None:
+    r"""`\ No newline at end of file` 不占号、也不算改动。"""
+    hunk = make_hunk(10, 1, 10, 2, "-\ta()\n\\ No newline at end of file\n+\tb()")
+
+    assert changed_lines(hunk) == ([10], [10])
 
 
 def test_format_location_multi_line_and_single_line() -> None:
@@ -553,6 +581,32 @@ def test_split_mixed_add_and_remove() -> None:
     assert changed_lines(pieces[0]) == ([1, 2, 3], [1, 2])
     # 子 2：新增的函数 B
     assert changed_lines(pieces[1]) == ([4], [])
+
+
+def test_split_offsets_count_context_lines() -> None:
+    """切片的行号偏移要把**上下文行**算进去。
+
+    `-U0` 下正文里没有上下文行，所以按「数 `+` / `-` 的个数」推偏移与按
+    「数占了几行」推偏移是等价的。这里守的是**换一种 diff 来源也不会整体偏移** ——
+    偏移后的行号读起来完全正常，只是指向隔壁几行。
+    """
+    # a() 是旧版第 2 行；c() 是新版第 4 行
+    old_symbols = [Symbol("A", "function", 2, 2)]
+    new_symbols = [Symbol("B", "function", 4, 4)]
+    hunk = make_hunk(
+        1,
+        3,
+        1,
+        4,
+        "\n".join([" \tctx()", "-\ta()", "+\tb()", " \tctx2()", "+\tc()"]),
+    )
+
+    pieces = split_by_symbol(hunk, new_symbols, old_symbols)
+
+    assert len(pieces) == 2
+    # 切片的起点由「前面几行占掉了多少号」决定：ctx / a / ctx2 共 3 行
+    assert (pieces[1].old_start, pieces[1].new_start) == (4, 4)
+    assert pieces[1].content == "+\tc()"
 
 
 def test_split_result_has_at_most_one_symbol(go_repo: Path, git: Callable[..., None]) -> None:

@@ -257,22 +257,54 @@ def _split_hunk(
     )
 
 
-def changed_lines(hunk: Hunk) -> tuple[list[int], list[int]]:
-    """取出 hunk 的改动行号。
+def _advances(line: str) -> tuple[bool, bool]:
+    """这一行会让旧版 / 新版的计数器各前进几格。
 
-    diff 由 `loader.CONTEXT_LINES = 0`（等价 `git diff -U0`）生成，hunk 里
-    只有改动行、没有上下文行，因此头字段本身就是改动行的位置与数量：
-    新文件侧是 ``[new_start, new_start + new_lines - 1]``，旧文件侧同理，
-    该侧行数为 0 时表示这一侧没有改动行。
+    ``+`` 只推进新版、``-`` 只推进旧版、**上下文行（空格开头）两侧都推**；
+    ``\\ No newline at end of file`` 不占号。
+
+    Args:
+        line: hunk 正文的一行
+
+    Returns:
+        (旧版是否前进, 新版是否前进)
+    """
+    head = line[:1]
+    if head == "+":
+        return False, True
+    if head == "-":
+        return True, False
+    if head == " " or line == "":
+        return True, True
+    return False, False
+
+
+def changed_lines(hunk: Hunk) -> tuple[list[int], list[int]]:
+    """取出 hunk 里**真正改动**的行号。
+
+    走正文数，**不用头字段**：``@@ -10,3 +10,7 @@`` 里的 ``7`` 是新文件侧的
+    **总行数**（改动 + 上下文），不是改动行数。只吃 `-U0` 的 diff 时两者恰好
+    相等，所以照头字段取区间的写法在那种输入下不显形 —— 换一种 diff 来源
+    就会把上下文行也算成改动。
 
     Args:
         hunk: 待解析的 hunk
 
     Returns:
-        (新增行号列表, 删除行号列表)，均为 1-based
+        (新增行号列表, 删除行号列表)，均为 1-based、按出现顺序
     """
-    added = list(range(hunk.new_start, hunk.new_start + hunk.new_lines)) if hunk.new_lines else []
-    removed = list(range(hunk.old_start, hunk.old_start + hunk.old_lines)) if hunk.old_lines else []
+    old_no, new_no = hunk.old_start, hunk.new_start
+    added: list[int] = []
+    removed: list[int] = []
+    for line in hunk.content.splitlines():
+        head = line[:1]
+        if head == "+":
+            added.append(new_no)
+        elif head == "-":
+            removed.append(old_no)
+        advance_old, advance_new = _advances(line)
+        old_no += advance_old
+        new_no += advance_new
     return added, removed
 
 
@@ -354,15 +386,17 @@ def split_by_symbol(hunk: Hunk, new_symbols: list[Symbol], old_symbols: list[Sym
 
     old_no, new_no = hunk.old_start, hunk.new_start
     for index, line in enumerate(body):
-        if line.startswith("+"):
+        head = line[:1]
+        if head == "+":
             owner = _owner_at(new_symbols, new_no)
-            new_no += 1
-        elif line.startswith("-"):
+        elif head == "-":
             owner = _owner_at(old_symbols, old_no)
-            old_no += 1
         else:
-            # -U0 下不该出现上下文行；防御性处理，两侧都前进
-            owner, old_no, new_no = None, old_no + 1, new_no + 1
+            # 上下文行不属于任何符号 —— 它两侧占号，但不产生归属
+            owner = None
+        advance_old, advance_new = _advances(line)
+        old_no += advance_old
+        new_no += advance_new
 
         if index == 0:
             cuts.append(0)
@@ -395,11 +429,15 @@ def _sub_hunk(hunk: Hunk, body: list[str], start: int, end: int) -> Hunk:
     """
     before = body[:start]
     segment = body[start : end + 1]
+    # 起始行号按**前面那些行占掉多少号**推；行数按该段**占了多少行**数。
+    # 两处都要把上下文行算进去（见 `_advances`）—— `-U0` 下正文里没有
+    # 上下文行，所以两种写法等价，但换一种 diff 来源就会整体偏移，
+    # 而偏移后的行号读起来完全正常
     return Hunk(
-        old_start=hunk.old_start + sum(1 for line in before if line.startswith("-")),
-        old_lines=sum(1 for line in segment if line.startswith("-")),
-        new_start=hunk.new_start + sum(1 for line in before if line.startswith("+")),
-        new_lines=sum(1 for line in segment if line.startswith("+")),
+        old_start=hunk.old_start + sum(_advances(line)[0] for line in before),
+        old_lines=sum(1 for line in segment if _advances(line)[0]),
+        new_start=hunk.new_start + sum(_advances(line)[1] for line in before),
+        new_lines=sum(1 for line in segment if _advances(line)[1]),
         content="\n".join(segment),
     )
 
