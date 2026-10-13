@@ -188,9 +188,17 @@ def _side_lines(part: Hunk, side: str) -> list[tuple[int, str]]:
     """hunk 片里**某一侧**的改动行，带该侧的行号。
 
     RIGHT 取 `+` 行、行号从 ``new_start`` 起；LEFT 取 `-` 行、从 ``old_start``
-    起。计数器只在遇到**本侧**的记号时前进，这是行号算对的关键：把对面那侧的
-    行也算进去，改一行删一行的那种 hunk 会整体偏移，而偏移后的值读起来完全
-    正常 —— 不报错、不越界，只是指向隔壁几行。
+    起。**两个计数器各走各的**：`+` 行只推进新版计数、`-` 行只推进旧版计数，
+    而上下文行（空格开头）**两侧都推进**。三处漏一处都不行 —— 拿对面那侧的行
+    推进本侧，改一行删一行的 hunk 会整体偏移；上下文行不推进，则从第一个上下文
+    行起一直偏。两种偏移的结果都**不报错、不越界，读起来完全正常**，只是指向
+    隔壁几行。
+
+    上下文那一支是**防御性**的：我们的 diff 由 `loader.CONTEXT_LINES = 0` 生成
+    （等价 `git diff -U0`），hunk 正文里没有上下文行，所以它目前走不到。留着是
+    因为「本函数只对 `-U0` 成立」是个**隐式前提** —— 哪天 diff 来源变了，行号会
+    从第一行起全错且没有任何信号（本项目最不能忍的那类）。对 `-U0` 两种写法等价，
+    `tests/unit/test_locate.py` 分别钉住两条路径。
 
     Args:
         part: hunk 片
@@ -200,13 +208,22 @@ def _side_lines(part: Hunk, side: str) -> list[tuple[int, str]]:
         (该侧行号, 归一化后的正文) 列表
     """
     right = side == SIDE_RIGHT
-    marker = "+" if right else "-"
-    number = part.new_start if right else part.old_start
+    old_no, new_no = part.old_start, part.new_start
     lines: list[tuple[int, str]] = []
     for line in part.content.splitlines():
-        if line.startswith(marker):
-            lines.append((number, normalize(line)))
-            number += 1
+        head = line[:1]
+        if head == "+":
+            if right:
+                lines.append((new_no, normalize(line)))
+            new_no += 1
+        elif head == "-":
+            if not right:
+                lines.append((old_no, normalize(line)))
+            old_no += 1
+        elif head == " " or line == "":
+            old_no += 1
+            new_no += 1
+        # `\ No newline at end of file` 不占号
     return lines
 
 

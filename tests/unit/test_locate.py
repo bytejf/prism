@@ -184,6 +184,75 @@ def test_deleted_block_gives_the_whole_range() -> None:
     assert found.level == LOCATE_HUNK
 
 
+# ---------- 行号：上下文行两侧都占号（防御性，-U0 下走不到）----------
+
+
+def test_leading_context_line_advances_the_new_side() -> None:
+    """上下文行**要占号**。
+
+    我们的 diff 由 `CONTEXT_LINES = 0` 生成（等价 `git diff -U0`），hunk 正文里
+    没有上下文行，所以这几条用例守的是一条**目前走不到**的路径。留着是因为
+    「本函数只对 `-U0` 成立」是个**隐式前提** —— 哪天 diff 来源变了（换个 diff
+    库、或有人动了 `CONTEXT_LINES`），行号会从第一个上下文行起全错，
+    而算错的行号**不报错、不越界、读起来完全正常**。
+    """
+    hunk = make_hunk("H-01", " \tctx()\n+\tnew()", new_start=10, old_start=10)
+
+    found = locate("H-01", "new()", [hunk])
+
+    assert (found.side, found.start_line) == (SIDE_RIGHT, 11)
+
+
+def test_context_line_advances_both_sides() -> None:
+    """上下文行**两侧都推进** —— 旧版和新版的计数器各自前进一格。"""
+    hunk = make_hunk("H-01", "-\told()\n \tctx()\n+\tnew()", new_start=10, old_start=7)
+
+    assert locate("H-01", "-old()", [hunk]).start_line == 7
+    assert locate("H-01", "+new()", [hunk]).start_line == 11
+
+
+def test_context_line_does_not_shift_the_other_side() -> None:
+    """一个方向上的上下文行，不该把另一个方向也带偏。
+
+    三种记号混在一起时最容易写错：`+` 只推新版计数、`-` 只推旧版、空格推两边。
+    """
+    hunk = make_hunk(
+        "H-01",
+        " \ta()\n-\tb()\n+\tc()\n \td()\n-\te()\n+\tf()",
+        new_start=100,
+        old_start=200,
+    )
+
+    assert locate("H-01", "+c()", [hunk]).start_line == 101
+    assert locate("H-01", "+f()", [hunk]).start_line == 103
+    assert locate("H-01", "-b()", [hunk]).start_line == 201
+    assert locate("H-01", "-e()", [hunk]).start_line == 203
+
+
+def test_u0_hunk_numbering_is_unchanged() -> None:
+    """没有上下文行时（`-U0`，**我们的主路径**），行为与「只推进本侧」逐字节一致。
+
+    回归守卫：上面几条修的是「有上下文行」的场景，别把真正在跑的那条路改坏了。
+    """
+    hunk = make_hunk("H-01", "-\ta()\n+\tb()\n+\tc()", new_start=20, old_start=7)
+
+    assert locate("H-01", "-a()", [hunk]).start_line == 7
+    assert locate("H-01", "+b()", [hunk]).start_line == 20
+    assert locate("H-01", "+c()", [hunk]).start_line == 21
+
+
+def test_no_newline_marker_does_not_advance() -> None:
+    """`\\ No newline at end of file` 不占号。"""
+    hunk = make_hunk(
+        "H-01",
+        "-a()\n\\ No newline at end of file\n+b()",
+        new_start=10,
+        old_start=10,
+    )
+
+    assert locate("H-01", "+b()", [hunk]).start_line == 10
+
+
 # ---------- 侧：命中哪一版 ----------
 
 
