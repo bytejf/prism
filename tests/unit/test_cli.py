@@ -332,7 +332,13 @@ def test_concurrent_results_are_ordered_by_group(
 
 
 def test_concurrency_keeps_every_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """并发跑完的组数与串行一致（并发不改变语义）。"""
+    """并发跑完的组数与串行一致（并发不改变语义）。
+
+    **比集合，不比顺序。** 并发下「哪一组先跑完」取决于线程调度 —— 那不是我们
+    能保证的东西：进度行按**完成顺序**打是设计如此（`_run_groups` 的注释里写着），
+    只有**报告**按序号排。断言顺序会写出一条在 3.12 上碰巧过、换个小版本就红的
+    用例（实测 3.13 就是这样）。
+    """
     for concurrency in (1, 3):
         ran = install_fake_pipeline(monkeypatch, UsageTotals(calls=1, output=1))
         set_concurrency(monkeypatch, concurrency)
@@ -341,7 +347,9 @@ def test_concurrency_keeps_every_group(tmp_path: Path, monkeypatch: pytest.Monke
             make_groups(5), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
         )
 
-        assert ran == [f"group-{index:03d}" for index in range(1, 6)], f"并发度 {concurrency}"
+        assert sorted(ran) == [f"group-{index:03d}" for index in range(1, 6)], (
+            f"并发度 {concurrency}"
+        )
         assert (outcome.skipped_groups, outcome.failed_groups) == (0, 0)
 
 
@@ -366,7 +374,8 @@ def test_concurrent_budget_stops_submitting_new_groups(
         make_groups(6), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
-    assert ran == ["group-001", "group-002"], "前两组已提交、不打断；第三组起不再提交"
+    # **比集合不比顺序** —— 理由同 `test_concurrency_keeps_every_group`
+    assert sorted(ran) == ["group-001", "group-002"], "前两组已提交、不打断；第三组起不再提交"
     assert (outcome.skipped_groups, outcome.failed_groups) == (4, 0)
 
 
@@ -399,6 +408,7 @@ def test_one_crashed_group_does_not_kill_the_rest(
         make_groups(3), tmp_path, "HEAD", {}, StaticReport(), time.monotonic()
     )
 
-    assert ran == ["group-001", "group-002", "group-003"], "第三组照跑"
+    # **比集合不比顺序** —— 理由同 `test_concurrency_keeps_every_group`
+    assert sorted(ran) == ["group-001", "group-002", "group-003"], "第三组照跑"
     assert outcome.failed_groups == 1
     assert outcome.skipped_groups == 0, "出错的组不能被算成「因预算没跑」"

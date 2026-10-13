@@ -2,6 +2,7 @@
 
 **确定性优先的 Go 代码审查 Agent** —— Python 实现，审查 Go 代码。
 
+[![CI](https://github.com/bytejf/prism/actions/workflows/ci.yml/badge.svg)](https://github.com/bytejf/prism/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![LangChain v1](https://img.shields.io/badge/LangChain-v1-1C3C3C?style=flat-square)](https://docs.langchain.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
@@ -187,7 +188,7 @@ class HunkWithSymbol:
 
     part: Hunk
     file_path: str
-    symbol: Symbol          # ← 不是 list[Symbol]：类型能表达的不该靠约定
+    symbol: Symbol  # ← 不是 list[Symbol]：类型能表达的不该靠约定
     hunk_id: str
     head_lines: LineRange | None
     renamed_from: str | None
@@ -253,7 +254,7 @@ def locate(hunk_id: str, existing_code: str, hunks: list[HunkWithSymbol]) -> Loc
     **每层里都按 `_search_plan` 的顺序试完两侧**才算这层没命中。
     """
     plan = _search_plan(_needles(existing_code))
-    if not plan:                       # 空片段先判，不等到搜索失败才报
+    if not plan:  # 空片段先判，不等到搜索失败才报
         return Location(hunk_id, 0, 0, LOCATE_FAILED, None, REASON_EMPTY_EXISTING_CODE)
 
     own = next((item for item in hunks if item.hunk_id == hunk_id), None)
@@ -282,10 +283,14 @@ def locate(hunk_id: str, existing_code: str, hunks: list[HunkWithSymbol]) -> Loc
 def _search_plan(groups: dict[str, list[str]]) -> list[tuple[str, list[str]]]:
     plus, minus, plain = groups["+"], groups["-"], groups[""]
     plan: list[tuple[str, list[str]]] = []
-    if plus:  plan.append((SIDE_RIGHT, plus))
-    if plain: plan.append((SIDE_RIGHT, plain))
-    if minus: plan.append((SIDE_LEFT,  minus))
-    if plain: plan.append((SIDE_LEFT,  plain))
+    if plus:
+        plan.append((SIDE_RIGHT, plus))
+    if plain:
+        plan.append((SIDE_RIGHT, plain))
+    if minus:
+        plan.append((SIDE_LEFT, minus))
+    if plain:
+        plan.append((SIDE_LEFT, plain))
     return plan
 ```
 

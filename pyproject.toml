@@ -3,6 +3,8 @@ name = "prism"
 version = "0.1.0"
 description = "A deterministic-first code review agent for Go"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "huhu", email = "2420183374@qq.com" }
 ]
