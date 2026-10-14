@@ -1550,7 +1550,9 @@ def test_budget_stop_is_logged_as_warning(
         run_review_agent(make_group(["H-01", "H-02"]), llm, project_root)
 
     assert "本组超预算（cost）" in caplog.text
-    assert "预算 0.000 元 / 300 秒" in caplog.text
+    # 秒数**从配置取，不写死** —— 写死的话改一次配置就让它静默失配。
+    # 实测撞到过：单组时长 300 → 900，这条红了，而它要测的「日志带上限」本身没坏
+    assert f"预算 0.000 元 / {settings.review.max_group_seconds:.0f} 秒" in caplog.text
 
 
 def test_no_progress_reminder_reaches_a_model_that_keeps_calling_tools(
